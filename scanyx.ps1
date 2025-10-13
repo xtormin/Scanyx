@@ -101,51 +101,51 @@ Enable verbose mode to display the full nmap command being executed for each hos
 Useful for debugging and understanding the exact commands being run and their output.
 
 .EXAMPLE
-.\network_scan_logger.ps1 -HostFile .\hosts.txt -ScanType tcp-1000
+.\scanyx.ps1 -HostFile .\hosts.txt -ScanType tcp-1000
 Execute a TCP top 1000 ports scan with default settings.
 
 .EXAMPLE
-.\network_scan_logger.ps1 -HostFile .\hosts.txt -ScanType tcp-full -MaxConcurrent 10 -OverwriteMode Skip
+.\scanyx.ps1 -HostFile .\hosts.txt -ScanType tcp-full -MaxConcurrent 10 -OverwriteMode Skip
 Execute a full TCP scan with 10 concurrent scans, skipping existing results.
 
 .EXAMPLE
-.\network_scan_logger.ps1 -HostFile .\hosts.txt -ScanType udp-common -Resume
+.\scanyx.ps1 -HostFile .\hosts.txt -ScanType udp-common -Resume
 Resume a previous scan session, continuing only with pending hosts.
 
 .EXAMPLE
-.\network_scan_logger.ps1 -HostFile .\hosts.txt -ScanType tcp-1000 -ResumeRetryFailed
+.\scanyx.ps1 -HostFile .\hosts.txt -ScanType tcp-1000 -ResumeRetryFailed
 Resume and retry failed hosts from previous session.
 
 .EXAMPLE
-.\network_scan_logger.ps1 -HostFile .\hosts.txt -ExcludeFile .\excluded.txt -ScanType tcp-1000
+.\scanyx.ps1 -HostFile .\hosts.txt -ExcludeFile .\excluded.txt -ScanType tcp-1000
 Scan hosts from hosts.txt excluding those listed in excluded.txt.
 
 .EXAMPLE
-.\network_scan_logger.ps1 -HostFile .\networks.txt -ExcludeFile .\gateways.txt -ResolveHostnames -ScanType tcp-full
+.\scanyx.ps1 -HostFile .\networks.txt -ExcludeFile .\gateways.txt -ResolveHostnames -ScanType tcp-full
 Scan CIDR ranges from networks.txt, excluding hosts in gateways.txt with hostname resolution.
 
 .EXAMPLE
-.\network_scan_logger.ps1 -HostFile .\hosts.txt -SensitiveFile .\production.txt -ScanType tcp-1000
+.\scanyx.ps1 -HostFile .\hosts.txt -SensitiveFile .\production.txt -ScanType tcp-1000
 Scan hosts with normal timing, but use T2 timing and default scripts for sensitive hosts.
 
 .EXAMPLE
-.\network_scan_logger.ps1 -HostFile .\networks.txt -SensitiveFile .\critical.txt -SensitiveTiming T1 -SensitiveScripts none -ScanType tcp-full
+.\scanyx.ps1 -HostFile .\networks.txt -SensitiveFile .\critical.txt -SensitiveTiming T1 -SensitiveScripts none -ScanType tcp-full
 Scan with very slow timing (T1) and no NSE scripts for critical/sensitive hosts.
 
 .EXAMPLE
-.\network_scan_logger.ps1 -HostFile .\hosts.txt -ScanType tcp-1000 -VerboseMode
+.\scanyx.ps1 -HostFile .\hosts.txt -ScanType tcp-1000 -VerboseMode
 Execute a scan with verbose mode enabled to see the exact nmap commands being run.
 
 .EXAMPLE
-.\network_scan_logger.ps1 -Hosts "192.168.1.0/24","10.0.0.50" -ScanType tcp-1000
+.\scanyx.ps1 -Hosts "192.168.1.0/24","10.0.0.50" -ScanType tcp-1000
 Scan hosts provided directly via command line without using a file.
 
 .EXAMPLE
-.\network_scan_logger.ps1 -Hosts "192.168.0.0/24" -ExcludeHosts "192.168.0.1","192.168.0.254" -ScanType tcp-1000
+.\scanyx.ps1 -Hosts "192.168.0.0/24" -ExcludeHosts "192.168.0.1","192.168.0.254" -ScanType tcp-1000
 Scan a network excluding specific hosts, all provided via command line.
 
 .EXAMPLE
-.\network_scan_logger.ps1 -HostFile .\hosts.txt -Hosts "192.168.5.0/24" -ExcludeHosts "192.168.5.1" -SensitiveHosts "192.168.5.10" -ScanType tcp-1000
+.\scanyx.ps1 -HostFile .\hosts.txt -Hosts "192.168.5.0/24" -ExcludeHosts "192.168.5.1" -SensitiveHosts "192.168.5.10" -ScanType tcp-1000
 Combine file-based and command line hosts, exclusions, and sensitive hosts.
 
 .EXAMPLE
@@ -157,7 +157,7 @@ Combine file-based and command line hosts, exclusions, and sensitive hosts.
 #     "command": "nmap -v -T2 -Pn -sS --host-timeout 15m"
 #   }
 # }
-# Then use: .\network_scan_logger.ps1 -HostFile .\hosts.txt -ScanType custom-stealth
+# Then use: .\scanyx.ps1 -HostFile .\hosts.txt -ScanType custom-stealth
 
 .NOTES
 Author: Jennifer Torres (@xtormin)
@@ -253,9 +253,17 @@ param (
     [Parameter(Mandatory = $false)]
     [switch]$ResumeRetryFailed,
 
+    # Resume and retry dead hosts (completed but no open ports)
+    [Parameter(Mandatory = $false)]
+    [switch]$ResumeRetryDead,
+
     # Retry only failed hosts
     [Parameter(Mandatory = $false)]
     [switch]$RetryFailed,
+
+    # Retry only dead hosts (skip pending, failed, and alive)
+    [Parameter(Mandatory = $false)]
+    [switch]$RetryDead,
 
     # Force fresh start (archive old state)
     [Parameter(Mandatory = $false)]
@@ -271,7 +279,23 @@ param (
 
     # Enable verbose mode to show nmap commands
     [Parameter(Mandatory = $false)]
-    [switch]$VerboseMode
+    [switch]$VerboseMode,
+
+    # Session name (custom identifier for this scan session)
+    [Parameter(Mandatory = $false)]
+    [string]$SessionName = "",
+
+    # List all available sessions
+    [Parameter(Mandatory = $false)]
+    [switch]$ListSessions,
+
+    # Resume a specific session by name
+    [Parameter(Mandatory = $false)]
+    [string]$ResumeSession = "",
+
+    # Interactive wizard mode to configure scan step-by-step
+    [Parameter(Mandatory = $false)]
+    [switch]$Wizard
 )
 
 #region Functions
@@ -555,22 +579,22 @@ function Get-OutputFolder {
     )
 
     if ($WorkflowName -and $WorkflowName -ne "") {
-        # Workflow mode: BaseDir/SN-profile/networks|hosts/...
+        # Workflow mode: BaseDir/SN-profile/networks|hosts/host/
         $stepFolder = "S$WorkflowStep-$StepProfile"
         if ($SourceCIDR) {
             $cidrFolder = $SourceCIDR -replace '/', '-'
-            return "$BaseDir\$stepFolder\networks\$cidrFolder"
+            return "$BaseDir\$stepFolder\networks\$cidrFolder\$TargetHost"
         } else {
             return "$BaseDir\$stepFolder\hosts\$TargetHost"
         }
     } else {
-        # Single scan mode: traditional structure
+        # Single scan mode: each host has its own folder
         if ($SourceCIDR) {
-            # From CIDR: goes to networks/ folder
+            # From CIDR: goes to networks/cidr/host/ folder
             $cidrFolder = $SourceCIDR -replace '/', '-'
-            return "$BaseDir\networks\$cidrFolder"
+            return "$BaseDir\networks\$cidrFolder\$TargetHost"
         } else {
-            # Individual host: goes to hosts/ folder
+            # Individual host: goes to hosts/host/ folder
             return "$BaseDir\hosts\$TargetHost"
         }
     }
@@ -639,15 +663,37 @@ function Update-HostState {
         [string]$TargetHost,
         [string]$Status,
         [int]$Attempts,
-        [string]$Error = ""
+        [string]$Error = "",
+        [string]$ScanFile = ""
     )
 
-    $State.hosts[$TargetHost] = @{
+    $hostState = @{
         status = $Status
         attempts = $Attempts
         last_update = (Get-Date -Format "yyyy-MM-ddTHH:mm:ss")
         error = $Error
     }
+
+    # Preserve existing fields that shouldn't be overwritten
+    if ($State.hosts.ContainsKey($TargetHost)) {
+        $existingHost = $State.hosts[$TargetHost]
+        if ($existingHost.source_cidr) { $hostState.source_cidr = $existingHost.source_cidr }
+        if ($existingHost.alternative_cidrs) { $hostState.alternative_cidrs = $existingHost.alternative_cidrs }
+        if ($existingHost.output_folder) { $hostState.output_folder = $existingHost.output_folder }
+        if ($existingHost.sensitive) { $hostState.sensitive = $existingHost.sensitive }
+        if ($existingHost.scan_type) { $hostState.scan_type = $existingHost.scan_type }
+        if ($existingHost.timing) { $hostState.timing = $existingHost.timing }
+        if ($existingHost.scripts) { $hostState.scripts = $existingHost.scripts }
+    }
+
+    # Add or update scan file
+    if ($ScanFile -ne "") {
+        $hostState.scan_file = $ScanFile
+    } elseif ($State.hosts.ContainsKey($TargetHost) -and $State.hosts[$TargetHost].scan_file) {
+        $hostState.scan_file = $State.hosts[$TargetHost].scan_file
+    }
+
+    $State.hosts[$TargetHost] = $hostState
 
     # Update counters
     $State.completed = ($State.hosts.GetEnumerator() | Where-Object { $_.Value.status -eq "completed" }).Count
@@ -715,11 +761,77 @@ function Show-ProgressBar {
         [string]$StepProfile = "",
         [hashtable]$NetworkProgress = @{},
         [int]$AliveHosts = 0,
-        [hashtable]$HostStateInfo = @{}
+        [hashtable]$HostStateInfo = @{},
+        [hashtable]$ActiveJobs = @{},
+        [DateTime]$ScanStartTime = [DateTime]::MinValue,
+        [array]$CompletedDurations = @()
     )
 
-    $percent = if ($Total -gt 0) { [math]::Round(($Completed / $Total) * 100, 1) } else { 0 }
+    $percent = if ($Total -gt 0) { [math]::Min([math]::Round(($Completed / $Total) * 100, 1), 100) } else { 0 }
     $successful = $Completed - $Failed
+
+    # Count hosts with open ports (Live hosts) and without (Dead hosts)
+    $liveHosts = 0
+    $deadHosts = 0
+    if ($HostStateInfo.Count -gt 0) {
+        foreach ($hostEntry in $HostStateInfo.GetEnumerator()) {
+            $hostData = $hostEntry.Value
+            if ($hostData.status -eq "completed" -and $hostData.scan_file) {
+                if (Test-HostHasOpenPorts -NmapFilePath $hostData.scan_file) {
+                    $liveHosts++
+                } else {
+                    $deadHosts++
+                }
+            }
+        }
+    }
+
+    # Helper function to format time with days if applicable
+    function Format-TimeSpan {
+        param([TimeSpan]$TimeSpan)
+
+        if ($TimeSpan.TotalDays -ge 1) {
+            $days = [math]::Floor($TimeSpan.TotalDays)
+            return "${days}d $($TimeSpan.Hours.ToString('00')):$($TimeSpan.Minutes.ToString('00')):$($TimeSpan.Seconds.ToString('00'))"
+        } else {
+            return "$($TimeSpan.Hours.ToString('00')):$($TimeSpan.Minutes.ToString('00')):$($TimeSpan.Seconds.ToString('00'))"
+        }
+    }
+
+    # Calculate elapsed time
+    $elapsedStr = ""
+    $etaStr = ""
+    if ($ScanStartTime -ne [DateTime]::MinValue) {
+        $elapsed = (Get-Date) - $ScanStartTime
+        $elapsedStr = Format-TimeSpan -TimeSpan $elapsed
+
+        # Calculate ETA (only after 10 completed scans)
+        if ($CompletedDurations.Count -ge 10 -and $Total -gt $Completed) {
+            $avgDuration = ($CompletedDurations | Measure-Object -Average).Average
+            $remainingHosts = $Total - $Completed
+            $estimatedSeconds = $remainingHosts * $avgDuration
+            $eta = [TimeSpan]::FromSeconds($estimatedSeconds)
+            $etaStr = " / ~$(Format-TimeSpan -TimeSpan $eta) ETA"
+        }
+    }
+
+    # Get active hosts list
+    $activeHostsList = @()
+    if ($ActiveJobs.Count -gt 0) {
+        $activeHostsList = $ActiveJobs.Keys | Sort-Object
+    }
+
+    # Format active hosts display (limit to 5)
+    $currentHostsDisplay = ""
+    if ($activeHostsList.Count -gt 0) {
+        if ($activeHostsList.Count -le 5) {
+            $currentHostsDisplay = $activeHostsList -join ", "
+        } else {
+            $displayHosts = $activeHostsList[0..4] -join ", "
+            $remaining = $activeHostsList.Count - 5
+            $currentHostsDisplay = "$displayHosts, ... (+$remaining more)"
+        }
+    }
 
     # Check if we're in workflow mode
     $isWorkflow = $WorkflowStep -gt 0 -and $WorkflowTotalSteps -gt 0
@@ -731,7 +843,7 @@ function Show-ProgressBar {
         $workflowPercent = [math]::Round((($WorkflowStep - 1) / $WorkflowTotalSteps) * 100, 1)
 
         # Build main status with alive hosts and network info
-        $mainStatus = "Step $WorkflowStep/$WorkflowTotalSteps: $StepProfile | Alive: $AliveHosts/$Total hosts"
+        $mainStatus = "Step ${WorkflowStep}/${WorkflowTotalSteps}: ${StepProfile} | Alive: ${AliveHosts}/${Total} hosts"
 
         # Add network completion info if scanning multiple networks
         if ($NetworkProgress.Count -gt 0) {
@@ -746,20 +858,24 @@ function Show-ProgressBar {
                        -Status $mainStatus `
                        -PercentComplete $workflowPercent
 
-        # Build secondary status with current host network info
-        $secondaryStatus = "Progress: $Completed/$Total ($percent%) | Success: $successful | Failed: $Failed"
+        # Build secondary status - Ultra compact format
+        $secondaryStatus = "$Completed/$Total ($percent%) | OK: $successful | Fail: $Failed"
 
-        if ($CurrentHost -ne "") {
-            $secondaryStatus += " | Current: $CurrentHost"
+        if ($liveHosts -gt 0) {
+            $secondaryStatus += " | Live: $liveHosts"
+        }
 
-            # If current host belongs to a network, show network progress
-            if ($HostStateInfo.ContainsKey($CurrentHost)) {
-                $hostCIDR = $HostStateInfo[$CurrentHost].source_cidr
-                if ($hostCIDR -and $NetworkProgress.ContainsKey($hostCIDR)) {
-                    $netProg = $NetworkProgress[$hostCIDR]
-                    $secondaryStatus += " | Network: $hostCIDR ($($netProg.Alive)/$($netProg.Total) alive)"
-                }
-            }
+        if ($deadHosts -gt 0) {
+            $secondaryStatus += " | Dead: $deadHosts"
+        }
+
+        if ($elapsedStr -ne "") {
+            $secondaryStatus += " | Time: $elapsedStr$etaStr"
+        }
+
+        $secondaryCurrentOperation = ""
+        if ($currentHostsDisplay -ne "") {
+            $secondaryCurrentOperation = "Current ($($activeHostsList.Count)): $currentHostsDisplay"
         }
 
         # Secondary progress bar: Current step hosts
@@ -767,11 +883,32 @@ function Show-ProgressBar {
                        -ParentId 1 `
                        -Activity "Current step: $StepProfile" `
                        -Status $secondaryStatus `
+                       -CurrentOperation $secondaryCurrentOperation `
                        -PercentComplete $percent
     } else {
-        # Single scan mode: Show single progress bar
+        # Single scan mode: Show single progress bar - Ultra compact format
+        $statusMessage = "$Completed/$Total ($percent%) | OK: $successful | Fail: $Failed"
+
+        if ($liveHosts -gt 0) {
+            $statusMessage += " | Live: $liveHosts"
+        }
+
+        if ($deadHosts -gt 0) {
+            $statusMessage += " | Dead: $deadHosts"
+        }
+
+        if ($elapsedStr -ne "") {
+            $statusMessage += " | Time: $elapsedStr$etaStr"
+        }
+
+        $currentOperation = ""
+        if ($currentHostsDisplay -ne "") {
+            $currentOperation = "Current ($($activeHostsList.Count)): $currentHostsDisplay"
+        }
+
         Write-Progress -Activity "Scanning hosts" `
-                       -Status "Progress: $Completed/$Total ($percent%) | Success: $successful | Failed: $Failed | Current: $CurrentHost" `
+                       -Status $statusMessage `
+                       -CurrentOperation $currentOperation `
                        -PercentComplete $percent
     }
 }
@@ -1043,20 +1180,954 @@ function Invoke-NmapScan {
     }
 }
 
+function Test-SessionName {
+    param(
+        [string]$Name
+    )
+
+    # Validations
+    if ([string]::IsNullOrWhiteSpace($Name)) {
+        return @{
+            Valid = $false
+            Message = "Session name cannot be empty"
+        }
+    }
+
+    # Minimum length: 3 characters
+    if ($Name.Length -lt 3) {
+        return @{
+            Valid = $false
+            Message = "Session name must be at least 3 characters long"
+        }
+    }
+
+    # Maximum length: 50 characters
+    if ($Name.Length -gt 50) {
+        return @{
+            Valid = $false
+            Message = "Session name cannot exceed 50 characters"
+        }
+    }
+
+    # Only allow alphanumeric, hyphens, underscores
+    if ($Name -notmatch '^[a-zA-Z0-9_-]+$') {
+        return @{
+            Valid = $false
+            Message = "Session name can only contain letters, numbers, hyphens, and underscores"
+        }
+    }
+
+    return @{
+        Valid = $true
+        Message = "Valid session name"
+    }
+}
+
+function Initialize-Session {
+    param(
+        [string]$SessionName,
+        [string]$OutputDir,
+        [string]$ScanType,
+        [string]$Workflow
+    )
+
+    $sessionsDir = Join-Path $OutputDir ".sessions"
+    $sessionDir = Join-Path $sessionsDir $SessionName
+
+    # Create .sessions directory if it doesn't exist
+    if (-not (Test-Path $sessionsDir)) {
+        New-Item -ItemType Directory -Path $sessionsDir -Force | Out-Null
+    }
+
+    # Create session directory
+    if (-not (Test-Path $sessionDir)) {
+        New-Item -ItemType Directory -Path $sessionDir -Force | Out-Null
+    }
+
+    return $sessionDir
+}
+
+function Get-SessionList {
+    param(
+        [string]$OutputDir
+    )
+
+    $sessionsDir = Join-Path $OutputDir ".sessions"
+
+    # Check if .sessions directory exists
+    if (-not (Test-Path $sessionsDir)) {
+        Write-Host "`nNo se encontraron sesiones en: " -NoNewline -ForegroundColor Yellow
+        Write-Host "$OutputDir" -ForegroundColor White
+        Write-Host ""
+        Write-Host "El directorio " -NoNewline -ForegroundColor Gray
+        Write-Host ".sessions/" -NoNewline -ForegroundColor Cyan
+        Write-Host " no existe en este directorio." -ForegroundColor Gray
+        Write-Host ""
+        Write-Host "Sugerencias:" -ForegroundColor Cyan
+        Write-Host "  • Usa " -NoNewline -ForegroundColor Gray
+        Write-Host "-OutputDir <directorio>" -NoNewline -ForegroundColor Yellow
+        Write-Host " para buscar en un directorio diferente" -ForegroundColor Gray
+        Write-Host "  • Usa " -NoNewline -ForegroundColor Gray
+        Write-Host "-SessionName <nombre>" -NoNewline -ForegroundColor Yellow
+        Write-Host " para crear una nueva sesión con nombre" -ForegroundColor Gray
+        Write-Host ""
+        Write-Host "Ejemplo:" -ForegroundColor Cyan
+        Write-Host "  .\scanyx.ps1 -ListSessions -OutputDir <tu-directorio>" -ForegroundColor White
+        Write-Host ""
+        return @()
+    }
+
+    # Get all session directories
+    $sessionDirs = Get-ChildItem -Path $sessionsDir -Directory
+
+    if ($sessionDirs.Count -eq 0) {
+        Write-Host "`nNo se encontraron sesiones en: " -NoNewline -ForegroundColor Yellow
+        Write-Host "$OutputDir" -ForegroundColor White
+        Write-Host ""
+        Write-Host "El directorio existe pero no contiene sesiones." -ForegroundColor Gray
+        Write-Host ""
+        Write-Host "Sugerencias:" -ForegroundColor Cyan
+        Write-Host "  • Usa " -NoNewline -ForegroundColor Gray
+        Write-Host "-SessionName <nombre>" -NoNewline -ForegroundColor Yellow
+        Write-Host " para crear una nueva sesión con nombre" -ForegroundColor Gray
+        Write-Host ""
+        return @()
+    }
+
+    $sessions = @()
+
+    foreach ($dir in $sessionDirs) {
+        $stateFile = Join-Path $dir.FullName "scan-state.json"
+
+        if (Test-Path $stateFile) {
+            try {
+                $state = Get-Content $stateFile -Raw | ConvertFrom-Json
+
+                $elapsed = 0
+                if ($state.start_time) {
+                    $startTime = [DateTime]::Parse($state.start_time)
+                    if ($state.end_time) {
+                        $endTime = [DateTime]::Parse($state.end_time)
+                        $elapsed = ($endTime - $startTime).TotalSeconds
+                    } else {
+                        $elapsed = ((Get-Date) - $startTime).TotalSeconds
+                    }
+                }
+
+                $sessions += [PSCustomObject]@{
+                    Name = $dir.Name
+                    Type = if ($state.workflow) { "Workflow: $($state.workflow)" } else { $state.scan_type }
+                    Status = $state.status
+                    Total = if ($state.total_hosts) { $state.total_hosts } else { $state.hosts.Count }
+                    Completed = if ($state.completed) { $state.completed } else { 0 }
+                    Failed = if ($state.failed) { $state.failed } else { 0 }
+                    Pending = if ($state.pending) { $state.pending } else { 0 }
+                    StartTime = $state.start_time
+                    EndTime = $state.end_time
+                    ElapsedSeconds = [int]$elapsed
+                    StateFile = $stateFile
+                }
+            } catch {
+                Write-Warning "Failed to load session state: $($dir.Name)"
+            }
+        }
+    }
+
+    # Sort by start time (most recent first)
+    $sessions = $sessions | Sort-Object StartTime -Descending
+
+    return $sessions
+}
+
+function Show-SessionList {
+    param(
+        [array]$Sessions,
+        [switch]$SuppressHeader
+    )
+
+    if (-not $SuppressHeader) {
+        Write-Host "`nAvailable Sessions in: " -NoNewline -ForegroundColor Cyan
+        Write-Host "$OutputDir`n" -ForegroundColor White
+    }
+
+    foreach ($session in $Sessions) {
+        # Format duration
+        $duration = ""
+        if ($session.ElapsedSeconds -gt 0) {
+            $hours = [math]::Floor($session.ElapsedSeconds / 3600)
+            $minutes = [math]::Floor(($session.ElapsedSeconds % 3600) / 60)
+            $seconds = $session.ElapsedSeconds % 60
+
+            if ($hours -gt 0) {
+                $duration = "${hours}h ${minutes}m"
+            } elseif ($minutes -gt 0) {
+                $duration = "${minutes}m ${seconds}s"
+            } else {
+                $duration = "${seconds}s"
+            }
+        }
+
+        # Calculate progress percentage
+        $progress = 0
+        if ($session.Total -gt 0) {
+            $progress = [math]::Round(($session.Completed / $session.Total) * 100, 1)
+        }
+
+        # Status color
+        $statusColor = switch ($session.Status) {
+            "completed" { "Green" }
+            "in_progress" { "Yellow" }
+            "interrupted" { "Cyan" }
+            default { "Gray" }
+        }
+
+        Write-Host "┌─────────────────────────────────────────────────────────────────────┐" -ForegroundColor Cyan
+        Write-Host "│ Session: " -NoNewline -ForegroundColor Cyan
+        Write-Host "$($session.Name)" -NoNewline -ForegroundColor White
+        Write-Host (" " * (60 - $session.Name.Length)) -NoNewline
+        Write-Host "│" -ForegroundColor Cyan
+        Write-Host "├─────────────────────────────────────────────────────────────────────┤" -ForegroundColor Cyan
+
+        Write-Host "│ Type       : " -NoNewline -ForegroundColor Cyan
+        Write-Host "$($session.Type)" -NoNewline -ForegroundColor White
+        Write-Host (" " * (56 - $session.Type.Length)) -NoNewline
+        Write-Host "│" -ForegroundColor Cyan
+
+        Write-Host "│ Status     : " -NoNewline -ForegroundColor Cyan
+        Write-Host "$($session.Status)" -NoNewline -ForegroundColor $statusColor
+        Write-Host (" " * (56 - $session.Status.Length)) -NoNewline
+        Write-Host "│" -ForegroundColor Cyan
+
+        $progressLine = "$($session.Completed)/$($session.Total) ($progress%) | Success: $($session.Completed) | Failed: $($session.Failed)"
+        Write-Host "│ Progress   : " -NoNewline -ForegroundColor Cyan
+        Write-Host "$progressLine" -NoNewline -ForegroundColor White
+        Write-Host (" " * (56 - $progressLine.Length)) -NoNewline
+        Write-Host "│" -ForegroundColor Cyan
+
+        if ($session.StartTime) {
+            $startFormatted = ([DateTime]::Parse($session.StartTime)).ToString("yyyy-MM-dd HH:mm:ss")
+            Write-Host "│ Started    : " -NoNewline -ForegroundColor Cyan
+            Write-Host "$startFormatted" -NoNewline -ForegroundColor White
+            Write-Host (" " * (56 - $startFormatted.Length)) -NoNewline
+            Write-Host "│" -ForegroundColor Cyan
+        }
+
+        if ($session.Status -eq "completed" -and $session.EndTime) {
+            Write-Host "│ Duration   : " -NoNewline -ForegroundColor Cyan
+            Write-Host "$duration" -NoNewline -ForegroundColor White
+            Write-Host (" " * (56 - $duration.Length)) -NoNewline
+            Write-Host "│" -ForegroundColor Cyan
+        } elseif ($session.Status -eq "in_progress") {
+            Write-Host "│ Elapsed    : " -NoNewline -ForegroundColor Cyan
+            Write-Host "$duration" -NoNewline -ForegroundColor White
+            Write-Host (" " * (56 - $duration.Length)) -NoNewline
+            Write-Host "│" -ForegroundColor Cyan
+        }
+
+        $relativePath = $session.StateFile.Replace($OutputDir, "").TrimStart('\')
+        # Truncate path if too long
+        if ($relativePath.Length -gt 56) {
+            $relativePath = "..." + $relativePath.Substring($relativePath.Length - 53)
+        }
+        Write-Host "│ State File : " -NoNewline -ForegroundColor Cyan
+        Write-Host "$relativePath" -NoNewline -ForegroundColor Gray
+        $padding = [Math]::Max(0, 56 - $relativePath.Length)
+        Write-Host (" " * $padding) -NoNewline
+        Write-Host "│" -ForegroundColor Cyan
+
+        Write-Host "└─────────────────────────────────────────────────────────────────────┘" -ForegroundColor Cyan
+        Write-Host ""
+    }
+
+    if (-not $SuppressHeader) {
+        Write-Host "Total: " -NoNewline -ForegroundColor Cyan
+        Write-Host "$($Sessions.Count) session(s) found`n" -ForegroundColor White
+    }
+}
+
+function Get-SessionState {
+    param(
+        [string]$SessionName,
+        [string]$OutputDir
+    )
+
+    $sessionsDir = Join-Path $OutputDir ".sessions"
+    $sessionDir = Join-Path $sessionsDir $SessionName
+    $stateFile = Join-Path $sessionDir "scan-state.json"
+
+    if (-not (Test-Path $sessionDir)) {
+        Write-Host "`n[ERROR] Session '$SessionName' not found" -ForegroundColor Red
+        Write-Host "Available sessions:" -ForegroundColor Yellow
+        $sessions = Get-SessionList -OutputDir $OutputDir
+        if ($sessions.Count -gt 0) {
+            foreach ($s in $sessions) {
+                Write-Host "  - $($s.Name)" -ForegroundColor Gray
+            }
+        }
+        Write-Host "`nTip: Use -ListSessions to see all available sessions`n" -ForegroundColor Gray
+        return $null
+    }
+
+    if (-not (Test-Path $stateFile)) {
+        Write-Host "`n[ERROR] Session state file not found for session '$SessionName'" -ForegroundColor Red
+        Write-Host "State file expected at: $stateFile`n" -ForegroundColor Gray
+        return $null
+    }
+
+    try {
+        $state = Load-StateFile -StateFile $stateFile
+        return @{
+            State = $state
+            SessionDir = $sessionDir
+            StateFile = $stateFile
+        }
+    } catch {
+        Write-Host "`n[ERROR] Failed to load session state: $($_.Exception.Message)`n" -ForegroundColor Red
+        return $null
+    }
+}
+
+#region Wizard Functions
+
+function Show-WizardHeader {
+    param([string]$Title, [int]$Step, [int]$TotalSteps)
+
+    Clear-Host
+    Write-Host ""
+    Write-Host " ░▒▓███████▓▒░░▒▓██████▓▒░ ░▒▓██████▓▒░░▒▓███████▓▒░░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░" -ForegroundColor Red
+    Write-Host "░▒▓█▓▒░      ░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░" -ForegroundColor Red
+    Write-Host "░▒▓█▓▒░      ░▒▓█▓▒░      ░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░" -ForegroundColor Red
+    Write-Host " ░▒▓██████▓▒░░▒▓█▓▒░      ░▒▓████████▓▒░▒▓█▓▒░░▒▓█▓▒░░▒▓██████▓▒░ ░▒▓██████▓▒░ " -ForegroundColor Red
+    Write-Host "       ░▒▓█▓▒░▒▓█▓▒░      ░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░  ░▒▓█▓▒░   ░▒▓█▓▒░░▒▓█▓▒░" -ForegroundColor Red
+    Write-Host "       ░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░  ░▒▓█▓▒░   ░▒▓█▓▒░░▒▓█▓▒░" -ForegroundColor Red
+    Write-Host "░▒▓███████▓▒░ ░▒▓██████▓▒░░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░  ░▒▓█▓▒░   ░▒▓█▓▒░░▒▓█▓▒░" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "                        https://github.com/xtormin/Scanyx" -ForegroundColor Red
+    Write-Host "                           @xtormin (Jennifer Torres)" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "╭─────────────────────────────────────────────────────────────────────────────╮" -ForegroundColor Cyan
+    Write-Host "│ INTERACTIVE CONFIGURATION                                                   │" -ForegroundColor Cyan
+    Write-Host "╰─────────────────────────────────────────────────────────────────────────────╯" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  Step " -NoNewline -ForegroundColor White
+    Write-Host "$Step" -NoNewline -ForegroundColor Yellow
+    Write-Host " of " -NoNewline -ForegroundColor White
+    Write-Host "$TotalSteps" -NoNewline -ForegroundColor Yellow
+    Write-Host " - " -NoNewline -ForegroundColor White
+    Write-Host "$Title" -ForegroundColor Cyan
+    Write-Host ""
+}
+
+function Get-ScanTypeChoice {
+    param([hashtable]$Profiles)
+
+    Write-Host "  Scan profiles:" -ForegroundColor White
+    Write-Host ""
+
+    $index = 1
+    $profileList = @()
+    foreach ($key in $Profiles.Keys | Sort-Object) {
+        $scanProfile = $Profiles[$key]
+        Write-Host "    [$index] " -NoNewline -ForegroundColor Yellow
+        Write-Host "$($scanProfile.name)" -NoNewline -ForegroundColor White
+        Write-Host " - $($scanProfile.description)" -ForegroundColor Gray
+        $profileList += $key
+        $index++
+    }
+
+    Write-Host ""
+    Write-Host "  Select scan type [1-$($profileList.Count)]: " -NoNewline -ForegroundColor Cyan
+
+    $selection = Read-Host
+
+    if ($selection -match '^\d+$' -and [int]$selection -ge 1 -and [int]$selection -le $profileList.Count) {
+        return $profileList[[int]$selection - 1]
+    } else {
+        Write-Host ""
+        Write-Host "  [ERROR] Invalid selection. Using default profile: tcp-1000" -ForegroundColor Red
+        Start-Sleep -Seconds 2
+        return "tcp-1000"
+    }
+}
+
+function Get-WorkflowChoice {
+    param([hashtable]$Workflows)
+
+    Write-Host "  Do you want to run a workflow (multiple scans in sequence)? [Y/n]: " -NoNewline -ForegroundColor Cyan
+    $useWorkflow = Read-Host
+
+    if ($useWorkflow -eq "" -or $useWorkflow -match '^[Yy]') {
+        Write-Host ""
+        Write-Host "  Available workflows:" -ForegroundColor White
+        Write-Host ""
+
+        $index = 1
+        $workflowList = @()
+        foreach ($key in $Workflows.Keys | Sort-Object) {
+            $workflow = $Workflows[$key]
+            Write-Host "    [$index] " -NoNewline -ForegroundColor Yellow
+            Write-Host "$($workflow.name)" -NoNewline -ForegroundColor White
+            Write-Host " - $($workflow.description)" -ForegroundColor Gray
+            $workflowList += $key
+            $index++
+        }
+
+        Write-Host ""
+        Write-Host "  Select workflow [1-$($workflowList.Count)] or Enter to cancel: " -NoNewline -ForegroundColor Cyan
+        $selection = Read-Host
+
+        if ($selection -match '^\d+$' -and [int]$selection -ge 1 -and [int]$selection -le $workflowList.Count) {
+            return $workflowList[[int]$selection - 1]
+        }
+    }
+
+    return $null
+}
+
+function Get-HostFileInput {
+    Write-Host "  Host file path (or Enter to specify hosts directly): " -NoNewline -ForegroundColor Cyan
+    $hostFile = Read-Host
+
+    if ($hostFile -ne "" -and -not (Test-Path $hostFile)) {
+        Write-Host ""
+        Write-Host "  [WARNING] File does not exist: $hostFile" -ForegroundColor Yellow
+        Write-Host "  Continue anyway? [y/N]: " -NoNewline -ForegroundColor Cyan
+        $continue = Read-Host
+        if ($continue -notmatch '^[Yy]') {
+            return ""
+        }
+    }
+
+    return $hostFile
+}
+
+function Get-DirectHostsInput {
+    Write-Host "  Hosts to scan (comma-separated - IPs, CIDRs or hostnames):" -ForegroundColor Cyan
+    Write-Host "  Example: 192.168.1.0/24,10.0.0.50,server.example.com" -ForegroundColor Gray
+    Write-Host "  > " -NoNewline -ForegroundColor Cyan
+    $hostsInput = Read-Host
+
+    if ($hostsInput -ne "") {
+        return $hostsInput -split ',' | ForEach-Object { $_.Trim() }
+    }
+
+    return @()
+}
+
+function Get-SessionNameInput {
+    Write-Host "  Custom session name (optional): " -NoNewline -ForegroundColor Cyan
+    $sessionName = Read-Host
+
+    if ($sessionName -ne "") {
+        # Validate session name
+        $validation = Test-SessionName -Name $sessionName
+        if (-not $validation.Valid) {
+            Write-Host ""
+            Write-Host "  [ERROR] $($validation.Message)" -ForegroundColor Red
+            Start-Sleep -Seconds 2
+            return ""
+        }
+    }
+
+    return $sessionName
+}
+
+function Get-ExclusionInput {
+    Write-Host "  Exclude some hosts from scan? [y/N]: " -NoNewline -ForegroundColor Cyan
+    $exclude = Read-Host
+
+    $result = @{
+        ExcludeFile = ""
+        ExcludeHosts = @()
+        ResolveHostnames = $false
+    }
+
+    if ($exclude -match '^[Yy]') {
+        Write-Host ""
+        Write-Host "  Exclusion file (or Enter to specify hosts directly): " -NoNewline -ForegroundColor Cyan
+        $excludeFile = Read-Host
+
+        if ($excludeFile -eq "") {
+            Write-Host "  Hosts to exclude (comma-separated): " -NoNewline -ForegroundColor Cyan
+            $excludeHosts = Read-Host
+            if ($excludeHosts -ne "") {
+                $result.ExcludeHosts = $excludeHosts -split ',' | ForEach-Object { $_.Trim() }
+            }
+        } else {
+            $result.ExcludeFile = $excludeFile
+        }
+
+        Write-Host "  Resolve hostnames for exclusions? [y/N]: " -NoNewline -ForegroundColor Cyan
+        $resolve = Read-Host
+        $result.ResolveHostnames = ($resolve -match '^[Yy]')
+    }
+
+    return $result
+}
+
+function Get-SensitiveHostsInput {
+    Write-Host "  Are there sensitive hosts requiring careful scanning? [y/N]: " -NoNewline -ForegroundColor Cyan
+    $sensitive = Read-Host
+
+    $result = @{
+        SensitiveFile = ""
+        SensitiveHosts = @()
+        SensitiveTiming = "T2"
+        SensitiveScripts = "default"
+    }
+
+    if ($sensitive -match '^[Yy]') {
+        Write-Host ""
+        Write-Host "  Sensitive hosts file (or Enter to specify directly): " -NoNewline -ForegroundColor Cyan
+        $sensitiveFile = Read-Host
+
+        if ($sensitiveFile -eq "") {
+            Write-Host "  Sensitive hosts (comma-separated): " -NoNewline -ForegroundColor Cyan
+            $sensitiveHosts = Read-Host
+            if ($sensitiveHosts -ne "") {
+                $result.SensitiveHosts = $sensitiveHosts -split ',' | ForEach-Object { $_.Trim() }
+            }
+        } else {
+            $result.SensitiveFile = $sensitiveFile
+        }
+
+        Write-Host ""
+        Write-Host "  Timing for sensitive hosts [T0-T4, default: T2]: " -NoNewline -ForegroundColor Cyan
+        $timing = Read-Host
+        if ($timing -match '^T[0-4]$') {
+            $result.SensitiveTiming = $timing
+        }
+
+        Write-Host "  NSE scripts [default/vuln/none/default+vuln, default: default]: " -NoNewline -ForegroundColor Cyan
+        $scripts = Read-Host
+        if ($scripts -in @("default", "vuln", "none", "default+vuln")) {
+            $result.SensitiveScripts = $scripts
+        }
+    }
+
+    return $result
+}
+
+function Get-PerformanceSettings {
+    $result = @{
+        MaxConcurrent = 5
+        MaxRetries = 1
+        RetryDelay = 60
+    }
+
+    Write-Host "  Maximum concurrent scans [1-50, default: 5]: " -NoNewline -ForegroundColor Cyan
+    $concurrent = Read-Host
+    if ($concurrent -match '^\d+$' -and [int]$concurrent -ge 1 -and [int]$concurrent -le 50) {
+        $result.MaxConcurrent = [int]$concurrent
+    }
+
+    Write-Host "  Maximum retries for failed scans [0-10, default: 1]: " -NoNewline -ForegroundColor Cyan
+    $retries = Read-Host
+    if ($retries -match '^\d+$' -and [int]$retries -ge 0 -and [int]$retries -le 10) {
+        $result.MaxRetries = [int]$retries
+    }
+
+    Write-Host "  Delay between retries in seconds [0-3600, default: 60]: " -NoNewline -ForegroundColor Cyan
+    $delay = Read-Host
+    if ($delay -match '^\d+$' -and [int]$delay -ge 0 -and [int]$delay -le 3600) {
+        $result.RetryDelay = [int]$delay
+    }
+
+    return $result
+}
+
+function Get-OutputSettings {
+    $result = @{
+        OutputDir = "nmap"
+        OverwriteMode = "Ask"
+        VerboseMode = $false
+    }
+
+    Write-Host "  Output directory [default: nmap]: " -NoNewline -ForegroundColor Cyan
+    $outputDir = Read-Host
+    if ($outputDir -ne "") {
+        $result.OutputDir = $outputDir
+    }
+
+    Write-Host "  Overwrite mode [Skip/Overwrite/Ask, default: Ask]: " -NoNewline -ForegroundColor Cyan
+    $overwrite = Read-Host
+    if ($overwrite -in @("Skip", "Overwrite", "Ask")) {
+        $result.OverwriteMode = $overwrite
+    }
+
+    Write-Host "  Enable verbose mode (show full nmap commands)? [y/N]: " -NoNewline -ForegroundColor Cyan
+    $verbose = Read-Host
+    $result.VerboseMode = ($verbose -match '^[Yy]')
+
+    return $result
+}
+
+function Get-AdvancedOptions {
+    $result = @{
+        Unprivileged = $false
+        ConfigFile = ""
+    }
+
+    Write-Host "  ¿Usar modo no privilegiado (--unprivileged)? [s/N]: " -NoNewline -ForegroundColor Cyan
+    $unprivileged = Read-Host
+    $result.Unprivileged = ($unprivileged -match '^[Ss]')
+
+    Write-Host "  Archivo de configuración personalizado (opcional): " -NoNewline -ForegroundColor Cyan
+    $configFile = Read-Host
+    if ($configFile -ne "") {
+        $result.ConfigFile = $configFile
+    }
+
+    return $result
+}
+
+function Show-WizardSummary {
+    param([hashtable]$Config)
+
+    Write-Host ""
+    Write-Host "╭─────────────────────────────────────────────────────────────────────────────╮" -ForegroundColor Cyan
+    Write-Host "│ RESUMEN DE CONFIGURACIÓN                                                    │" -ForegroundColor Cyan
+    Write-Host "╰─────────────────────────────────────────────────────────────────────────────╯" -ForegroundColor Cyan
+    Write-Host ""
+
+    if ($Config.Workflow) {
+        Write-Host "  Workflow       : " -NoNewline -ForegroundColor White
+        Write-Host "$($Config.Workflow)" -ForegroundColor Yellow
+    } else {
+        Write-Host "  Tipo de Escaneo: " -NoNewline -ForegroundColor White
+        Write-Host "$($Config.ScanType)" -ForegroundColor Yellow
+    }
+
+    if ($Config.HostFile) {
+        Write-Host "  Archivo Hosts  : " -NoNewline -ForegroundColor White
+        Write-Host "$($Config.HostFile)" -ForegroundColor Green
+    }
+
+    if ($Config.Hosts.Count -gt 0) {
+        Write-Host "  Hosts Directos : " -NoNewline -ForegroundColor White
+        Write-Host "$($Config.Hosts.Count) host(s)" -ForegroundColor Green
+    }
+
+    if ($Config.SessionName) {
+        Write-Host "  Nombre Sesión  : " -NoNewline -ForegroundColor White
+        Write-Host "$($Config.SessionName)" -ForegroundColor Magenta
+    }
+
+    if ($Config.ExcludeFile -or $Config.ExcludeHosts.Count -gt 0) {
+        Write-Host "  Exclusiones    : " -NoNewline -ForegroundColor White
+        if ($Config.ExcludeFile) {
+            Write-Host "$($Config.ExcludeFile)" -ForegroundColor Red
+        } else {
+            Write-Host "$($Config.ExcludeHosts.Count) host(s)" -ForegroundColor Red
+        }
+    }
+
+    if ($Config.SensitiveFile -or $Config.SensitiveHosts.Count -gt 0) {
+        Write-Host "  Hosts Sensibles: " -NoNewline -ForegroundColor White
+        if ($Config.SensitiveFile) {
+            Write-Host "$($Config.SensitiveFile)" -ForegroundColor Yellow
+        } else {
+            Write-Host "$($Config.SensitiveHosts.Count) host(s)" -ForegroundColor Yellow
+        }
+        Write-Host "    └─ Timing    : " -NoNewline -ForegroundColor Gray
+        Write-Host "$($Config.SensitiveTiming)" -NoNewline -ForegroundColor White
+        Write-Host " | Scripts: " -NoNewline -ForegroundColor Gray
+        Write-Host "$($Config.SensitiveScripts)" -ForegroundColor White
+    }
+
+    Write-Host "  Concurrencia   : " -NoNewline -ForegroundColor White
+    Write-Host "$($Config.MaxConcurrent)" -NoNewline -ForegroundColor Cyan
+    Write-Host " | Reintentos: " -NoNewline -ForegroundColor White
+    Write-Host "$($Config.MaxRetries)" -NoNewline -ForegroundColor Cyan
+    Write-Host " | Delay: " -NoNewline -ForegroundColor White
+    Write-Host "$($Config.RetryDelay)s" -ForegroundColor Cyan
+
+    Write-Host "  Salida         : " -NoNewline -ForegroundColor White
+    Write-Host "$($Config.OutputDir)" -NoNewline -ForegroundColor Green
+    Write-Host " | Sobrescritura: " -NoNewline -ForegroundColor White
+    Write-Host "$($Config.OverwriteMode)" -ForegroundColor Green
+
+    if ($Config.VerboseMode) {
+        Write-Host "  Modo Verbose   : " -NoNewline -ForegroundColor White
+        Write-Host "Activado" -ForegroundColor Yellow
+    }
+
+    if ($Config.Unprivileged) {
+        Write-Host "  No Privilegiado: " -NoNewline -ForegroundColor White
+        Write-Host "Activado" -ForegroundColor Yellow
+    }
+
+    Write-Host ""
+}
+
+function New-CommandString {
+    param([hashtable]$Config)
+
+    $cmd = ".\scanyx.ps1"
+
+    # Scan type or workflow
+    if ($Config.Workflow) {
+        $cmd += " -Workflow `"$($Config.Workflow)`""
+    } else {
+        $cmd += " -ScanType `"$($Config.ScanType)`""
+    }
+
+    # Hosts
+    if ($Config.HostFile) {
+        $cmd += " -HostFile `"$($Config.HostFile)`""
+    }
+
+    if ($Config.Hosts.Count -gt 0) {
+        $hostsStr = ($Config.Hosts | ForEach-Object { "`"$_`"" }) -join ","
+        $cmd += " -Hosts $hostsStr"
+    }
+
+    # Session name
+    if ($Config.SessionName) {
+        $cmd += " -SessionName `"$($Config.SessionName)`""
+    }
+
+    # Exclusions
+    if ($Config.ExcludeFile) {
+        $cmd += " -ExcludeFile `"$($Config.ExcludeFile)`""
+    }
+
+    if ($Config.ExcludeHosts.Count -gt 0) {
+        $excludeStr = ($Config.ExcludeHosts | ForEach-Object { "`"$_`"" }) -join ","
+        $cmd += " -ExcludeHosts $excludeStr"
+    }
+
+    if ($Config.ResolveHostnames) {
+        $cmd += " -ResolveHostnames"
+    }
+
+    # Sensitive hosts
+    if ($Config.SensitiveFile) {
+        $cmd += " -SensitiveFile `"$($Config.SensitiveFile)`""
+    }
+
+    if ($Config.SensitiveHosts.Count -gt 0) {
+        $sensitiveStr = ($Config.SensitiveHosts | ForEach-Object { "`"$_`"" }) -join ","
+        $cmd += " -SensitiveHosts $sensitiveStr"
+    }
+
+    if ($Config.SensitiveTiming -ne "T2") {
+        $cmd += " -SensitiveTiming $($Config.SensitiveTiming)"
+    }
+
+    if ($Config.SensitiveScripts -ne "default") {
+        $cmd += " -SensitiveScripts $($Config.SensitiveScripts)"
+    }
+
+    # Performance
+    if ($Config.MaxConcurrent -ne 5) {
+        $cmd += " -MaxConcurrent $($Config.MaxConcurrent)"
+    }
+
+    if ($Config.MaxRetries -ne 1) {
+        $cmd += " -MaxRetries $($Config.MaxRetries)"
+    }
+
+    if ($Config.RetryDelay -ne 60) {
+        $cmd += " -RetryDelay $($Config.RetryDelay)"
+    }
+
+    # Output
+    if ($Config.OutputDir -ne "nmap") {
+        $cmd += " -OutputDir `"$($Config.OutputDir)`""
+    }
+
+    if ($Config.OverwriteMode -ne "Ask") {
+        $cmd += " -OverwriteMode $($Config.OverwriteMode)"
+    }
+
+    if ($Config.VerboseMode) {
+        $cmd += " -VerboseMode"
+    }
+
+    # Advanced
+    if ($Config.Unprivileged) {
+        $cmd += " -Unprivileged"
+    }
+
+    if ($Config.ConfigFile) {
+        $cmd += " -ConfigFile `"$($Config.ConfigFile)`""
+    }
+
+    return $cmd
+}
+
+function Show-GeneratedCommand {
+    param([string]$Command)
+
+    Write-Host "╭─────────────────────────────────────────────────────────────────────────────╮" -ForegroundColor Green
+    Write-Host "│ COMANDO GENERADO                                                            │" -ForegroundColor Green
+    Write-Host "╰─────────────────────────────────────────────────────────────────────────────╯" -ForegroundColor Green
+    Write-Host ""
+    Write-Host "  $Command" -ForegroundColor White
+    Write-Host ""
+    Write-Host "  Puedes copiar este comando para usarlo en futuras ejecuciones." -ForegroundColor Gray
+    Write-Host ""
+}
+
+function Confirm-Execution {
+    Write-Host "  ¿Deseas ejecutar este escaneo ahora? [S/n]: " -NoNewline -ForegroundColor Cyan
+    $execute = Read-Host
+
+    return ($execute -eq "" -or $execute -match '^[Ss]')
+}
+
+function Start-ScanWizard {
+    param(
+        [hashtable]$ScanProfiles,
+        [hashtable]$Workflows
+    )
+
+    $config = @{
+        ScanType = ""
+        Workflow = ""
+        HostFile = ""
+        Hosts = @()
+        SessionName = ""
+        ExcludeFile = ""
+        ExcludeHosts = @()
+        ResolveHostnames = $false
+        SensitiveFile = ""
+        SensitiveHosts = @()
+        SensitiveTiming = "T2"
+        SensitiveScripts = "default"
+        MaxConcurrent = 5
+        MaxRetries = 1
+        RetryDelay = 60
+        OutputDir = "nmap"
+        OverwriteMode = "Ask"
+        VerboseMode = $false
+        Unprivileged = $false
+        ConfigFile = ""
+    }
+
+    # Step 1: Scan Type or Workflow
+    Show-WizardHeader -Title "Tipo de Escaneo" -Step 1 -TotalSteps 10
+
+    # Check if workflows are available
+    if ($Workflows -and $Workflows.Count -gt 0) {
+        $workflowChoice = Get-WorkflowChoice -Workflows $Workflows
+        if ($workflowChoice) {
+            $config.Workflow = $workflowChoice
+        }
+    }
+
+    if (-not $config.Workflow) {
+        $config.ScanType = Get-ScanTypeChoice -Profiles $ScanProfiles
+    }
+
+    # Step 2: Host Input
+    Show-WizardHeader -Title "Hosts a Escanear" -Step 2 -TotalSteps 10
+    $config.HostFile = Get-HostFileInput
+
+    if ($config.HostFile -eq "") {
+        $config.Hosts = Get-DirectHostsInput
+
+        if ($config.Hosts.Count -eq 0) {
+            Write-Host ""
+            Write-Host "  [ERROR] Debes especificar al menos un host o archivo de hosts." -ForegroundColor Red
+            Write-Host "  Presiona Enter para salir del wizard..." -ForegroundColor Gray
+            Read-Host
+            exit 1
+        }
+    }
+
+    # Step 3: Session Name
+    Show-WizardHeader -Title "Nombre de Sesión" -Step 3 -TotalSteps 10
+    $config.SessionName = Get-SessionNameInput
+
+    # Step 4: Exclusions
+    Show-WizardHeader -Title "Exclusiones" -Step 4 -TotalSteps 10
+    $exclusions = Get-ExclusionInput
+    $config.ExcludeFile = $exclusions.ExcludeFile
+    $config.ExcludeHosts = $exclusions.ExcludeHosts
+    $config.ResolveHostnames = $exclusions.ResolveHostnames
+
+    # Step 5: Sensitive Hosts
+    Show-WizardHeader -Title "Hosts Sensibles" -Step 5 -TotalSteps 10
+    $sensitive = Get-SensitiveHostsInput
+    $config.SensitiveFile = $sensitive.SensitiveFile
+    $config.SensitiveHosts = $sensitive.SensitiveHosts
+    $config.SensitiveTiming = $sensitive.SensitiveTiming
+    $config.SensitiveScripts = $sensitive.SensitiveScripts
+
+    # Step 6: Performance Settings
+    Show-WizardHeader -Title "Configuración de Rendimiento" -Step 6 -TotalSteps 10
+    $performance = Get-PerformanceSettings
+    $config.MaxConcurrent = $performance.MaxConcurrent
+    $config.MaxRetries = $performance.MaxRetries
+    $config.RetryDelay = $performance.RetryDelay
+
+    # Step 7: Output Settings
+    Show-WizardHeader -Title "Configuración de Salida" -Step 7 -TotalSteps 10
+    $output = Get-OutputSettings
+    $config.OutputDir = $output.OutputDir
+    $config.OverwriteMode = $output.OverwriteMode
+    $config.VerboseMode = $output.VerboseMode
+
+    # Step 8: Advanced Options
+    Show-WizardHeader -Title "Opciones Avanzadas" -Step 8 -TotalSteps 10
+    $advanced = Get-AdvancedOptions
+    $config.Unprivileged = $advanced.Unprivileged
+    $config.ConfigFile = $advanced.ConfigFile
+
+    # Step 9: Summary
+    Show-WizardHeader -Title "Resumen" -Step 9 -TotalSteps 10
+    Show-WizardSummary -Config $config
+
+    # Step 10: Generate Command & Confirm
+    Show-WizardHeader -Title "Confirmación" -Step 10 -TotalSteps 10
+    $command = New-CommandString -Config $config
+    Show-GeneratedCommand -Command $command
+
+    $shouldExecute = Confirm-Execution
+
+    if ($shouldExecute) {
+        Write-Host ""
+        Write-Host "  Iniciando escaneo..." -ForegroundColor Green
+        Write-Host ""
+        Start-Sleep -Seconds 2
+        return $config
+    } else {
+        Write-Host ""
+        Write-Host "  Escaneo cancelado. Comando guardado para referencia futura." -ForegroundColor Yellow
+        Write-Host ""
+        exit 0
+    }
+}
+
+#endregion
+
 #endregion
 
 #region Main Script
 
 # Script start
 $scriptStartTime = Get-Date
-$sessionId = Get-Date -Format "yyyy-MM-dd_HHmmss"
-
-# Convert OutputDir to absolute path to ensure it works in background jobs
-$OutputDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputDir)
+$sessionId = Get-Date -Format "yyyyMMdd-HHmmss_session"
 
 Write-Host "`n========================================" -ForegroundColor Cyan
 Write-Host "  Network Scan Logger v2.7" -ForegroundColor Cyan
 Write-Host "========================================`n" -ForegroundColor Cyan
+
+# Handle -ListSessions (exit early)
+# Convert OutputDir to absolute path for -ListSessions
+if ($ListSessions) {
+    $resolvedOutputDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputDir)
+    $sessions = @(Get-SessionList -OutputDir $resolvedOutputDir)
+    if ($sessions.Count -gt 0) {
+        Show-SessionList -Sessions $sessions
+    }
+    exit 0
+}
+
+# Convert OutputDir to absolute path to ensure it works in background jobs
+$OutputDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputDir)
 
 # Validate Nmap installation
 if (-not (Test-NmapInstalled)) {
@@ -1075,15 +2146,119 @@ $scanConfig = Load-ScanConfiguration -ConfigFile $configFile
 $scanProfiles = $scanConfig.profiles
 $scanWorkflows = $scanConfig.workflows
 
+# Handle -Wizard mode (interactive configuration)
+if ($Wizard) {
+    $wizardConfig = Start-ScanWizard -ScanProfiles $scanProfiles -Workflows $scanWorkflows
+
+    # Apply wizard configuration to script parameters
+    if ($wizardConfig.Workflow) {
+        $Workflow = $wizardConfig.Workflow
+    } else {
+        $ScanType = $wizardConfig.ScanType
+    }
+
+    $HostFile = $wizardConfig.HostFile
+    $Hosts = $wizardConfig.Hosts
+    $SessionName = $wizardConfig.SessionName
+    $ExcludeFile = $wizardConfig.ExcludeFile
+    $ExcludeHosts = $wizardConfig.ExcludeHosts
+    $ResolveHostnames = $wizardConfig.ResolveHostnames
+    $SensitiveFile = $wizardConfig.SensitiveFile
+    $SensitiveHosts = $wizardConfig.SensitiveHosts
+    $SensitiveTiming = $wizardConfig.SensitiveTiming
+    $SensitiveScripts = $wizardConfig.SensitiveScripts
+    $MaxConcurrent = $wizardConfig.MaxConcurrent
+    $MaxRetries = $wizardConfig.MaxRetries
+    $RetryDelay = $wizardConfig.RetryDelay
+    $OutputDir = $wizardConfig.OutputDir
+    $OverwriteMode = $wizardConfig.OverwriteMode
+    $VerboseMode = $wizardConfig.VerboseMode
+    $Unprivileged = $wizardConfig.Unprivileged
+    if ($wizardConfig.ConfigFile) {
+        $ConfigFile = $wizardConfig.ConfigFile
+        # Reload configuration if custom file was specified
+        $scanConfig = Load-ScanConfiguration -ConfigFile $wizardConfig.ConfigFile
+        $scanProfiles = $scanConfig.profiles
+        $scanWorkflows = $scanConfig.workflows
+    }
+
+    # Convert OutputDir to absolute path again after wizard updates
+    $OutputDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputDir)
+}
+
 # Validate mutually exclusive resume/retry/force parameters
-$resumeParams = @($Resume.IsPresent, $ResumeRetryFailed.IsPresent, $RetryFailed.IsPresent, $Force.IsPresent)
+$resumeParams = @($Resume.IsPresent, $ResumeRetryFailed.IsPresent, $ResumeRetryDead.IsPresent, $RetryFailed.IsPresent, $RetryDead.IsPresent, $Force.IsPresent)
 $resumeParamsCount = ($resumeParams | Where-Object { $_ }).Count
 if ($resumeParamsCount -gt 1) {
-    Write-Host "[ERROR] Parameters -Resume, -ResumeRetryFailed, -RetryFailed, and -Force are mutually exclusive. Use only one." -ForegroundColor Red
+    Write-Host "[ERROR] Parameters -Resume, -ResumeRetryFailed, -ResumeRetryDead, -RetryFailed, -RetryDead, and -Force are mutually exclusive. Use only one." -ForegroundColor Red
     exit 1
 }
 
+# Validate SessionName if provided
+if ($SessionName -and $SessionName -ne "") {
+    $validation = Test-SessionName -Name $SessionName
+    if (-not $validation.Valid) {
+        Write-Host "[ERROR] Invalid session name: $($validation.Message)" -ForegroundColor Red
+        Write-Host "`nSession name requirements:" -ForegroundColor Yellow
+        Write-Host "  - 3-50 characters long" -ForegroundColor Gray
+        Write-Host "  - Only letters, numbers, hyphens (-), and underscores (_)" -ForegroundColor Gray
+        Write-Host "`nExamples:" -ForegroundColor Yellow
+        Write-Host "  -SessionName `"pentest-client-2025`"" -ForegroundColor Cyan
+        Write-Host "  -SessionName `"weekly_scan_oct`"" -ForegroundColor Cyan
+        Write-Host "  -SessionName `"infrastructure-audit-phase1`"`n" -ForegroundColor Cyan
+        exit 1
+    }
+}
+
+# Handle -ResumeSession
+$resumingSession = $false
+$resumedSessionData = $null
+if ($ResumeSession -and $ResumeSession -ne "") {
+    Write-Host "[INFO] Resuming session: $ResumeSession" -ForegroundColor Cyan
+    $resumedSessionData = Get-SessionState -SessionName $ResumeSession -OutputDir $OutputDir
+    if ($null -eq $resumedSessionData) {
+        exit 1
+    }
+    $resumingSession = $true
+
+    # Override sessionId with resumed session name
+    $sessionId = $ResumeSession
+
+    # Load scan configuration from session state
+    $stateScanType = $null
+
+    # Try to get scan_type from state root first
+    if ($resumedSessionData.State.scan_type -and $resumedSessionData.State.scan_type -ne "") {
+        $stateScanType = $resumedSessionData.State.scan_type
+    } else {
+        # Fallback: Find first host that has scan_type defined
+        $hostWithScanType = $resumedSessionData.State.hosts.PSObject.Properties | Where-Object {
+            $_.Value.scan_type -and $_.Value.scan_type -ne ""
+        } | Select-Object -First 1
+
+        if ($hostWithScanType -and $hostWithScanType.Value.scan_type) {
+            $stateScanType = $hostWithScanType.Value.scan_type
+            Write-Host "[INFO] Loaded scan type from host data: $stateScanType" -ForegroundColor Cyan
+        }
+    }
+
+    # Check for workflow (though unlikely for this session)
+    if ($resumedSessionData.State.workflow -and $resumedSessionData.State.workflow -ne "null" -and $resumedSessionData.State.workflow -ne "") {
+        $Workflow = $resumedSessionData.State.workflow
+        Write-Host "[INFO] Loaded workflow from session: $Workflow" -ForegroundColor Green
+    } elseif ($stateScanType) {
+        $ScanType = $stateScanType
+        Write-Host "[INFO] Loaded scan type from session: $ScanType" -ForegroundColor Green
+    } else {
+        Write-Host "[WARNING] Could not load scan type or workflow from session state" -ForegroundColor Yellow
+    }
+
+    Write-Host "[INFO] Session loaded successfully" -ForegroundColor Green
+}
+
 # Validate that either ScanType or Workflow is provided (mutually exclusive)
+# Skip this validation if resuming a session (will use session's config)
+if (-not $resumingSession) {
 if ((-not $ScanType -or $ScanType -eq "") -and (-not $Workflow -or $Workflow -eq "")) {
     Write-Host "[ERROR] Either -ScanType or -Workflow parameter must be provided." -ForegroundColor Red
     Write-Host "`nAvailable scan profiles:" -ForegroundColor Yellow
@@ -1142,8 +2317,11 @@ if ($Workflow -and $Workflow -ne "") {
 
     Write-Host "[INFO] Using scan profile: $($scanProfiles[$ScanType].name)" -ForegroundColor Green
 }
+} # End of if (-not $resumingSession)
 
 # Validate that at least one host source is provided
+# Skip this validation if resuming a session
+if (-not $resumingSession) {
 if ((-not $HostFile -or $HostFile -eq "") -and ($Hosts.Count -eq 0)) {
     Write-Host "[ERROR] Either -HostFile or -Hosts parameter must be provided." -ForegroundColor Red
     exit 1
@@ -1153,6 +2331,12 @@ if ((-not $HostFile -or $HostFile -eq "") -and ($Hosts.Count -eq 0)) {
 if ($HostFile -and $HostFile -ne "" -and -not (Test-Path $HostFile)) {
     Write-Host "[ERROR] Host file not found: $HostFile" -ForegroundColor Red
     exit 1
+}
+} # End of if (-not $resumingSession) for host validation
+
+# Use SessionName or generate sessionId
+if ($SessionName -and $SessionName -ne "") {
+    $sessionId = $SessionName
 }
 
 # Create output directories
@@ -1189,14 +2373,16 @@ $resultsFile = "$logsFolder\scan-results.json"
 # Note: $stateFile will be defined inside the workflow loop to support per-step state files
 
 # Process target hosts from file and/or command line
+# Skip this section if resuming a session (hosts are loaded from session state)
 $targetHostsData = @{}  # Host -> {CIDR: [], Type: ""}
 $allCIDRs = @()
 $invalidEntries = @()
 $totalExpanded = 0
 $totalEntriesProcessed = 0
 
-# Process host file if provided
-if ($HostFile -and $HostFile -ne "") {
+if (-not $resumingSession) {
+    # Process host file if provided
+    if ($HostFile -and $HostFile -ne "") {
     Write-Log -Message "Processing target hosts file: $HostFile" -Level "INFO" -LogFile $logFile
     $hostFileLines = Get-Content $HostFile
     foreach ($line in $hostFileLines) {
@@ -1266,23 +2452,58 @@ if ($Hosts.Count -gt 0) {
     $totalEntriesProcessed += $Hosts.Count
 }
 
-$targetHosts = $targetHostsData.Keys
-Write-Log -Message "Total entries processed: $totalEntriesProcessed" -Level "INFO" -LogFile $logFile
-Write-Log -Message "Unique target hosts after expansion: $($targetHosts.Count)" -Level "INFO" -LogFile $logFile
+    $targetHosts = $targetHostsData.Keys
+    Write-Log -Message "Total entries processed: $totalEntriesProcessed" -Level "INFO" -LogFile $logFile
+    Write-Log -Message "Unique target hosts after expansion: $($targetHosts.Count)" -Level "INFO" -LogFile $logFile
 
-if ($invalidEntries.Count -gt 0) {
-    Write-Log -Message "Invalid entries found: $($invalidEntries.Count)" -Level "WARNING" -LogFile $logFile
-    $invalidEntries | ForEach-Object { Write-Log -Message "  - $_" -Level "WARNING" -LogFile $logFile }
-}
+    if ($invalidEntries.Count -gt 0) {
+        Write-Log -Message "Invalid entries found: $($invalidEntries.Count)" -Level "WARNING" -LogFile $logFile
+        $invalidEntries | ForEach-Object { Write-Log -Message "  - $_" -Level "WARNING" -LogFile $logFile }
+    }
 
-if ($targetHosts.Count -eq 0) {
-    Write-Log -Message "No valid hosts found in target file" -Level "ERROR" -LogFile $logFile -ErrorLogFile $errorLogFile
-    exit 1
-}
+    if ($targetHosts.Count -eq 0) {
+        Write-Log -Message "No valid hosts found in target file" -Level "ERROR" -LogFile $logFile -ErrorLogFile $errorLogFile
+        exit 1
+    }
 
-# Warn if large CIDR expansion
-if ($totalExpanded -gt 5000) {
-    Write-Log -Message "WARNING: Expanded CIDR ranges to $totalExpanded hosts. This may take a long time." -Level "WARNING" -LogFile $logFile
+    # Warn if large CIDR expansion
+    if ($totalExpanded -gt 5000) {
+        Write-Log -Message "WARNING: Expanded CIDR ranges to $totalExpanded hosts. This may take a long time." -Level "WARNING" -LogFile $logFile
+    }
+} else {
+    # Resuming session: hosts are loaded from session state
+    Write-Log -Message "Resuming session: hosts will be loaded from session state" -Level "INFO" -LogFile $logFile
+
+    # Load hosts from the resumed session state
+    if ($resumedSessionData -and $resumedSessionData.State -and $resumedSessionData.State.hosts) {
+        # Get host keys - works for both hashtables and PSCustomObjects
+        $hostsObject = $resumedSessionData.State.hosts
+
+        # Check if it's a PSCustomObject or hashtable
+        if ($hostsObject -is [System.Collections.Hashtable]) {
+            $targetHosts = $hostsObject.Keys
+        } else {
+            # It's a PSCustomObject, get properties
+            $targetHosts = $hostsObject.PSObject.Properties.Name
+        }
+
+        Write-Log -Message "Found $($targetHosts.Count) hosts in session state" -Level "INFO" -LogFile $logFile
+
+        # Rebuild targetHostsData from session state
+        foreach ($hostKey in $targetHosts) {
+            $hostData = $hostsObject.$hostKey
+            $targetHostsData[$hostKey] = @{
+                CIDRs = if ($hostData.source_cidr) { @($hostData.source_cidr) } else { @() }
+                Type = "Host"  # Default type for resumed sessions
+                Original = $hostKey
+            }
+        }
+
+        Write-Log -Message "Loaded $($targetHosts.Count) hosts from session state" -Level "INFO" -LogFile $logFile
+    } else {
+        Write-Log -Message "No hosts found in session state" -Level "ERROR" -LogFile $logFile -ErrorLogFile $errorLogFile
+        exit 1
+    }
 }
 
 # Process exclusion hosts from file and/or command line
@@ -1558,12 +2779,19 @@ foreach ($workflowStep in $workflowSteps) {
         $currentBaseDir = $OutputDir
     }
 
-    # Define state file (workflow mode: per-step state file, single scan: single state file)
+    # Define session directory and state file
+    # ALWAYS use .sessions/ structure for consistency
+    $sessionDir = Initialize-Session -SessionName $sessionId -OutputDir $OutputDir -ScanType $currentScanType -Workflow $Workflow
+
     if ($isWorkflowMode) {
-        $stateFile = "$logsFolder\scan-state-S$workflowStepNumber-$currentProfile.json"
+        $stateFile = Join-Path $sessionDir "scan-state-$Workflow-S$workflowStepNumber-$currentProfile.json"
     } else {
-        $stateFile = "$logsFolder\scan-state.json"
+        $stateFile = Join-Path $sessionDir "scan-state.json"
     }
+
+    $logFile = Join-Path $sessionDir "scan.log"
+    $errorLogFile = Join-Path $sessionDir "scan-errors.log"
+    $resultsFile = Join-Path $sessionDir "scan-results.json"
 
     # Initialize tracking for alive hosts and network progress (per workflow step)
     $aliveHostsCount = 0
@@ -1579,20 +2807,30 @@ foreach ($workflowStep in $workflowSteps) {
     }
 
 # Load or initialize state
-$existingState = Load-StateFile -StateFile $stateFile
+# If resuming session, load the existing state
+if ($resumingSession -and $resumedSessionData) {
+    $existingState = $resumedSessionData.State
+} else {
+    $existingState = Load-StateFile -StateFile $stateFile
+}
+
 $state = @{
     session_id = $sessionId
+    session_type = if ($SessionName -or $ResumeSession) { "custom" } else { "auto" }
     scan_type = $currentScanType
-    workflow_name = if ($isWorkflowMode) { $Workflow } else { "" }
+    workflow = if ($isWorkflowMode) { $Workflow } else { $null }
     workflow_step = $workflowStepNumber
     workflow_total_steps = $workflowSteps.Count
     start_time = (Get-Date -Format "yyyy-MM-ddTHH:mm:ss")
+    end_time = $null
     status = "in_progress"
     total_hosts = $validHosts.Count
     completed = 0
     failed = 0
     in_progress = 0
     pending = $validHosts.Count
+    elapsed_seconds = 0
+    output_dir = $OutputDir
     hosts = @{}
 }
 
@@ -1637,20 +2875,33 @@ $hostsToScan = @()
 if ($existingState -and -not $Force) {
     Write-Log -Message "Found previous scan state from session: $($existingState.session_id)" -Level "INFO" -LogFile $logFile
 
+    # Verify scan_type matches
+    if ($existingState.scan_type -and $existingState.scan_type -ne $currentScanType) {
+        Write-Host "`n[WARNING] Previous state was for scan type '$($existingState.scan_type)' but current scan is '$currentScanType'" -ForegroundColor Yellow
+        Write-Host "[INFO] This typically shouldn't happen. State file: $stateFile" -ForegroundColor Cyan
+        Write-Log -Message "WARNING: Scan type mismatch - Previous: $($existingState.scan_type), Current: $currentScanType" -Level "WARNING" -LogFile $logFile
+    }
+
     # Determine action based on parameters or user choice
     $action = ""
     if ($Resume) {
         $action = "Resume (pending only)"
     } elseif ($ResumeRetryFailed) {
         $action = "Resume and retry failed"
+    } elseif ($ResumeRetryDead) {
+        $action = "Resume and retry dead"
     } elseif ($RetryFailed) {
         $action = "Retry failed only"
+    } elseif ($RetryDead) {
+        $action = "Retry dead only"
     } else {
         # Interactive choice
         $options = @(
             "Resume (pending only)",
             "Resume and retry failed",
+            "Resume and retry dead",
             "Retry failed only",
+            "Retry dead only",
             "Force (start fresh)",
             "Cancel"
         )
@@ -1669,31 +2920,78 @@ if ($existingState -and -not $Force) {
         "Resume (pending only)" {
             foreach ($currentHost in $validHosts) {
                 $hostState = $existingState.hosts.$currentHost
-                if (-not $hostState -or $hostState.status -eq "pending") {
+                if (-not $hostState -or $hostState.status -eq "pending" -or $hostState.status -eq "in_progress") {
                     $hostsToScan += $currentHost
+                    # If was in_progress, preserve state to continue tracking attempts
+                    if ($hostState -and $hostState.status -eq "in_progress") {
+                        $state.hosts[$currentHost] = $hostState
+                        $state.in_progress--
+                    }
                 } elseif ($hostState.status -eq "completed") {
                     $state.hosts[$currentHost] = $hostState
-                    $state.completed++
-                    $state.pending--
                 } elseif ($hostState.status -eq "failed") {
                     $state.hosts[$currentHost] = $hostState
-                    $state.failed++
-                    $state.pending--
                 }
             }
         }
         "Resume and retry failed" {
             foreach ($currentHost in $validHosts) {
                 $hostState = $existingState.hosts.$currentHost
-                if (-not $hostState -or $hostState.status -eq "pending" -or $hostState.status -eq "failed") {
+                if (-not $hostState -or $hostState.status -eq "pending" -or $hostState.status -eq "failed" -or $hostState.status -eq "in_progress") {
                     $hostsToScan += $currentHost
-                    if ($hostState -and $hostState.status -eq "failed") {
+                    if ($hostState -and ($hostState.status -eq "failed" -or $hostState.status -eq "in_progress")) {
                         $state.hosts[$currentHost] = $hostState
+                        if ($hostState.status -eq "in_progress") {
+                            $state.in_progress--
+                        }
                     }
                 } elseif ($hostState.status -eq "completed") {
                     $state.hosts[$currentHost] = $hostState
-                    $state.completed++
-                    $state.pending--
+                }
+            }
+        }
+        "Resume and retry dead" {
+            foreach ($currentHost in $validHosts) {
+                $hostState = $existingState.hosts.$currentHost
+
+                if (-not $hostState -or $hostState.status -eq "pending" -or $hostState.status -eq "in_progress") {
+                    # Host new or pending → add to scan list
+                    $hostsToScan += $currentHost
+                    if ($hostState -and $hostState.status -eq "in_progress") {
+                        $state.hosts[$currentHost] = $hostState
+                        $state.in_progress--
+                    }
+                }
+                elseif ($hostState.status -eq "failed") {
+                    # Failed host → retry
+                    $hostsToScan += $currentHost
+                    $state.hosts[$currentHost] = $hostState
+                    $state.failed--
+                }
+                elseif ($hostState.status -eq "completed") {
+                    # Completed host → check if has open ports
+                    $isDeadHost = $false
+
+                    if ($hostState.scan_file -and (Test-Path $hostState.scan_file)) {
+                        # .nmap file exists → check content
+                        $hasOpenPorts = Test-HostHasOpenPorts -NmapFilePath $hostState.scan_file
+                        if (-not $hasOpenPorts) {
+                            $isDeadHost = $true
+                        }
+                    } else {
+                        # .nmap file does NOT exist → consider "dead"
+                        $isDeadHost = $true
+                    }
+
+                    if ($isDeadHost) {
+                        # NO open ports → RESCAN
+                        $hostsToScan += $currentHost
+                        $state.hosts[$currentHost] = $hostState
+                        $state.hosts[$currentHost].status = "pending"
+                    } else {
+                        # Has open ports → SKIP
+                        $state.hosts[$currentHost] = $hostState
+                    }
                 }
             }
         }
@@ -1705,16 +3003,62 @@ if ($existingState -and -not $Force) {
                     $state.hosts[$currentHost] = $hostState
                 } elseif ($hostState.status -eq "completed") {
                     $state.hosts[$currentHost] = $hostState
-                    $state.completed++
-                    $state.pending--
-                } elseif (-not $hostState -or $hostState.status -eq "pending") {
+                } elseif (-not $hostState -or $hostState.status -eq "pending" -or $hostState.status -eq "in_progress") {
                     $state.hosts[$currentHost] = @{
                         status = "skipped"
                         attempts = 0
                         last_update = (Get-Date -Format "yyyy-MM-ddTHH:mm:ss")
                         error = "Skipped (retry failed mode)"
                     }
-                    $state.pending--
+                }
+            }
+        }
+        "Retry dead only" {
+            foreach ($currentHost in $validHosts) {
+                $hostState = $existingState.hosts.$currentHost
+
+                if ($hostState -and $hostState.status -eq "failed") {
+                    # Failed host → SKIP (mark as skipped)
+                    $state.hosts[$currentHost] = @{
+                        status = "skipped"
+                        attempts = 0
+                        last_update = (Get-Date -Format "yyyy-MM-ddTHH:mm:ss")
+                        error = "Skipped (retry dead only mode)"
+                    }
+                }
+                elseif ($hostState -and $hostState.status -eq "completed") {
+                    # Completed host → check if has open ports
+                    $isDeadHost = $false
+
+                    if ($hostState.scan_file -and (Test-Path $hostState.scan_file)) {
+                        # .nmap file exists → check content
+                        $hasOpenPorts = Test-HostHasOpenPorts -NmapFilePath $hostState.scan_file
+                        if (-not $hasOpenPorts) {
+                            $isDeadHost = $true
+                        }
+                    } else {
+                        # .nmap file does NOT exist → consider "dead"
+                        $isDeadHost = $true
+                    }
+
+                    if ($isDeadHost) {
+                        # NO open ports → RESCAN
+                        $hostsToScan += $currentHost
+                        $state.hosts[$currentHost] = $hostState
+                        $state.hosts[$currentHost].status = "pending"
+                    } else {
+                        # Has open ports → SKIP
+                        $state.hosts[$currentHost] = $hostState
+                    }
+                }
+                elseif (-not $hostState -or $hostState.status -eq "pending" -or $hostState.status -eq "in_progress") {
+                    # Pending/in-progress host → SKIP (mark as skipped)
+                    $state.hosts[$currentHost] = @{
+                        status = "skipped"
+                        attempts = 0
+                        last_update = (Get-Date -Format "yyyy-MM-ddTHH:mm:ss")
+                        error = "Skipped (retry dead only mode)"
+                    }
                 }
             }
         }
@@ -1750,6 +3094,36 @@ if ($existingState -and -not $Force) {
 if ($hostsToScan.Count -eq 0) {
     Write-Log -Message "No hosts to scan. All hosts already processed." -Level "SUCCESS" -LogFile $logFile
     exit 0
+}
+
+# Ask once for overwrite mode if set to "Ask" and there are existing results
+if ($OverwriteMode -eq "Ask") {
+    $hostsWithExistingResults = 0
+    foreach ($targetHost in $hostsToScan) {
+        $hostMeta = $state.hosts[$targetHost]
+        if ($hostMeta) {
+            $hostFolder = $hostMeta.output_folder
+            $fileName = "$currentScanType"
+            if ($hostFolder -and (Test-Path "$hostFolder\$fileName.nmap")) {
+                $hostsWithExistingResults++
+            }
+        }
+    }
+
+    if ($hostsWithExistingResults -gt 0) {
+        Write-Host "`n$hostsWithExistingResults host(s) have existing scan results." -ForegroundColor Yellow
+        $response = Read-Host "Do you want to overwrite all existing results? (y/N)"
+        if ($response -eq "y" -or $response -eq "Y") {
+            $OverwriteMode = "Overwrite"
+            Write-Log -Message "User chose to overwrite all existing results" -Level "INFO" -LogFile $logFile
+        } else {
+            $OverwriteMode = "Skip"
+            Write-Log -Message "User chose to skip all hosts with existing results" -Level "INFO" -LogFile $logFile
+        }
+    } else {
+        # No existing results, set to Overwrite to avoid checks later
+        $OverwriteMode = "Overwrite"
+    }
 }
 
 Write-Log -Message "Scan configuration:" -Level "INFO" -LogFile $logFile
@@ -1795,6 +3169,11 @@ $completedCount = $state.completed
 $failedCount = $state.failed
 $jobQueue = @{}
 
+# Timing tracking
+$scanStartTime = Get-Date
+$scanDurations = @()  # Array to store completed scan durations in seconds
+$jobStartTimes = @{}  # Hashtable to track when each job started
+
 Write-Host ""
 
 foreach ($currentHost in $hostsToScan) {
@@ -1815,12 +3194,19 @@ foreach ($currentHost in $hostsToScan) {
             $attempts = $jobData.Attempts
 
             if ($scanSuccess) {
-                Update-HostState -State $state -TargetHost $jobHost -Status "completed" -Attempts $attempts
+                # Check if host has open ports and update counters
+                $nmapFile = "$($jobData.HostFolder)\$($jobData.FileName).nmap"
+
+                Update-HostState -State $state -TargetHost $jobHost -Status "completed" -Attempts $attempts -ScanFile $nmapFile
                 $completedCount++
                 Write-Log -Message "Scan completed: $jobHost | $currentScanType | Attempt: $attempts | Duration: $($jobResult.Duration)" -Level "SUCCESS" -LogFile $logFile
 
-                # Check if host has open ports and update counters
-                $nmapFile = "$($jobData.HostFolder)\$($jobData.FileName).nmap"
+                # Track scan duration for ETA calculation
+                if ($jobStartTimes.ContainsKey($jobHost)) {
+                    $duration = (Get-Date) - $jobStartTimes[$jobHost]
+                    $scanDurations += $duration.TotalSeconds
+                    $jobStartTimes.Remove($jobHost)
+                }
                 if (Test-HostHasOpenPorts -NmapFilePath $nmapFile) {
                     $aliveHostsCount++
                     $hostCIDR = $state.hosts[$jobHost].source_cidr
@@ -1987,6 +3373,7 @@ foreach ($currentHost in $hostsToScan) {
                         FileName = $jobData.FileName
                         ScanCommand = $jobData.ScanCommand
                     }
+                    $jobStartTimes[$jobHost] = Get-Date
                 } else {
                     # Max retries reached
                     Update-HostState -State $state -TargetHost $jobHost -Status "failed" -Attempts $attempts -Error $jobResult.Error
@@ -2010,9 +3397,9 @@ foreach ($currentHost in $hostsToScan) {
             # Save state and update progress
             Save-StateFile -StateFile $stateFile -State $state
             if ($isWorkflowMode) {
-                Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost $jobHost -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -AliveHosts $aliveHostsCount -HostStateInfo $state.hosts
+                Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost $jobHost -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -AliveHosts $aliveHostsCount -HostStateInfo $state.hosts -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations
             } else {
-                Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost $jobHost
+                Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost $jobHost -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -HostStateInfo $state.hosts
             }
 
             # Remove from queue
@@ -2023,7 +3410,7 @@ foreach ($currentHost in $hostsToScan) {
     # Get host metadata from state
     $hostMeta = $state.hosts[$currentHost]
     $hostFolder = $hostMeta.output_folder
-    $fileName = "$($currentHost)_$($currentScanType)"
+    $fileName = "$currentScanType"
     $isSensitive = $hostMeta.sensitive
 
     # Determine scan command (normal or sensitive)
@@ -2037,25 +3424,21 @@ foreach ($currentHost in $hostsToScan) {
     # Check if results already exist
     $skipHost = $false
     if (Test-Path "$hostFolder\$fileName.nmap") {
-        switch ($OverwriteMode) {
-            "Skip" {
-                Write-Log -Message "Skipping $currentHost (results already exist)" -Level "INFO" -LogFile $logFile
-                Update-HostState -State $state -TargetHost $currentHost -Status "completed" -Attempts 0
-                $completedCount++
-                Save-StateFile -StateFile $stateFile -State $state
-                $skipHost = $true
-            }
-            "Overwrite" {
-                Write-Log -Message "Overwriting existing results for $currentHost" -Level "WARNING" -LogFile $logFile
-            }
-            "Ask" {
-                $response = Read-Host "Results exist for $currentHost. Overwrite? (y/N)"
-                if ($response -ne "y" -and $response -ne "Y") {
-                    Write-Log -Message "Skipping $currentHost (user chose not to overwrite)" -Level "INFO" -LogFile $logFile
-                    Update-HostState -State $state -TargetHost $currentHost -Status "completed" -Attempts 0
+        # If host was in_progress, always overwrite incomplete results
+        if ($hostMeta.status -eq "in_progress") {
+            Write-Log -Message "Overwriting incomplete scan for $currentHost (was in_progress)" -Level "INFO" -LogFile $logFile
+        } else {
+            $existingNmapFile = "$hostFolder\$fileName.nmap"
+            switch ($OverwriteMode) {
+                "Skip" {
+                    Write-Log -Message "Skipping $currentHost (results already exist)" -Level "INFO" -LogFile $logFile
+                    Update-HostState -State $state -TargetHost $currentHost -Status "completed" -Attempts 0 -ScanFile $existingNmapFile
                     $completedCount++
                     Save-StateFile -StateFile $stateFile -State $state
                     $skipHost = $true
+                }
+                "Overwrite" {
+                    Write-Log -Message "Overwriting existing results for $currentHost" -Level "WARNING" -LogFile $logFile
                 }
             }
         }
@@ -2198,11 +3581,12 @@ foreach ($currentHost in $hostsToScan) {
         FileName = $fileName
         ScanCommand = $scanCommand
     }
+    $jobStartTimes[$currentHost] = Get-Date
 
     if ($isWorkflowMode) {
-        Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost $currentHost -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -AliveHosts $aliveHostsCount -HostStateInfo $state.hosts
+        Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost $currentHost -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -AliveHosts $aliveHostsCount -HostStateInfo $state.hosts -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations
     } else {
-        Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost $currentHost
+        Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost $currentHost -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -HostStateInfo $state.hosts
     }
 }
 
@@ -2221,12 +3605,12 @@ while ($jobQueue.Count -gt 0) {
         $attempts = $jobData.Attempts
 
         if ($scanSuccess) {
-            Update-HostState -State $state -TargetHost $jobHost -Status "completed" -Attempts $attempts
-            $completedCount++
-            Write-Log -Message "Scan completed: $jobHost | $currentScanType | Attempt: $attempts | Duration: $($jobResult.Duration)" -Level "SUCCESS" -LogFile $logFile
-
             # Check if host has open ports and update counters
             $nmapFile = "$($jobData.HostFolder)\$($jobData.FileName).nmap"
+
+            Update-HostState -State $state -TargetHost $jobHost -Status "completed" -Attempts $attempts -ScanFile $nmapFile
+            $completedCount++
+            Write-Log -Message "Scan completed: $jobHost | $currentScanType | Attempt: $attempts | Duration: $($jobResult.Duration)" -Level "SUCCESS" -LogFile $logFile
             if (Test-HostHasOpenPorts -NmapFilePath $nmapFile) {
                 $aliveHostsCount++
                 $hostCIDR = $state.hosts[$jobHost].source_cidr
@@ -2390,6 +3774,7 @@ while ($jobQueue.Count -gt 0) {
                     FileName = $jobData.FileName
                     ScanCommand = $jobData.ScanCommand
                 }
+                $jobStartTimes[$jobHost] = Get-Date
             } else {
                 Update-HostState -State $state -TargetHost $jobHost -Status "failed" -Attempts $attempts -Error $jobResult.Error
                 $failedCount++
@@ -2410,9 +3795,9 @@ while ($jobQueue.Count -gt 0) {
 
         Save-StateFile -StateFile $stateFile -State $state
         if ($isWorkflowMode) {
-            Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost $jobHost -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -AliveHosts $aliveHostsCount -HostStateInfo $state.hosts
+            Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost $jobHost -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -AliveHosts $aliveHostsCount -HostStateInfo $state.hosts -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations
         } else {
-            Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost $jobHost
+            Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost $jobHost -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -HostStateInfo $state.hosts
         }
 
         $jobQueue.Remove($jobHost)
@@ -2449,11 +3834,19 @@ $normalIndividualFailed = 0
 $sensitiveIndividualSuccess = 0
 $sensitiveIndividualFailed = 0
 
+# Count unique networks
+$uniqueNetworks = @{}
+
 foreach ($currentHost in $validHosts) {
     $hostMeta = $state.hosts[$currentHost]
     $isSensitive = $hostMeta.sensitive
     $isFromCIDR = $null -ne $hostMeta.source_cidr -and $hostMeta.source_cidr -ne ""
     $isSuccess = $hostMeta.status -eq "completed"
+
+    # Track unique networks
+    if ($isFromCIDR) {
+        $uniqueNetworks[$hostMeta.source_cidr] = $true
+    }
 
     if ($isFromCIDR) {
         $networkHostsCount++
@@ -2478,43 +3871,197 @@ foreach ($currentHost in $validHosts) {
     }
 }
 
+$networkCount = $uniqueNetworks.Count
 $conflictCount = if ($conflicts) { $conflicts.Count } else { 0 }
 
-Write-Host "`n========================================" -ForegroundColor Cyan
-Write-Host "  Scan Summary" -ForegroundColor Cyan
-Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "Session ID      : $sessionId" -ForegroundColor White
-if ($isWorkflowMode) {
-    Write-Host "Workflow        : $Workflow" -ForegroundColor White
-} else {
-    Write-Host "Scan Type       : $ScanType" -ForegroundColor White
+# Calculate Live and Dead hosts
+$liveHostsCount = 0
+$deadHostsCount = 0
+
+foreach ($currentHost in $validHosts) {
+    $hostMeta = $state.hosts[$currentHost]
+    if ($hostMeta.status -eq "completed" -and $hostMeta.scan_file) {
+        if (Test-HostHasOpenPorts -NmapFilePath $hostMeta.scan_file) {
+            $liveHostsCount++
+        } else {
+            $deadHostsCount++
+        }
+    }
 }
+
+# Calculate metrics
+$totalCompleted = $normalSuccess + $sensitiveSuccess
+$totalFailed = $normalFailed + $sensitiveFailed
+
+$avgTimePerHost = if ($totalCompleted -gt 0) {
+    [math]::Round($totalDuration.TotalSeconds / $totalCompleted, 1)
+} else {
+    0
+}
+
+$throughput = if ($totalDuration.TotalMinutes -gt 0) {
+    [math]::Round($totalCompleted / $totalDuration.TotalMinutes, 1)
+} else {
+    0
+}
+
+$successPercent = if ($validHosts.Count -gt 0) {
+    [math]::Round($totalCompleted / $validHosts.Count * 100, 1)
+} else {
+    0
+}
+
+$failPercent = if ($validHosts.Count -gt 0) {
+    [math]::Round($totalFailed / $validHosts.Count * 100, 1)
+} else {
+    0
+}
+
+$livePercent = if ($totalCompleted -gt 0) {
+    [math]::Round($liveHostsCount / $totalCompleted * 100, 1)
+} else {
+    0
+}
+
+$deadPercent = if ($totalCompleted -gt 0) {
+    [math]::Round($deadHostsCount / $totalCompleted * 100, 1)
+} else {
+    0
+}
+
+# Format duration (remove leading zeros)
+$durationFormatted = if ($totalDuration.TotalHours -ge 1) {
+    "{0}h {1:D2}m {2:D2}s" -f [math]::Floor($totalDuration.TotalHours), $totalDuration.Minutes, $totalDuration.Seconds
+} else {
+    "{0}m {1:D2}s" -f $totalDuration.Minutes, $totalDuration.Seconds
+}
+
 Write-Host ""
-Write-Host "Total Hosts     : $($validHosts.Count)" -ForegroundColor White
-Write-Host "  Networks (CIDR): $networkHostsCount" -ForegroundColor White
-Write-Host "    - Normal     : $($normalNetworkSuccess + $normalNetworkFailed) (success: $normalNetworkSuccess, failed: $normalNetworkFailed)" -ForegroundColor White
-Write-Host "    - Sensitive  : $($sensitiveNetworkSuccess + $sensitiveNetworkFailed) (success: $sensitiveNetworkSuccess, failed: $sensitiveNetworkFailed)" -ForegroundColor White
-Write-Host "  Individual     : $individualHostsCount" -ForegroundColor White
-Write-Host "    - Normal     : $($normalIndividualSuccess + $normalIndividualFailed) (success: $normalIndividualSuccess, failed: $normalIndividualFailed)" -ForegroundColor White
-Write-Host "    - Sensitive  : $($sensitiveIndividualSuccess + $sensitiveIndividualFailed) (success: $sensitiveIndividualSuccess, failed: $sensitiveIndividualFailed)" -ForegroundColor White
+Write-Host " ░▒▓███████▓▒░░▒▓██████▓▒░ ░▒▓██████▓▒░░▒▓███████▓▒░░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░" -ForegroundColor Red
+Write-Host "░▒▓█▓▒░      ░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░" -ForegroundColor Red
+Write-Host "░▒▓█▓▒░      ░▒▓█▓▒░      ░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░" -ForegroundColor Red
+Write-Host " ░▒▓██████▓▒░░▒▓█▓▒░      ░▒▓████████▓▒░▒▓█▓▒░░▒▓█▓▒░░▒▓██████▓▒░ ░▒▓██████▓▒░ " -ForegroundColor Red
+Write-Host "       ░▒▓█▓▒░▒▓█▓▒░      ░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░  ░▒▓█▓▒░   ░▒▓█▓▒░░▒▓█▓▒░" -ForegroundColor Red
+Write-Host "       ░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░  ░▒▓█▓▒░   ░▒▓█▓▒░░▒▓█▓▒░" -ForegroundColor Red
+Write-Host "░▒▓███████▓▒░ ░▒▓██████▓▒░░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░  ░▒▓█▓▒░   ░▒▓█▓▒░░▒▓█▓▒░" -ForegroundColor Red
 Write-Host ""
-Write-Host "Total Normal    : $($normalSuccess + $normalFailed) (success: $normalSuccess, failed: $normalFailed)" -ForegroundColor Cyan
-Write-Host "Total Sensitive : $($sensitiveSuccess + $sensitiveFailed) (success: $sensitiveSuccess, failed: $sensitiveFailed)" -ForegroundColor Yellow
-Write-Host "Excluded        : $($excludedHosts.Count)" -ForegroundColor DarkGray
-Write-Host "Conflicts       : $conflictCount" -ForegroundColor Magenta
+Write-Host "                        https://github.com/xtormin/Scanyx" -ForegroundColor Red
+Write-Host "                           @xtormin (Jennifer Torres)" -ForegroundColor Red
 Write-Host ""
-$durationFormatted = "{0:hh}h {0:mm}m {0:ss}s" -f $totalDuration
-Write-Host "Total Duration  : $durationFormatted" -ForegroundColor White
-Write-Host "========================================`n" -ForegroundColor Cyan
+Write-Host "╭─────────────────────────────────────────────────╮" -ForegroundColor Cyan
+Write-Host "│ SCAN SUMMARY                                    │" -ForegroundColor Cyan
+Write-Host "╰─────────────────────────────────────────────────╯" -ForegroundColor Cyan
+
+# Session info
+Write-Host "📋 Session  : " -NoNewline -ForegroundColor Cyan
+Write-Host "$sessionId" -ForegroundColor White
+if ($isWorkflowMode) {
+    Write-Host "   Workflow : " -NoNewline -ForegroundColor Cyan
+    Write-Host "$Workflow" -ForegroundColor White
+} else {
+    Write-Host "   Type     : " -NoNewline -ForegroundColor Cyan
+    Write-Host "$ScanType" -ForegroundColor White
+}
+Write-Host "   Duration : " -NoNewline -ForegroundColor Cyan
+Write-Host "$durationFormatted " -NoNewline -ForegroundColor White
+Write-Host "(avg: " -NoNewline -ForegroundColor DarkGray
+Write-Host "${avgTimePerHost}s/host" -NoNewline -ForegroundColor Gray
+Write-Host " | throughput: " -NoNewline -ForegroundColor DarkGray
+Write-Host "$throughput hosts/min" -NoNewline -ForegroundColor Gray
+Write-Host ")" -ForegroundColor DarkGray
+
+Write-Host ""
+
+# Results overview
+Write-Host "📊 Results  : " -NoNewline -ForegroundColor Cyan
+Write-Host "$totalCompleted/$($validHosts.Count) " -NoNewline -ForegroundColor White
+Write-Host "✅ " -NoNewline -ForegroundColor Green
+Write-Host "($successPercent%)" -NoNewline -ForegroundColor Green
+Write-Host " | " -NoNewline -ForegroundColor DarkGray
+Write-Host "$totalFailed " -NoNewline -ForegroundColor White
+Write-Host "❌ " -NoNewline -ForegroundColor Red
+Write-Host "($failPercent%)" -ForegroundColor Red
+
+# Host status (Live/Dead)
+Write-Host "🎯 Status   : " -NoNewline -ForegroundColor Cyan
+Write-Host "$liveHostsCount " -NoNewline -ForegroundColor White
+Write-Host "🟢 " -NoNewline -ForegroundColor Green
+Write-Host "Live ($livePercent%)" -NoNewline -ForegroundColor Green
+Write-Host " | " -NoNewline -ForegroundColor DarkGray
+Write-Host "$deadHostsCount " -NoNewline -ForegroundColor White
+Write-Host "🔴 " -NoNewline -ForegroundColor Red
+Write-Host "Dead ($deadPercent%)" -ForegroundColor Red
+
+Write-Host ""
+
+# Source breakdown
+Write-Host "📁 Source Breakdown" -ForegroundColor Cyan
+
+# Networks section - only show if there are networks
+if ($networkCount -gt 0) {
+    Write-Host "   Networks : " -NoNewline -ForegroundColor White
+    Write-Host "$networkCount CIDR(s) - $networkHostsCount hosts" -ForegroundColor White
+
+    Write-Host "   ├─ Normal    : " -NoNewline -ForegroundColor White
+    Write-Host "$($normalNetworkSuccess + $normalNetworkFailed) " -NoNewline -ForegroundColor White
+    Write-Host "(✅ " -NoNewline -ForegroundColor Green
+    Write-Host "$normalNetworkSuccess" -NoNewline -ForegroundColor Green
+    Write-Host " | ❌ " -NoNewline -ForegroundColor Red
+    Write-Host "$normalNetworkFailed" -NoNewline -ForegroundColor Red
+    Write-Host ")" -ForegroundColor White
+
+    Write-Host "   └─ Sensitive : " -NoNewline -ForegroundColor White
+    Write-Host "$($sensitiveNetworkSuccess + $sensitiveNetworkFailed) " -NoNewline -ForegroundColor Yellow
+    Write-Host "(✅ " -NoNewline -ForegroundColor Green
+    Write-Host "$sensitiveNetworkSuccess" -NoNewline -ForegroundColor Green
+    Write-Host " | ❌ " -NoNewline -ForegroundColor Red
+    Write-Host "$sensitiveNetworkFailed" -NoNewline -ForegroundColor Red
+    Write-Host ")" -ForegroundColor Yellow
+
+    Write-Host ""
+}
+
+# Individual hosts section - only show if there are individual hosts
+if ($individualHostsCount -gt 0) {
+    Write-Host "   Individual: " -NoNewline -ForegroundColor White
+    Write-Host "$individualHostsCount hosts" -ForegroundColor White
+
+    Write-Host "   ├─ Normal    : " -NoNewline -ForegroundColor White
+    Write-Host "$($normalIndividualSuccess + $normalIndividualFailed) " -NoNewline -ForegroundColor White
+    Write-Host "(✅ " -NoNewline -ForegroundColor Green
+    Write-Host "$normalIndividualSuccess" -NoNewline -ForegroundColor Green
+    Write-Host " | ❌ " -NoNewline -ForegroundColor Red
+    Write-Host "$normalIndividualFailed" -NoNewline -ForegroundColor Red
+    Write-Host ")" -ForegroundColor White
+
+    Write-Host "   └─ Sensitive : " -NoNewline -ForegroundColor White
+    Write-Host "$($sensitiveIndividualSuccess + $sensitiveIndividualFailed) " -NoNewline -ForegroundColor Yellow
+    Write-Host "(✅ " -NoNewline -ForegroundColor Green
+    Write-Host "$sensitiveIndividualSuccess" -NoNewline -ForegroundColor Green
+    Write-Host " | ❌ " -NoNewline -ForegroundColor Red
+    Write-Host "$sensitiveIndividualFailed" -NoNewline -ForegroundColor Red
+    Write-Host ")" -ForegroundColor Yellow
+}
+
+Write-Host ""
+
+# Other info
+Write-Host "📌 Other    : " -NoNewline -ForegroundColor Cyan
+Write-Host "Excluded: " -NoNewline -ForegroundColor DarkGray
+Write-Host "$($excludedHosts.Count)" -NoNewline -ForegroundColor Gray
+Write-Host " | Conflicts: " -NoNewline -ForegroundColor DarkGray
+Write-Host "$conflictCount" -ForegroundColor Gray
+
+Write-Host "─────────────────────────────────────────────────`n" -ForegroundColor Cyan
 
 Write-Log -Message "Scan session completed | Total: $($validHosts.Count) | Normal: $($normalSuccess + $normalFailed) (success: $normalSuccess, failed: $normalFailed) | Sensitive: $($sensitiveSuccess + $sensitiveFailed) (success: $sensitiveSuccess, failed: $sensitiveFailed) | Excluded: $($excludedHosts.Count) | Duration: $durationFormatted" -Level "SUCCESS" -LogFile $logFile
 
 if ($failedCount -gt 0) {
     Write-Host "[INFO] To retry failed hosts, run:" -ForegroundColor Yellow
     if ($isWorkflowMode) {
-        Write-Host "  .\network_scan_logger.ps1 -HostFile $HostFile -Workflow $Workflow -RetryFailed`n" -ForegroundColor Yellow
+        Write-Host "  .\scanyx.ps1 -HostFile $HostFile -Workflow $Workflow -RetryFailed`n" -ForegroundColor Yellow
     } else {
-        Write-Host "  .\network_scan_logger.ps1 -HostFile $HostFile -ScanType $ScanType -RetryFailed`n" -ForegroundColor Yellow
+        Write-Host "  .\scanyx.ps1 -HostFile $HostFile -ScanType $ScanType -RetryFailed`n" -ForegroundColor Yellow
     }
 }
 

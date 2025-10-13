@@ -1,0 +1,52 @@
+{
+    "workflows":  {
+                      "full-discovery":  {
+                                             "description":  "Complete host discovery: quick TCP scan -\u003e full TCP scan -\u003e common UDP ports",
+                                             "name":  "Full Discovery Workflow",
+                                             "steps":  [
+                                                           {
+                                                               "profile":  "tcp-1000",
+                                                               "description":  "Quick TCP port discovery",
+                                                               "condition":  "always"
+                                                           },
+                                                           {
+                                                               "profile":  "tcp-full",
+                                                               "description":  "Full TCP port scan",
+                                                               "condition":  "previous_success"
+                                                           },
+                                                           {
+                                                               "profile":  "udp-common",
+                                                               "description":  "Common UDP ports",
+                                                               "condition":  "previous_success"
+                                                           }
+                                                       ]
+                                         }
+                  },
+    "profiles":  {
+                     "udp-1000":  {
+                                      "description":  "UDP scan of top 1000 ports",
+                                      "name":  "UDP Top 1000 Ports",
+                                      "command":  "nmap -v -T4 -Pn -sU -sV -A --host-timeout 60m"
+                                  },
+                     "tcp-full":  {
+                                      "description":  "Complete TCP scan of all 65535 ports",
+                                      "name":  "TCP Full Port Scan",
+                                      "command":  "nmap -v -T4 -Pn -open -sS --script=default,vuln -A --host-timeout 60m -p-"
+                                  },
+                     "udp-full":  {
+                                      "description":  "Complete UDP scan of all 65535 ports",
+                                      "name":  "UDP Full Port Scan",
+                                      "command":  "nmap -v -T4 -Pn -sU -sV -A --host-timeout 60m -p-"
+                                  },
+                     "tcp-1000":  {
+                                      "description":  "Fast TCP scan of top 1000 ports with scripts and version detection",
+                                      "name":  "TCP Top 1000 Ports",
+                                      "command":  "nmap -v -T4 -Pn -open -sS --script=default,vuln -A --host-timeout 60m"
+                                  },
+                     "udp-common":  {
+                                        "description":  "UDP scan of most common ports",
+                                        "name":  "UDP Common Ports",
+                                        "command":  "nmap -v -T4 -Pn -sU -sV -A --host-timeout 60m -p \u002753,67,69,11,123,137,161,500,514,520,563\u0027"
+                                    }
+                 }
+}
