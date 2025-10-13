@@ -1,7 +1,7 @@
 # SCANYX
 
 <p align="center">
-  <img src="Images/banner.jpeg" alt="AzRA Banner" width="100%">
+  <img src="Images/banner.jpeg" alt="Banner" width="100%">
 </p>
 
 [![Version](https://img.shields.io/badge/version-2.7-blue.svg)](https://github.com/xtormin/scanyx)
