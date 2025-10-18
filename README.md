@@ -35,10 +35,7 @@ echo "192.168.1.0/24" > hosts.txt
 # Carga local
 git clone https://github.com/xtormin/scanyx.git
 cd scanyx
-. scanyx
-
-# Cargar script desde URL
-. ([scriptblock]::Create((iwr -useb https://raw.githubusercontent.com/xtormin/scanyx/main/scanyx.ps1)))
+. .\scanyx.ps1
 ```
 
 ## Edición de la configuración de perfiles y workflows (opcional)
