@@ -1,0 +1,34 @@
+# ============================================
+# SCANYX - Nmap Scanner Framework
+# Git Ignore Configuration
+# ============================================
+
+# Nmap scan results
+nmap/
+
+# PowerShell temporary files
+*.tmp
+*.temp
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Backup files (if any are created in the future)
+*.backup
+*.bak
+*.old
+
+# WIKI draft
+WIKI.md
+
+# Tests
+.github/

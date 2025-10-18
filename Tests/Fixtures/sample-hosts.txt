@@ -1,0 +1,27 @@
+# Sample hosts file for testing
+# This file contains various formats of host entries
+
+# Individual IPs
+192.168.1.1
+192.168.1.10
+10.0.0.50
+
+# CIDR ranges
+192.168.1.0/30
+172.16.0.0/28
+10.0.0.0/24
+
+# Hostnames
+server.example.com
+web-server.local
+db01.internal.net
+
+# Mixed with comments
+192.168.2.1  # Production web server
+192.168.2.2  # Database server
+
+# Empty lines and whitespace are ignored
+
+   192.168.3.1
+
+# End of file

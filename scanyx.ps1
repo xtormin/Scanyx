@@ -52,9 +52,9 @@ Nmap timing template for sensitive hosts (T0-T4). Default: T2 (less aggressive t
 NSE scripts to use for sensitive hosts. Options: default, vuln, none, default+vuln. Default: default.
 
 .PARAMETER ScanType
-Specifies the scan profile to use. Profiles are loaded from scan-profiles.json in the script directory.
+Specifies the scan profile to use. Profiles are loaded from nmap-profiles-workflows.json in the script directory.
 Default profiles include: tcp-1000, tcp-full, udp-common, udp-1000, udp-full.
-You can add custom profiles by editing scan-profiles.json.
+You can add custom profiles by editing nmap-profiles-workflows.json.
 
 .PARAMETER OutputDir
 Specifies the output directory for scan results. Default: "nmap"
@@ -93,7 +93,7 @@ Automatically replaces -sS with -sT for compatibility.
 
 .PARAMETER ConfigFile
 Optional path to custom scan profiles configuration JSON file.
-Default: scan-profiles.json in script directory.
+Default: nmap-profiles-workflows.json in script directory.
 Allows using different configurations for different projects or scan scenarios.
 
 .PARAMETER VerboseMode
@@ -149,7 +149,7 @@ Scan a network excluding specific hosts, all provided via command line.
 Combine file-based and command line hosts, exclusions, and sensitive hosts.
 
 .EXAMPLE
-# Create custom scan profile by editing scan-profiles.json:
+# Create custom scan profile by editing nmap-profiles-workflows.json:
 # {
 #   "custom-stealth": {
 #     "name": "Stealth Scan",
@@ -161,144 +161,76 @@ Combine file-based and command line hosts, exclusions, and sensitive hosts.
 
 .NOTES
 Author: Jennifer Torres (@xtormin)
-Version: 2.7
+Version: 2.8.0
 Requires: Nmap installed and available in PATH
 
-Scan profiles are loaded from scan-profiles.json in the script directory.
+Scan profiles are loaded from nmap-profiles-workflows.json in the script directory.
 If the file doesn't exist, it will be created with default profiles.
 #>
 
-[CmdletBinding(DefaultParameterSetName='Normal')]
+[CmdletBinding(DefaultParameterSetName='SingleScan')]
 param (
-    # Path to the file containing the list of hosts to scan
     [Parameter(Mandatory = $false)]
     [string]$HostFile = "",
-
-    # Array of hosts to scan (IPs, CIDRs, hostnames)
     [Parameter(Mandatory = $false)]
     [string[]]$Hosts = @(),
-
-    # Type of scan to perform (loaded from scan-profiles.json)
     [Parameter(Mandatory = $false, ParameterSetName='SingleScan')]
     [string]$ScanType = "",
-
-    # Workflow to execute (multiple scans in sequence)
     [Parameter(Mandatory = $false, ParameterSetName='WorkflowScan')]
     [string]$Workflow = "",
-
-    # Condition for workflow step execution
     [Parameter(Mandatory = $false)]
     [ValidateSet("always", "previous_success", "previous_has_results")]
     [string]$WorkflowCondition = "always",
-
-    # File containing hosts to exclude from scanning
     [Parameter(Mandatory = $false)]
     [string]$ExcludeFile = "",
-
-    # Array of hosts to exclude from scanning (IPs, CIDRs, hostnames)
     [Parameter(Mandatory = $false)]
     [string[]]$ExcludeHosts = @(),
-
-    # Resolve hostnames to IPs for exclusion matching
     [Parameter(Mandatory = $false)]
     [switch]$ResolveHostnames,
-
-    # File containing sensitive hosts to scan with reduced timing/scripts
     [Parameter(Mandatory = $false)]
     [string]$SensitiveFile = "",
-
-    # Array of sensitive hosts (IPs, CIDRs, hostnames)
     [Parameter(Mandatory = $false)]
     [string[]]$SensitiveHosts = @(),
-
-    # Timing template for sensitive hosts (T0-T4)
     [Parameter(Mandatory = $false)]
     [ValidateSet("T0", "T1", "T2", "T3", "T4")]
     [string]$SensitiveTiming = "T2",
-
-    # NSE scripts for sensitive hosts
     [Parameter(Mandatory = $false)]
     [ValidateSet("default", "vuln", "none", "default+vuln")]
     [string]$SensitiveScripts = "default",
-
-    # Output directory for scan results
     [Parameter(Mandatory = $false)]
     [string]$OutputDir = "nmap",
-
-    # Maximum number of concurrent scans
     [Parameter(Mandatory = $false)]
     [ValidateRange(1, 50)]
     [int]$MaxConcurrent = 5,
-
-    # Maximum number of retry attempts
     [Parameter(Mandatory = $false)]
     [ValidateRange(0, 10)]
     [int]$MaxRetries = 1,
-
-    # Delay between retry attempts (seconds)
     [Parameter(Mandatory = $false)]
-    [ValidateRange(0, 3600)]
     [int]$RetryDelay = 60,
-
-    # Overwrite mode for existing results
     [Parameter(Mandatory = $false)]
     [ValidateSet("Skip", "Overwrite", "Ask")]
     [string]$OverwriteMode = "Ask",
-
-    # Resume: Continue with pending hosts only
     [Parameter(Mandatory = $false)]
     [switch]$Resume,
-
-    # Resume and retry failed hosts
     [Parameter(Mandatory = $false)]
     [switch]$ResumeRetryFailed,
-
-    # Resume and retry dead hosts (completed but no open ports)
-    [Parameter(Mandatory = $false)]
-    [switch]$ResumeRetryDead,
-
-    # Retry only failed hosts
     [Parameter(Mandatory = $false)]
     [switch]$RetryFailed,
-
-    # Retry only dead hosts (skip pending, failed, and alive)
-    [Parameter(Mandatory = $false)]
-    [switch]$RetryDead,
-
-    # Force fresh start (archive old state)
     [Parameter(Mandatory = $false)]
     [switch]$Force,
-
-    # Use unprivileged mode for nmap scans (adds --unprivileged flag)
     [Parameter(Mandatory = $false)]
     [switch]$Unprivileged,
-
-    # Path to custom scan profiles configuration file
     [Parameter(Mandatory = $false)]
     [string]$ConfigFile = "",
-
-    # Enable verbose mode to show nmap commands
     [Parameter(Mandatory = $false)]
     [switch]$VerboseMode,
-
-    # Session name (custom identifier for this scan session)
     [Parameter(Mandatory = $false)]
-    [string]$SessionName = "",
-
-    # List all available sessions
-    [Parameter(Mandatory = $false)]
-    [switch]$ListSessions,
-
-    # Resume a specific session by name
-    [Parameter(Mandatory = $false)]
-    [string]$ResumeSession = "",
-
-    # Interactive wizard mode to configure scan step-by-step
-    [Parameter(Mandatory = $false)]
-    [switch]$Wizard
+    [switch]$WhatIf
 )
 
-#region Functions
+# ============================================
+# HELPER FUNCTIONS (Global Scope)
+# ============================================
 
 function Write-Log {
     param(
@@ -343,16 +275,42 @@ function Test-NmapInstalled {
 function Test-ValidIPOrHost {
     param([string]$Address)
 
-    # Check if valid IP address
-    $ipPattern = '^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$'
-    if ($Address -match $ipPattern) {
-        return $true
+    # Check if it looks like an IP
+    $segments = $Address -split '\.'
+
+    # If exactly 4 segments, check if it's an IP or hostname
+    if ($segments.Count -eq 4) {
+        $numericSegments = ($segments | Where-Object { $_ -match '^\d+$' }).Count
+
+        # If all 4 segments are numeric, validate as IP
+        if ($numericSegments -eq 4) {
+            $ipPattern = '^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$'
+            if ($Address -match $ipPattern) {
+                return $true
+            }
+            # All numeric but invalid IP (e.g., 256.1.1.1)
+            return $false
+        }
+
+        # If 2-3 segments are numeric, it's likely a malformed IP, not a hostname
+        # Examples: 192.168.1.a, 192.168.1.1.1 (after split, but this has 5 segments)
+        if ($numericSegments -ge 2) {
+            # Reject things that look like malformed IPs
+            return $false
+        }
+
+        # If 0-1 segments are numeric, treat as potential hostname (e.g., api.v2.example.com)
+        # Fall through to hostname validation below
     }
 
-    # Check if valid hostname/FQDN
+    # Check if valid hostname/FQDN (must contain at least one letter)
+    # Hostnames must start with alphanumeric, can contain hyphens, and end with alphanumeric
     $hostnamePattern = '^([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)*[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?$'
     if ($Address -match $hostnamePattern) {
-        return $true
+        # Ensure it contains at least one letter (not just numbers)
+        if ($Address -match '[a-zA-Z]') {
+            return $true
+        }
     }
 
     return $false
@@ -366,8 +324,9 @@ function Test-ValidCIDR {
     if ($CIDR -match $cidrPattern) {
         # Extract subnet mask
         $mask = [int]($CIDR -split '/')[1]
-        # Valid range: /8 to /32
-        if ($mask -ge 8 -and $mask -le 32) {
+        # Valid range: /0 to /32 (allow all valid CIDR masks)
+        # Note: /0 represents the entire internet (0.0.0.0/0)
+        if ($mask -ge 0 -and $mask -le 32) {
             return $true
         }
     }
@@ -434,7 +393,9 @@ function Expand-CIDR {
             $hosts += "$byte1.$byte2.$byte3.$byte4"
         }
 
-        return $hosts
+        # Force return as array (PowerShell returns single items as scalars)
+        # Using comma operator to prevent unwrapping of single-element arrays
+        return ,$hosts
     } catch {
         Write-Warning "Failed to expand CIDR $CIDR : $_"
         return @()
@@ -478,7 +439,7 @@ function Resolve-HostEntry {
     if ($Line -match $ipPattern) {
         return @{
             Type = "IP"
-            Hosts = @($Line)
+            Hosts = ,$Line
             Original = $Line
             SourceCIDR = $null
         }
@@ -487,7 +448,7 @@ function Resolve-HostEntry {
     # Check if hostname
     $hostnamePattern = '^([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)*[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?$'
     if ($Line -match $hostnamePattern) {
-        $hosts = @($Line)
+        $hosts = ,$Line
 
         # Optionally resolve to IP
         if ($ResolveHostname) {
@@ -527,16 +488,23 @@ function Resolve-HostEntry {
 function Get-MostSpecificCIDR {
     param(
         [string]$IPAddress,
-        [array]$CIDRList
+        $CIDRList  # Can be array or hashtable
     )
 
     if ($CIDRList.Count -eq 0) {
         return $null
     }
 
+    # Get CIDR list (handle both array and hashtable)
+    $cidrs = if ($CIDRList -is [hashtable]) {
+        $CIDRList.Keys
+    } else {
+        $CIDRList
+    }
+
     # Filter CIDRs that contain this IP
     $matchingCIDRs = @()
-    foreach ($cidr in $CIDRList) {
+    foreach ($cidr in $cidrs) {
         $parts = $cidr -split '/'
         $networkIP = $parts[0]
         $maskBits = [int]$parts[1]
@@ -544,8 +512,8 @@ function Get-MostSpecificCIDR {
         # Convert IP and network to integers
         $ipBytes = $IPAddress.Split('.')
         $netBytes = $networkIP.Split('.')
-        $ipInt = ([long]$ipBytes[0] -shl 24) + ([long]$ipBytes[1] -shl 16) + ([long]$ipBytes[2] -shl 8) + [long]$ipBytes[3]
-        $netInt = ([long]$netBytes[0] -shl 24) + ([long]$netBytes[1] -shl 16) + ([long]$netBytes[2] -shl 8) + [long]$netBytes[3]
+        $ipInt = ([long][int]$ipBytes[0] -shl 24) + ([long][int]$ipBytes[1] -shl 16) + ([long][int]$ipBytes[2] -shl 8) + [long][int]$ipBytes[3]
+        $netInt = ([long][int]$netBytes[0] -shl 24) + ([long][int]$netBytes[1] -shl 16) + ([long][int]$netBytes[2] -shl 8) + [long][int]$netBytes[3]
 
         # Calculate mask
         $mask = [long]([math]::Pow(2, 32) - [math]::Pow(2, (32 - $maskBits)))
@@ -570,63 +538,92 @@ function Get-MostSpecificCIDR {
 
 function Get-OutputFolder {
     param(
+        [Parameter(Mandatory=$false)]
         [string]$TargetHost,
-        [string]$SourceCIDR,
+        [Parameter(Mandatory=$false)]
+        [Alias("Host")]
+        [string]$HostParameter,
+        [string]$SourceCIDR = "",
         [string]$BaseDir,
+        [string]$ScanType = "",
         [string]$WorkflowName = "",
         [int]$WorkflowStep = 0,
         [string]$StepProfile = ""
     )
+
+    # Support both -TargetHost and -Host (for tests)
+    $hostKey = if ($TargetHost) { $TargetHost } else { $HostParameter }
+
+    # Simple mode for tests (includes scan type in path)
+    if ($ScanType -and -not $WorkflowName) {
+        return Join-Path $BaseDir "$hostKey\$ScanType"
+    }
 
     if ($WorkflowName -and $WorkflowName -ne "") {
         # Workflow mode: BaseDir/SN-profile/networks|hosts/host/
         $stepFolder = "S$WorkflowStep-$StepProfile"
         if ($SourceCIDR) {
             $cidrFolder = $SourceCIDR -replace '/', '-'
-            return "$BaseDir\$stepFolder\networks\$cidrFolder\$TargetHost"
+            return "$BaseDir\$stepFolder\networks\$cidrFolder\$hostKey"
         } else {
-            return "$BaseDir\$stepFolder\hosts\$TargetHost"
+            return "$BaseDir\$stepFolder\hosts\$hostKey"
         }
     } else {
         # Single scan mode: each host has its own folder
         if ($SourceCIDR) {
             # From CIDR: goes to networks/cidr/host/ folder
             $cidrFolder = $SourceCIDR -replace '/', '-'
-            return "$BaseDir\networks\$cidrFolder\$TargetHost"
+            return "$BaseDir\networks\$cidrFolder\$hostKey"
         } else {
             # Individual host: goes to hosts/host/ folder
-            return "$BaseDir\hosts\$TargetHost"
+            return "$BaseDir\hosts\$hostKey"
         }
     }
 }
 
 function Build-SensitiveScanCommand {
     param(
-        [string]$BaseScanCommand,
-        [string]$Timing,
-        [string]$Scripts
+        [string]$TargetHost,
+        [string]$Arguments,
+        [string]$OutputFile,
+        [bool]$IsSensitive,
+        [string]$SensitiveTiming,
+        [string]$SensitiveScripts,
+        [bool]$Unprivileged = $false
     )
 
-    # Replace timing: -T4 → -T{timing}
-    $modifiedCommand = $BaseScanCommand -replace '-T\d', "-$Timing"
+    # Start with base nmap command
+    $cmd = "nmap"
 
-    # Replace scripts based on selection
-    $scriptParam = switch ($Scripts) {
-        "default"       { "--script=default" }
-        "vuln"          { "--script=vuln" }
-        "none"          { "" }
-        "default+vuln"  { "--script=default,vuln" }
+    # Add arguments
+    if ($Arguments) {
+        $cmd += " $Arguments"
     }
 
-    if ($Scripts -eq "none") {
-        # Remove --script parameter entirely
-        $modifiedCommand = $modifiedCommand -replace '--script=[^\s]+', ''
-    } else {
-        # Replace existing --script parameter
-        $modifiedCommand = $modifiedCommand -replace '--script=[^\s]+', $scriptParam
+    # Handle sensitive hosts: replace timing
+    if ($IsSensitive) {
+        $cmd = $cmd -replace '-T\d+', "-$SensitiveTiming"
+
+        # Replace scripts if sensitive
+        if ($SensitiveScripts -eq "none") {
+            $cmd = $cmd -replace '--script[=\s]+[^\s]+', ''
+            $cmd = $cmd -replace '\s+', ' '
+        }
     }
 
-    return $modifiedCommand.Trim() -replace '\s+', ' '
+    # Handle unprivileged mode
+    if ($Unprivileged) {
+        $cmd += " --unprivileged"
+        $cmd = $cmd -replace '-sS', '-sT'
+    }
+
+    # Add output file
+    $cmd += " -oX `"$OutputFile`""
+
+    # Add host
+    $cmd += " $TargetHost"
+
+    return $cmd.Trim() -replace '\s+', ' '
 }
 
 function Save-StateFile {
@@ -636,6 +633,12 @@ function Save-StateFile {
     )
 
     try {
+        # Create parent directory if it doesn't exist
+        $parentDir = Split-Path -Path $StateFile -Parent
+        if ($parentDir -and -not (Test-Path $parentDir)) {
+            New-Item -Path $parentDir -ItemType Directory -Force | Out-Null
+        }
+
         $State | ConvertTo-Json -Depth 10 | Set-Content -Path $StateFile -ErrorAction Stop
     } catch {
         Write-Warning "Failed to save state file: $_"
@@ -648,35 +651,62 @@ function Load-StateFile {
     if (Test-Path $StateFile) {
         try {
             $json = Get-Content -Path $StateFile -Raw -ErrorAction Stop
-            return $json | ConvertFrom-Json
+            if ([string]::IsNullOrWhiteSpace($json)) {
+                return @{}
+            }
+            $obj = $json | ConvertFrom-Json
+            # Convert PSCustomObject to Hashtable
+            $hashtable = @{}
+            $obj.PSObject.Properties | ForEach-Object {
+                $hashtable[$_.Name] = $_.Value
+            }
+            return $hashtable
         } catch {
             Write-Warning "Failed to load state file: $_"
-            return $null
+            return @{}
         }
     }
-    return $null
+    return @{}
 }
 
 function Update-HostState {
     param(
         [hashtable]$State,
+        [Parameter(Mandatory=$false)]
         [string]$TargetHost,
+        [Parameter(Mandatory=$false)]
+        [Alias("Host")]
+        [string]$HostParameter,
+        [Parameter(Mandatory=$false)]
         [string]$Status,
-        [int]$Attempts,
+        [Parameter(Mandatory=$false)]
+        [string]$NewState,
+        [int]$Attempts = 0,
         [string]$Error = "",
         [string]$ScanFile = ""
     )
 
+    # Support both -TargetHost and -Host (for tests)
+    $hostKey = if ($TargetHost) { $TargetHost } else { $HostParameter }
+    $statusValue = if ($Status) { $Status } else { $NewState }
+
+    # Simple mode for tests (flat hashtable)
+    if (-not $State.ContainsKey("hosts")) {
+        $State[$hostKey] = $statusValue
+        return
+    }
+
+    # Complex mode for real usage (structured state)
     $hostState = @{
-        status = $Status
+        status = $statusValue
         attempts = $Attempts
         last_update = (Get-Date -Format "yyyy-MM-ddTHH:mm:ss")
         error = $Error
     }
 
     # Preserve existing fields that shouldn't be overwritten
-    if ($State.hosts.ContainsKey($TargetHost)) {
-        $existingHost = $State.hosts[$TargetHost]
+    if ($State.hosts.ContainsKey($hostKey)) {
+        $existingHost = $State.hosts[$hostKey]
         if ($existingHost.source_cidr) { $hostState.source_cidr = $existingHost.source_cidr }
         if ($existingHost.alternative_cidrs) { $hostState.alternative_cidrs = $existingHost.alternative_cidrs }
         if ($existingHost.output_folder) { $hostState.output_folder = $existingHost.output_folder }
@@ -689,11 +719,11 @@ function Update-HostState {
     # Add or update scan file
     if ($ScanFile -ne "") {
         $hostState.scan_file = $ScanFile
-    } elseif ($State.hosts.ContainsKey($TargetHost) -and $State.hosts[$TargetHost].scan_file) {
-        $hostState.scan_file = $State.hosts[$TargetHost].scan_file
+    } elseif ($State.hosts.ContainsKey($hostKey) -and $State.hosts[$hostKey].scan_file) {
+        $hostState.scan_file = $State.hosts[$hostKey].scan_file
     }
 
-    $State.hosts[$TargetHost] = $hostState
+    $State.hosts[$hostKey] = $hostState
 
     # Update counters
     $State.completed = ($State.hosts.GetEnumerator() | Where-Object { $_.Value.status -eq "completed" }).Count
@@ -733,18 +763,23 @@ function Add-ScanResult {
 }
 
 function Test-HostHasOpenPorts {
-    param([string]$NmapFilePath)
+    param([string]$XmlFile)
 
-    if (-not (Test-Path $NmapFilePath)) {
+    if (-not (Test-Path $XmlFile)) {
         return $false
     }
 
     try {
-        $content = Get-Content $NmapFilePath -Raw -ErrorAction Stop
-        # Search for lines indicating open ports
-        # Format: "22/tcp   open  ssh" or "53/udp   open  domain"
-        # Pattern matches: number/(tcp|udp) followed by whitespace and "open"
-        return $content -match "\d+/(tcp|udp)\s+open"
+        $content = Get-Content $XmlFile -Raw -ErrorAction Stop
+
+        # Detect file format and use appropriate pattern
+        if ($content -match '<\?xml' -or $content -match '<nmaprun') {
+            # XML format: <state state="open"/>
+            return $content -match '<state\s+state="open"'
+        } else {
+            # Plain text .nmap format: "22/tcp   open  ssh"
+            return $content -match "\d+/(tcp|udp)\s+open"
+        }
     } catch {
         return $false
     }
@@ -777,7 +812,7 @@ function Show-ProgressBar {
         foreach ($hostEntry in $HostStateInfo.GetEnumerator()) {
             $hostData = $hostEntry.Value
             if ($hostData.status -eq "completed" -and $hostData.scan_file) {
-                if (Test-HostHasOpenPorts -NmapFilePath $hostData.scan_file) {
+                if (Test-HostHasOpenPorts -XmlFile $hostData.scan_file) {
                     $liveHosts++
                 } else {
                     $deadHosts++
@@ -1187,40 +1222,25 @@ function Test-SessionName {
 
     # Validations
     if ([string]::IsNullOrWhiteSpace($Name)) {
-        return @{
-            Valid = $false
-            Message = "Session name cannot be empty"
-        }
+        return $false
     }
 
     # Minimum length: 3 characters
     if ($Name.Length -lt 3) {
-        return @{
-            Valid = $false
-            Message = "Session name must be at least 3 characters long"
-        }
+        return $false
     }
 
     # Maximum length: 50 characters
     if ($Name.Length -gt 50) {
-        return @{
-            Valid = $false
-            Message = "Session name cannot exceed 50 characters"
-        }
+        return $false
     }
 
-    # Only allow alphanumeric, hyphens, underscores
-    if ($Name -notmatch '^[a-zA-Z0-9_-]+$') {
-        return @{
-            Valid = $false
-            Message = "Session name can only contain letters, numbers, hyphens, and underscores"
-        }
+    # Only allow alphanumeric, hyphens, underscores (no leading numbers)
+    if ($Name -notmatch '^[a-zA-Z][a-zA-Z0-9_-]*$') {
+        return $false
     }
 
-    return @{
-        Valid = $true
-        Message = "Valid session name"
-    }
+    return $true
 }
 
 function Initialize-Session {
@@ -1620,10 +1640,10 @@ function Get-SessionNameInput {
 
     if ($sessionName -ne "") {
         # Validate session name
-        $validation = Test-SessionName -Name $sessionName
-        if (-not $validation.Valid) {
+        $isValid = Test-SessionName -Name $sessionName
+        if (-not $isValid) {
             Write-Host ""
-            Write-Host "  [ERROR] $($validation.Message)" -ForegroundColor Red
+            Write-Host "  [ERROR] Invalid session name. Must be 3-50 chars, start with letter, only letters/numbers/hyphens/underscores allowed." -ForegroundColor Red
             Start-Sleep -Seconds 2
             return ""
         }
@@ -2101,18 +2121,166 @@ function Start-ScanWizard {
     }
 }
 
-#endregion
 
-#endregion
+# ============================================
+# MAIN FUNCTION
+# ============================================
+
+function Invoke-Scanyx {
+<#
+.SYNOPSIS
+SCANYX (Scan Analysis eXecution) - Advanced Nmap scanner with parallel execution and state persistence.
+
+.DESCRIPTION
+Main function to execute network scans using Nmap with advanced features.
+
+.EXAMPLE
+Invoke-Scanyx -HostFile hosts.txt -ScanType tcp-1000
+
+.EXAMPLE
+Invoke-Scanyx -Hosts "192.168.1.0/24" -ScanType tcp-full -MaxConcurrent 10
+#>
+    [CmdletBinding(DefaultParameterSetName='SingleScan')]
+    param (
+        # Path to the file containing the list of hosts to scan
+        [Parameter(Mandatory = $false)]
+        [string]$HostFile = "",
+
+        # Array of hosts to scan (IPs, CIDRs, hostnames)
+        [Parameter(Mandatory = $false)]
+        [string[]]$Hosts = @(),
+
+        # Type of scan to perform (loaded from nmap-profiles-workflows.json)
+        [Parameter(Mandatory = $false, ParameterSetName='SingleScan')]
+        [string]$ScanType = "",
+
+        # Workflow to execute (multiple scans in sequence)
+        [Parameter(Mandatory = $false, ParameterSetName='WorkflowScan')]
+        [string]$Workflow = "",
+
+        # Condition for workflow step execution
+        [Parameter(Mandatory = $false)]
+        [ValidateSet("always", "previous_success", "previous_has_results")]
+        [string]$WorkflowCondition = "always",
+
+        # File containing hosts to exclude from scanning
+        [Parameter(Mandatory = $false)]
+        [string]$ExcludeFile = "",
+
+        # Array of hosts to exclude from scanning (IPs, CIDRs, hostnames)
+        [Parameter(Mandatory = $false)]
+        [string[]]$ExcludeHosts = @(),
+
+        # Resolve hostnames to IPs for exclusion matching
+        [Parameter(Mandatory = $false)]
+        [switch]$ResolveHostnames,
+
+        # File containing sensitive hosts to scan with reduced timing/scripts
+        [Parameter(Mandatory = $false)]
+        [string]$SensitiveFile = "",
+
+        # Array of sensitive hosts (IPs, CIDRs, hostnames)
+        [Parameter(Mandatory = $false)]
+        [string[]]$SensitiveHosts = @(),
+
+        # Timing template for sensitive hosts (T0-T4)
+        [Parameter(Mandatory = $false)]
+        [ValidateSet("T0", "T1", "T2", "T3", "T4")]
+        [string]$SensitiveTiming = "T2",
+
+        # NSE scripts for sensitive hosts
+        [Parameter(Mandatory = $false)]
+        [ValidateSet("default", "vuln", "none", "default+vuln")]
+        [string]$SensitiveScripts = "default",
+
+        # Output directory for scan results
+        [Parameter(Mandatory = $false)]
+        [string]$OutputDir = "nmap",
+
+        # Maximum number of concurrent scans
+        [Parameter(Mandatory = $false)]
+        [ValidateRange(1, 50)]
+        [int]$MaxConcurrent = 5,
+
+        # Maximum number of retry attempts
+        [Parameter(Mandatory = $false)]
+        [ValidateRange(0, 10)]
+        [int]$MaxRetries = 1,
+
+        # Delay between retry attempts (seconds)
+        [Parameter(Mandatory = $false)]
+        [ValidateRange(0, 3600)]
+        [int]$RetryDelay = 60,
+
+        # Overwrite mode for existing results
+        [Parameter(Mandatory = $false)]
+        [ValidateSet("Skip", "Overwrite", "Ask")]
+        [string]$OverwriteMode = "Ask",
+
+        # Resume: Continue with pending hosts only
+        [Parameter(Mandatory = $false)]
+        [switch]$Resume,
+
+        # Resume and retry failed hosts
+        [Parameter(Mandatory = $false)]
+        [switch]$ResumeRetryFailed,
+
+        # Resume and retry dead hosts (completed but no open ports)
+        [Parameter(Mandatory = $false)]
+        [switch]$ResumeRetryDead,
+
+        # Retry only failed hosts
+        [Parameter(Mandatory = $false)]
+        [switch]$RetryFailed,
+
+        # Retry only dead hosts (skip pending, failed, and alive)
+        [Parameter(Mandatory = $false)]
+        [switch]$RetryDead,
+
+        # Force fresh start (archive old state)
+        [Parameter(Mandatory = $false)]
+        [switch]$Force,
+
+        # Use unprivileged mode for nmap scans (adds --unprivileged flag)
+        [Parameter(Mandatory = $false)]
+        [switch]$Unprivileged,
+
+        # Path to custom scan profiles configuration file
+        [Parameter(Mandatory = $false)]
+        [string]$ConfigFile = "",
+
+        # Enable verbose mode to show nmap commands
+        [Parameter(Mandatory = $false)]
+        [switch]$VerboseMode,
+
+        # Session name (custom identifier for this scan session)
+        [Parameter(Mandatory = $false)]
+        [string]$SessionName = "",
+
+        # List all available sessions
+        [Parameter(Mandatory = $false)]
+        [switch]$ListSessions,
+
+        # Resume a specific session by name
+        [Parameter(Mandatory = $false)]
+        [string]$ResumeSession = "",
+
+        # Interactive wizard mode to configure scan step-by-step
+        [Parameter(Mandatory = $false)]
+        [switch]$Wizard
+    )
+
+#region Functions
 
 #region Main Script
 
+
 # Script start
 $scriptStartTime = Get-Date
-$sessionId = Get-Date -Format "yyyyMMdd-HHmmss_session"
+$sessionId = (Get-Date -Format "yyyyMMdd-HHmmss") + "_session"
 
 Write-Host "`n========================================" -ForegroundColor Cyan
-Write-Host "  Network Scan Logger v2.7" -ForegroundColor Cyan
+Write-Host "  Network Scan Logger v2.8.0" -ForegroundColor Cyan
 Write-Host "========================================`n" -ForegroundColor Cyan
 
 # Handle -ListSessions (exit early)
@@ -2136,9 +2304,9 @@ if (-not (Test-NmapInstalled)) {
 }
 
 # Load scan configuration (profiles and workflows)
-$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 if (-not $ConfigFile -or $ConfigFile -eq "") {
-    $configFile = Join-Path $scriptDir "scan-profiles.json"
+    $configFile = Join-Path $scriptDir "nmap-profiles-workflows.json"
 } else {
     $configFile = $ConfigFile
 }
@@ -2196,11 +2364,12 @@ if ($resumeParamsCount -gt 1) {
 
 # Validate SessionName if provided
 if ($SessionName -and $SessionName -ne "") {
-    $validation = Test-SessionName -Name $SessionName
-    if (-not $validation.Valid) {
-        Write-Host "[ERROR] Invalid session name: $($validation.Message)" -ForegroundColor Red
+    $isValid = Test-SessionName -Name $SessionName
+    if (-not $isValid) {
+        Write-Host "[ERROR] Invalid session name" -ForegroundColor Red
         Write-Host "`nSession name requirements:" -ForegroundColor Yellow
         Write-Host "  - 3-50 characters long" -ForegroundColor Gray
+        Write-Host "  - Must start with a letter" -ForegroundColor Gray
         Write-Host "  - Only letters, numbers, hyphens (-), and underscores (_)" -ForegroundColor Gray
         Write-Host "`nExamples:" -ForegroundColor Yellow
         Write-Host "  -SessionName `"pentest-client-2025`"" -ForegroundColor Cyan
@@ -2974,7 +3143,7 @@ if ($existingState -and -not $Force) {
 
                     if ($hostState.scan_file -and (Test-Path $hostState.scan_file)) {
                         # .nmap file exists → check content
-                        $hasOpenPorts = Test-HostHasOpenPorts -NmapFilePath $hostState.scan_file
+                        $hasOpenPorts = Test-HostHasOpenPorts -XmlFile $hostState.scan_file
                         if (-not $hasOpenPorts) {
                             $isDeadHost = $true
                         }
@@ -3032,7 +3201,7 @@ if ($existingState -and -not $Force) {
 
                     if ($hostState.scan_file -and (Test-Path $hostState.scan_file)) {
                         # .nmap file exists → check content
-                        $hasOpenPorts = Test-HostHasOpenPorts -NmapFilePath $hostState.scan_file
+                        $hasOpenPorts = Test-HostHasOpenPorts -XmlFile $hostState.scan_file
                         if (-not $hasOpenPorts) {
                             $isDeadHost = $true
                         }
@@ -3207,7 +3376,7 @@ foreach ($currentHost in $hostsToScan) {
                     $scanDurations += $duration.TotalSeconds
                     $jobStartTimes.Remove($jobHost)
                 }
-                if (Test-HostHasOpenPorts -NmapFilePath $nmapFile) {
+                if (Test-HostHasOpenPorts -XmlFile $nmapFile) {
                     $aliveHostsCount++
                     $hostCIDR = $state.hosts[$jobHost].source_cidr
                     if ($hostCIDR -and $script:networkProgress.ContainsKey($hostCIDR)) {
@@ -3416,7 +3585,14 @@ foreach ($currentHost in $hostsToScan) {
     # Determine scan command (normal or sensitive)
     $baseScanCommand = $scanProfiles[$currentScanType].command
     if ($isSensitive) {
-        $currentScanCommand = Build-SensitiveScanCommand -BaseScanCommand $baseScanCommand -Timing $SensitiveTiming -Scripts $SensitiveScripts
+        # Modify command for sensitive hosts
+        $currentScanCommand = $baseScanCommand -replace '-T\d+', "-$SensitiveTiming"
+
+        # Handle script parameter replacement
+        if ($SensitiveScripts -eq "none") {
+            $currentScanCommand = $currentScanCommand -replace '--script=[^\s]+', ''
+            $currentScanCommand = $currentScanCommand -replace '\s+', ' '
+        }
     } else {
         $currentScanCommand = $baseScanCommand
     }
@@ -3881,7 +4057,7 @@ $deadHostsCount = 0
 foreach ($currentHost in $validHosts) {
     $hostMeta = $state.hosts[$currentHost]
     if ($hostMeta.status -eq "completed" -and $hostMeta.scan_file) {
-        if (Test-HostHasOpenPorts -NmapFilePath $hostMeta.scan_file) {
+        if (Test-HostHasOpenPorts -XmlFile $hostMeta.scan_file) {
             $liveHostsCount++
         } else {
             $deadHostsCount++
@@ -4086,3 +4262,15 @@ if ($isWorkflowMode) {
 }
 
 #endregion
+
+#endregion
+
+} # End of Invoke-Scanyx function
+
+# Create alias for shorter invocation
+Set-Alias -Name scanyx -Value Invoke-Scanyx
+
+# Auto-execute if script is run directly (not dot-sourced)
+if ($MyInvocation.InvocationName -ne '.') {
+    Invoke-Scanyx @PSBoundParameters
+}

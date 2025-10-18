@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<!DOCTYPE nmaprun>
+<nmaprun scanner="nmap" args="nmap -sT -p 80,443 -T4 192.168.1.1" start="1234567890" version="7.94">
+    <scaninfo type="connect" protocol="tcp" numservices="2"/>
+    <host>
+        <status state="up" reason="echo-reply" reason_ttl="64"/>
+        <address addr="192.168.1.1" addrtype="ipv4"/>
+        <hostnames>
+            <hostname name="webserver.local" type="PTR"/>
+        </hostnames>
+        <ports>
+            <port protocol="tcp" portid="80">
+                <state state="open" reason="syn-ack" reason_ttl="64"/>
+                <service name="http" product="Apache httpd" version="2.4.41" extrainfo="(Ubuntu)" method="probed" conf="10">
+                    <cpe>cpe:/a:apache:http_server:2.4.41</cpe>
+                </service>
+            </port>
+            <port protocol="tcp" portid="443">
+                <state state="open" reason="syn-ack" reason_ttl="64"/>
+                <service name="https" product="Apache httpd" version="2.4.41" ssl="yes" method="probed" conf="10">
+                    <cpe>cpe:/a:apache:http_server:2.4.41</cpe>
+                </service>
+            </port>
+        </ports>
+        <times srtt="1234" rttvar="5678" to="100000"/>
+    </host>
+    <runstats>
+        <finished time="1234567890" timestr="Mon Jan 01 00:00:00 2024" elapsed="2.34" summary="Nmap done at Mon Jan 01 00:00:00 2024; 1 IP address (1 host up) scanned in 2.34 seconds" exit="success"/>
+        <hosts up="1" down="0" total="1"/>
+    </runstats>
+</nmaprun>
