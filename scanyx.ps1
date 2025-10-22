@@ -3172,8 +3172,46 @@ foreach ($currentHost in $validHosts) {
 
 # Handle existing state
 $hostsToScan = @()
-if ($existingState -and -not $Force) {
+
+# Check if existingState has actual content (not just empty hashtable)
+$hasValidState = $existingState -and
+                 ($existingState.Count -gt 0) -and
+                 ($existingState.hosts -or $existingState.session_id -or
+                  ($existingState.completed -gt 0) -or ($existingState.failed -gt 0))
+
+if ($hasValidState -and -not $Force) {
     Write-Log -Message "Found previous scan state from session: $($existingState.session_id)" -Level "INFO" -LogFile $logFile
+
+    # Show session information to user
+    Write-Host ""
+    Write-Host "╔════════════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
+    Write-Host "║  Previous Scan Session Detected                                    ║" -ForegroundColor Cyan
+    Write-Host "╠════════════════════════════════════════════════════════════════════╣" -ForegroundColor Cyan
+
+    # Session name (max 55 chars)
+    $sessionIdToShow = if ($existingState.session_id) { $existingState.session_id } else { $sessionId }
+    $sessionDisplay = if ($sessionIdToShow.Length -gt 55) {
+        $sessionIdToShow.Substring(0, 52) + "..."
+    } else {
+        $sessionIdToShow
+    }
+    Write-Host "║  Session : " -NoNewline -ForegroundColor Cyan
+    Write-Host ($sessionDisplay.PadRight(55)) -NoNewline -ForegroundColor White
+    Write-Host "║" -ForegroundColor Cyan
+
+    # Path (max 55 chars, truncate from the left to show filename)
+    $pathStr = if ($stateFile) { $stateFile.ToString() } else { "(unknown)" }
+    $pathDisplay = if ($pathStr.Length -gt 55) {
+        "..." + $pathStr.Substring($pathStr.Length - 52)
+    } else {
+        $pathStr
+    }
+    Write-Host "║  Path    : " -NoNewline -ForegroundColor Cyan
+    Write-Host ($pathDisplay.PadRight(55)) -NoNewline -ForegroundColor White
+    Write-Host "║" -ForegroundColor Cyan
+
+    Write-Host "╚════════════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
+    Write-Host ""
 
     # Verify scan_type matches
     if ($existingState.scan_type -and $existingState.scan_type -ne $currentScanType) {
@@ -3205,7 +3243,7 @@ if ($existingState -and -not $Force) {
             "Force (start fresh)",
             "Cancel"
         )
-        $action = Get-UserChoice -Prompt "Previous scan state detected. What would you like to do?" -Options $options -Default "Resume (pending only)"
+        $action = Get-UserChoice -Prompt "What would you like to do?" -Options $options -Default "Resume (pending only)"
 
         if ($action -eq "Cancel") {
             Write-Host "`nScan cancelled by user." -ForegroundColor Yellow
@@ -4370,8 +4408,9 @@ if ($failedCount -gt 0) {
 }
 
 # Next steps suggestion with XNP
+Write-Host ""
 Write-Host "🚀 Next Steps" -ForegroundColor Cyan
-Write-Host "   To analyze and merge scan results, use XtremeNmapParser (XNP):" -ForegroundColor White
+Write-Host "   To analyze and merge scan results, you can use XtremeNmapParser (XNP):" -ForegroundColor White
 Write-Host ""
 if ($isWorkflowMode) {
     Write-Host "   python3 xnp.py -d `"$OutputDir\$Workflow`" -M -R --open -C all" -ForegroundColor Yellow
