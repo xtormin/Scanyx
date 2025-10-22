@@ -4,7 +4,7 @@
   <img src="images/banner.jpeg" alt="Banner" width="100%">
 </p>
 
-[![Version](https://img.shields.io/badge/version-2.8.0-blue.svg)](https://github.com/xtormin/scanyx)
+[![Version](https://img.shields.io/badge/version-2.8.1-blue.svg)](https://github.com/xtormin/scanyx)
 [![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-blue.svg)](https://github.com/PowerShell/PowerShell)
 
 **SCANYX** es una herramienta para automatizar escaneos de red con Nmap. Soporta ejecución paralela, workflows secuenciales, sesiones, hosts sensibles y excluidos, y persistencia de estado, entre otras.
