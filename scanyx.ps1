@@ -705,6 +705,11 @@ function Add-ScanResult {
 function Test-HostHasOpenPorts {
     param([string]$XmlFile)
 
+    # Validate that XmlFile is not empty or null
+    if ([string]::IsNullOrWhiteSpace($XmlFile)) {
+        return $false
+    }
+
     if (-not (Test-Path $XmlFile)) {
         return $false
     }
@@ -1304,6 +1309,122 @@ function Invoke-NmapScan {
             ErrorOutput = $_.Exception.Message
         }
     }
+}
+
+# Global ScriptBlock for nmap scan jobs (reusable across retry and initial scans)
+$Global:NmapScanScriptBlock = {
+    param($TargetHost, $ScanCommand, $OutputPath, $FileName, $Attempts, $Unprivileged)
+
+    $startTime = Get-Date
+
+    # Execute scan - Build argument list properly
+    $nmapArgs = @()
+
+    # Parse command into arguments (handle quoted strings)
+    $cmdWithoutNmap = $ScanCommand -replace '^nmap\s+', ''
+    $regex = [regex]'(?:[^\s"'']+|"[^"]*"|''[^'']*'')+'
+    $matches = $regex.Matches($cmdWithoutNmap)
+    foreach ($match in $matches) {
+        $arg = $match.Value.Trim('"').Trim("'")
+        # Replace -sS with -sT if unprivileged mode is enabled
+        if ($Unprivileged -and $arg -eq "-sS") {
+            $nmapArgs += "-sT"
+        } else {
+            $nmapArgs += $arg
+        }
+    }
+
+    # Add --unprivileged if specified
+    if ($Unprivileged) {
+        $nmapArgs += "--unprivileged"
+    }
+
+    # Add output and target (quote the path if it contains spaces)
+    $outputFullPath = "$OutputPath\$FileName"
+    if ($outputFullPath -match '\s') {
+        $nmapArgs += @("-oA", "`"$outputFullPath`"", $TargetHost)
+    } else {
+        $nmapArgs += @("-oA", $outputFullPath, $TargetHost)
+    }
+
+    $processArgs = @{
+        FilePath = "nmap"
+        ArgumentList = $nmapArgs
+        Wait = $true
+        NoNewWindow = $true
+        RedirectStandardOutput = "$OutputPath\$FileName.stdout"
+        RedirectStandardError = "$OutputPath\$FileName.stderr"
+        PassThru = $true
+    }
+
+    try {
+        $process = Start-Process @processArgs
+        $endTime = Get-Date
+        $duration = $endTime - $startTime
+
+        $errorOutput = if (Test-Path "$OutputPath\$FileName.stderr") {
+            Get-Content "$OutputPath\$FileName.stderr" -Raw
+        } else { "" }
+
+        # Add exit code to error message for debugging
+        $exitCode = $process.ExitCode
+        if ($exitCode -ne 0) {
+            $errorOutput = "Nmap exited with code $exitCode. " + $errorOutput
+        }
+
+        # Verify that nmap actually created output files
+        $nmapFileExists = Test-Path "$OutputPath\$FileName.nmap"
+        $exitCodeOk = $exitCode -eq 0
+
+        # Success only if exit code is 0 AND .nmap file exists
+        $scanSuccess = $exitCodeOk -and $nmapFileExists
+
+        # If exit code was 0 but no file, add to error
+        if ($exitCodeOk -and -not $nmapFileExists) {
+            $errorOutput = "Nmap exited with code 0 but did not generate output files. " + $errorOutput
+        }
+
+        # If no error message but scan failed, add generic message
+        if (-not $scanSuccess -and [string]::IsNullOrWhiteSpace($errorOutput)) {
+            $errorOutput = "Nmap scan failed. Exit code: $exitCode. No stderr output captured. Check nmap installation and permissions."
+        }
+
+        return @{
+            Success = $scanSuccess
+            StartTime = $startTime.ToString("yyyy-MM-ddTHH:mm:ss")
+            EndTime = $endTime.ToString("yyyy-MM-ddTHH:mm:ss")
+            Duration = "{0:mm}m {0:ss}s" -f $duration
+            DurationSeconds = [int]$duration.TotalSeconds
+            Error = $errorOutput
+            Attempts = $Attempts
+        }
+    } catch {
+        $endTime = Get-Date
+        $duration = $endTime - $startTime
+
+        return @{
+            Success = $false
+            StartTime = $startTime.ToString("yyyy-MM-ddTHH:mm:ss")
+            EndTime = $endTime.ToString("yyyy-MM-ddTHH:mm:ss")
+            Duration = "{0:mm}m {0:ss}s" -f $duration
+            DurationSeconds = [int]$duration.TotalSeconds
+            Error = $_.Exception.Message
+            Attempts = $Attempts
+        }
+    }
+}
+
+function Start-NmapScanJob {
+    param(
+        [string]$TargetHost,
+        [string]$ScanCommand,
+        [string]$OutputPath,
+        [string]$FileName,
+        [int]$Attempts,
+        [bool]$Unprivileged
+    )
+
+    return Start-Job -ScriptBlock $Global:NmapScanScriptBlock -ArgumentList $TargetHost, $ScanCommand, $OutputPath, $FileName, $Attempts, $Unprivileged
 }
 
 function Test-SessionName {
@@ -3602,107 +3723,7 @@ foreach ($currentHost in $hostsToScan) {
                         Write-Log -Message "Retry command: $fullNmapCommand" -Level "VERBOSE" -LogFile $logFile
                     }
 
-                    $retryJob = Start-Job -ScriptBlock {
-                        param($TargetHost, $ScanCommand, $OutputPath, $FileName, $Attempts)
-
-                        $startTime = Get-Date
-
-                        # Execute scan - Build argument list properly
-                        $nmapArgs = @()
-
-                        # Parse command into arguments (handle quoted strings)
-                        $cmdWithoutNmap = $ScanCommand -replace '^nmap\s+', ''
-                        $regex = [regex]'(?:[^\s"'']+|"[^"]*"|''[^'']*'')+'
-                        $matches = $regex.Matches($cmdWithoutNmap)
-                        foreach ($match in $matches) {
-                            $arg = $match.Value.Trim('"').Trim("'")
-                            # Replace -sS with -sT if unprivileged mode is enabled
-                            if ($using:Unprivileged -and $arg -eq "-sS") {
-                                $nmapArgs += "-sT"
-                            } else {
-                                $nmapArgs += $arg
-                            }
-                        }
-
-                        # Add --unprivileged if specified
-                        if ($using:Unprivileged) {
-                            $nmapArgs += "--unprivileged"
-                        }
-
-                        # Add output and target (quote the path if it contains spaces)
-                        $outputFullPath = "$OutputPath\$FileName"
-                        if ($outputFullPath -match '\s') {
-                            $nmapArgs += @("-oA", "`"$outputFullPath`"", $TargetHost)
-                        } else {
-                            $nmapArgs += @("-oA", $outputFullPath, $TargetHost)
-                        }
-
-                        $processArgs = @{
-                            FilePath = "nmap"
-                            ArgumentList = $nmapArgs
-                            Wait = $true
-                            NoNewWindow = $true
-                            RedirectStandardOutput = "$OutputPath\$FileName.stdout"
-                            RedirectStandardError = "$OutputPath\$FileName.stderr"
-                            PassThru = $true
-                        }
-
-                        try {
-                            $process = Start-Process @processArgs
-                            $endTime = Get-Date
-                            $duration = $endTime - $startTime
-
-                            $errorOutput = if (Test-Path "$OutputPath\$FileName.stderr") {
-                                Get-Content "$OutputPath\$FileName.stderr" -Raw
-                            } else { "" }
-
-                            # Add exit code to error message for debugging
-                            $exitCode = $process.ExitCode
-                            if ($exitCode -ne 0) {
-                                $errorOutput = "Nmap exited with code $exitCode. " + $errorOutput
-                            }
-
-                            # Verify that nmap actually created output files
-                            $nmapFileExists = Test-Path "$OutputPath\$FileName.nmap"
-                            $exitCodeOk = $exitCode -eq 0
-
-                            # Success only if exit code is 0 AND .nmap file exists
-                            $scanSuccess = $exitCodeOk -and $nmapFileExists
-
-                            # If exit code was 0 but no file, add to error
-                            if ($exitCodeOk -and -not $nmapFileExists) {
-                                $errorOutput = "Nmap exited with code 0 but did not generate output files. " + $errorOutput
-                            }
-
-                            # If no error message but scan failed, add generic message
-                            if (-not $scanSuccess -and [string]::IsNullOrWhiteSpace($errorOutput)) {
-                                $errorOutput = "Nmap scan failed. Exit code: $exitCode. No stderr output captured. Check nmap installation and permissions."
-                            }
-
-                            return @{
-                                Success = $scanSuccess
-                                StartTime = $startTime.ToString("yyyy-MM-ddTHH:mm:ss")
-                                EndTime = $endTime.ToString("yyyy-MM-ddTHH:mm:ss")
-                                Duration = "{0:mm}m {0:ss}s" -f $duration
-                                DurationSeconds = [int]$duration.TotalSeconds
-                                Error = $errorOutput
-                                Attempts = $Attempts
-                            }
-                        } catch {
-                            $endTime = Get-Date
-                            $duration = $endTime - $startTime
-
-                            return @{
-                                Success = $false
-                                StartTime = $startTime.ToString("yyyy-MM-ddTHH:mm:ss")
-                                EndTime = $endTime.ToString("yyyy-MM-ddTHH:mm:ss")
-                                Duration = "{0:mm}m {0:ss}s" -f $duration
-                                DurationSeconds = [int]$duration.TotalSeconds
-                                Error = $_.Exception.Message
-                                Attempts = $Attempts
-                            }
-                        }
-                    } -ArgumentList $jobHost, $jobData.ScanCommand, $jobData.HostFolder, $jobData.FileName, $newAttempts
+                    $retryJob = Start-NmapScanJob -TargetHost $jobHost -ScanCommand $jobData.ScanCommand -OutputPath $jobData.HostFolder -FileName $jobData.FileName -Attempts $newAttempts -Unprivileged $Unprivileged
 
                     $jobQueue[$jobHost] = @{
                         Job = $retryJob
@@ -3817,107 +3838,7 @@ foreach ($currentHost in $hostsToScan) {
         Write-Log -Message "Command: $fullNmapCommand" -Level "VERBOSE" -LogFile $logFile
     }
 
-    $job = Start-Job -ScriptBlock {
-        param($TargetHost, $ScanCommand, $OutputPath, $FileName, $Attempts)
-
-        $startTime = Get-Date
-
-        # Execute scan - Build argument list properly
-        $nmapArgs = @()
-
-        # Parse command into arguments (handle quoted strings)
-        $cmdWithoutNmap = $ScanCommand -replace '^nmap\s+', ''
-        $regex = [regex]'(?:[^\s"'']+|"[^"]*"|''[^'']*'')+'
-        $matches = $regex.Matches($cmdWithoutNmap)
-        foreach ($match in $matches) {
-            $arg = $match.Value.Trim('"').Trim("'")
-            # Replace -sS with -sT if unprivileged mode is enabled
-            if ($using:Unprivileged -and $arg -eq "-sS") {
-                $nmapArgs += "-sT"
-            } else {
-                $nmapArgs += $arg
-            }
-        }
-
-        # Add --unprivileged if specified
-        if ($using:Unprivileged) {
-            $nmapArgs += "--unprivileged"
-        }
-
-        # Add output and target (quote the path if it contains spaces)
-        $outputFullPath = "$OutputPath\$FileName"
-        if ($outputFullPath -match '\s') {
-            $nmapArgs += @("-oA", "`"$outputFullPath`"", $TargetHost)
-        } else {
-            $nmapArgs += @("-oA", $outputFullPath, $TargetHost)
-        }
-
-        $processArgs = @{
-            FilePath = "nmap"
-            ArgumentList = $nmapArgs
-            Wait = $true
-            NoNewWindow = $true
-            RedirectStandardOutput = "$OutputPath\$FileName.stdout"
-            RedirectStandardError = "$OutputPath\$FileName.stderr"
-            PassThru = $true
-        }
-
-        try {
-            $process = Start-Process @processArgs
-            $endTime = Get-Date
-            $duration = $endTime - $startTime
-
-            $errorOutput = if (Test-Path "$OutputPath\$FileName.stderr") {
-                Get-Content "$OutputPath\$FileName.stderr" -Raw
-            } else { "" }
-
-            # Add exit code to error message for debugging
-            $exitCode = $process.ExitCode
-            if ($exitCode -ne 0) {
-                $errorOutput = "Nmap exited with code $exitCode. " + $errorOutput
-            }
-
-            # Verify that nmap actually created output files
-            $nmapFileExists = Test-Path "$OutputPath\$FileName.nmap"
-            $exitCodeOk = $exitCode -eq 0
-
-            # Success only if exit code is 0 AND .nmap file exists
-            $scanSuccess = $exitCodeOk -and $nmapFileExists
-
-            # If exit code was 0 but no file, add to error
-            if ($exitCodeOk -and -not $nmapFileExists) {
-                $errorOutput = "Nmap exited with code 0 but did not generate output files. " + $errorOutput
-            }
-
-            # If no error message but scan failed, add generic message
-            if (-not $scanSuccess -and [string]::IsNullOrWhiteSpace($errorOutput)) {
-                $errorOutput = "Nmap scan failed. Exit code: $exitCode. No stderr output captured. Check nmap installation and permissions."
-            }
-
-            return @{
-                Success = $scanSuccess
-                StartTime = $startTime.ToString("yyyy-MM-ddTHH:mm:ss")
-                EndTime = $endTime.ToString("yyyy-MM-ddTHH:mm:ss")
-                Duration = "{0:mm}m {0:ss}s" -f $duration
-                DurationSeconds = [int]$duration.TotalSeconds
-                Error = $errorOutput
-                Attempts = $Attempts
-            }
-        } catch {
-            $endTime = Get-Date
-            $duration = $endTime - $startTime
-
-            return @{
-                Success = $false
-                StartTime = $startTime.ToString("yyyy-MM-ddTHH:mm:ss")
-                EndTime = $endTime.ToString("yyyy-MM-ddTHH:mm:ss")
-                Duration = "{0:mm}m {0:ss}s" -f $duration
-                DurationSeconds = [int]$duration.TotalSeconds
-                Error = $_.Exception.Message
-                Attempts = $Attempts
-            }
-        }
-    } -ArgumentList $currentHost, $currentScanCommand, $hostFolder, $fileName, 1
+    $job = Start-NmapScanJob -TargetHost $currentHost -ScanCommand $currentScanCommand -OutputPath $hostFolder -FileName $fileName -Attempts 1 -Unprivileged $Unprivileged
 
     $jobQueue[$currentHost] = @{
         Job = $job
@@ -4010,107 +3931,7 @@ while ($jobQueue.Count -gt 0) {
                     Write-Log -Message "Retry command: $fullNmapCommand" -Level "VERBOSE" -LogFile $logFile
                 }
 
-                $retryJob = Start-Job -ScriptBlock {
-                    param($TargetHost, $ScanCommand, $OutputPath, $FileName, $Attempts)
-
-                    $startTime = Get-Date
-
-                    # Execute scan - Build argument list properly
-                    $nmapArgs = @()
-
-                    # Parse command into arguments (handle quoted strings)
-                    $cmdWithoutNmap = $ScanCommand -replace '^nmap\s+', ''
-                    $regex = [regex]'(?:[^\s"'']+|"[^"]*"|''[^'']*'')+'
-                    $matches = $regex.Matches($cmdWithoutNmap)
-                    foreach ($match in $matches) {
-                        $arg = $match.Value.Trim('"').Trim("'")
-                        # Replace -sS with -sT if unprivileged mode is enabled
-                        if ($using:Unprivileged -and $arg -eq "-sS") {
-                            $nmapArgs += "-sT"
-                        } else {
-                            $nmapArgs += $arg
-                        }
-                    }
-
-                    # Add --unprivileged if specified
-                    if ($using:Unprivileged) {
-                        $nmapArgs += "--unprivileged"
-                    }
-
-                    # Add output and target (quote the path if it contains spaces)
-                    $outputFullPath = "$OutputPath\$FileName"
-                    if ($outputFullPath -match '\s') {
-                        $nmapArgs += @("-oA", "`"$outputFullPath`"", $TargetHost)
-                    } else {
-                        $nmapArgs += @("-oA", $outputFullPath, $TargetHost)
-                    }
-
-                    $processArgs = @{
-                        FilePath = "nmap"
-                        ArgumentList = $nmapArgs
-                        Wait = $true
-                        NoNewWindow = $true
-                        RedirectStandardOutput = "$OutputPath\$FileName.stdout"
-                        RedirectStandardError = "$OutputPath\$FileName.stderr"
-                        PassThru = $true
-                    }
-
-                    try {
-                        $process = Start-Process @processArgs
-                        $endTime = Get-Date
-                        $duration = $endTime - $startTime
-
-                        $errorOutput = if (Test-Path "$OutputPath\$FileName.stderr") {
-                            Get-Content "$OutputPath\$FileName.stderr" -Raw
-                        } else { "" }
-
-                        # Add exit code to error message for debugging
-                        $exitCode = $process.ExitCode
-                        if ($exitCode -ne 0) {
-                            $errorOutput = "Nmap exited with code $exitCode. " + $errorOutput
-                        }
-
-                        # Verify that nmap actually created output files
-                        $nmapFileExists = Test-Path "$OutputPath\$FileName.nmap"
-                        $exitCodeOk = $exitCode -eq 0
-
-                        # Success only if exit code is 0 AND .nmap file exists
-                        $scanSuccess = $exitCodeOk -and $nmapFileExists
-
-                        # If exit code was 0 but no file, add to error
-                        if ($exitCodeOk -and -not $nmapFileExists) {
-                            $errorOutput = "Nmap exited with code 0 but did not generate output files. " + $errorOutput
-                        }
-
-                        # If no error message but scan failed, add generic message
-                        if (-not $scanSuccess -and [string]::IsNullOrWhiteSpace($errorOutput)) {
-                            $errorOutput = "Nmap scan failed. Exit code: $exitCode. No stderr output captured. Check nmap installation and permissions."
-                        }
-
-                        return @{
-                            Success = $scanSuccess
-                            StartTime = $startTime.ToString("yyyy-MM-ddTHH:mm:ss")
-                            EndTime = $endTime.ToString("yyyy-MM-ddTHH:mm:ss")
-                            Duration = "{0:mm}m {0:ss}s" -f $duration
-                            DurationSeconds = [int]$duration.TotalSeconds
-                            Error = $errorOutput
-                            Attempts = $Attempts
-                        }
-                    } catch {
-                        $endTime = Get-Date
-                        $duration = $endTime - $startTime
-
-                        return @{
-                            Success = $false
-                            StartTime = $startTime.ToString("yyyy-MM-ddTHH:mm:ss")
-                            EndTime = $endTime.ToString("yyyy-MM-ddTHH:mm:ss")
-                            Duration = "{0:mm}m {0:ss}s" -f $duration
-                            DurationSeconds = [int]$duration.TotalSeconds
-                            Error = $_.Exception.Message
-                            Attempts = $Attempts
-                        }
-                    }
-                } -ArgumentList $jobHost, $jobData.ScanCommand, $jobData.HostFolder, $jobData.FileName, $newAttempts
+                $retryJob = Start-NmapScanJob -TargetHost $jobHost -ScanCommand $jobData.ScanCommand -OutputPath $jobData.HostFolder -FileName $jobData.FileName -Attempts $newAttempts -Unprivileged $Unprivileged
 
                 $jobQueue[$jobHost] = @{
                     Job = $retryJob
