@@ -20,22 +20,24 @@
 - ✅ **Hosts sensibles** - Timing y scripts personalizados para hosts críticos
 - ✅ **Exclusiones inteligentes** - CIDR, IPs individuales, hostnames
 - ✅ **Carga remota** - Ejecuta desde URL sin descargar archivos
+- ✅ **ConfigFile** - Carga perfiles de configuración remotos o locales
+- ✅ **Límite de fallos** - Detiene escaneos tras N fallos consecutivos
 - ✅ **Modo Wizard** - Configuración interactiva paso a paso
 ---
 
 # TL;DR - Inicio Rápido
 
-## Crear archivo con hosts/redes
+## Carga del script
+### Carga local
 ```powershell
-echo "192.168.1.0/24" > hosts.txt
-```
-
-## Carga del fichero
-```powershell
-# Carga local
-git clone https://github.com/xtormin/scanyx.git
+git clone "https://github.com/xtormin/scanyx.git"
 cd scanyx
 . .\scanyx.ps1
+```
+
+### Carga remota
+```powershell
+iex ((New-Object Net.WebClient).DownloadString('https://raw.githubusercontent.com/xtormin/Scanyx/refs/heads/main/scanyx.ps1'))
 ```
 
 ## Edición de la configuración de perfiles y workflows (opcional)
@@ -43,10 +45,15 @@ cd scanyx
 notepad "nmap-profiles-workflows.json"
 ```
 
+## Crear archivo con hosts/redes
+```powershell
+echo "192.168.1.0/24" > hosts.txt
+```
+
 ## Escaneo básico
 ```powershell
 # Un tipo de escaneo
-scanyx -HostFile hosts.txt -ScanType "tcp-1000"
+scanyx -Hosts "192.168.1.2" -ScanType "tcp-1000"
 
 # Multiples tipos de escaneo secuenciales
 scanyx -HostFile hosts.txt -Workflow "full-discovery" -MaxConcurrent 5
@@ -57,32 +64,31 @@ scanyx -HostFile hosts.txt -Workflow "full-discovery" -MaxConcurrent 5
 Un tipo de escaneo:
 ```powershell
 scanyx `
-    -HostFile "C:\Pentest\PROYECTO\scope\networks.txt" `
-    -SensitiveFile "C:\Pentest\PROYECTO\scope\sensitive.txt" `
-    -ExcludeFile "C:\Pentest\PROYECTO\scope\excluded.txt" `
+    -HostFile "networks.txt" `
+    -SensitiveFile "sensitive.txt" `
+    -ExcludeFile "excluded.txt" `
     -ConfigFile "nmap-profiles-workflows.json" `
     -ScanType "tcp-1000"
     -SessionName "scan-01" `
-    -OutputDir "C:\Pentest\PROYECTO\scans" `
+    -OutputDir "scans" `
     -SensitiveTiming T1 `
     -SensitiveScripts default `
     -MaxConcurrent 5 `
     -MaxRetries 1 `
     -ResolveHostnames `
-    -ConfigFile "nmap-profiles-workflows.json" `
     -VerboseMode
 ```
 
 Con varios tipos de escaneo secuenciales:
 ```powershell
 scanyx `
-    -HostFile "C:\Pentest\PROYECTO\scope\networks.txt" `
-    -SensitiveFile "C:\Pentest\PROYECTO\scope\sensitive.txt" `
-    -ExcludeFile "C:\Pentest\PROYECTO\scope\excluded.txt" `
-    -ConfigFile "nmap-profiles-workflows.json" `
-    -Workflow "full-discovery" `
     -SessionName "workflow-01" `
-    -OutputDir "C:\Pentest\PROYECTO\scans" `
+    -OutputDir "scans" `
+    -Workflow "full-discovery" `
+    -HostFile "networks.txt" `
+    -SensitiveFile "sensitive.txt" `
+    -ExcludeFile "excluded.txt" `
+    -ConfigFile "nmap-profiles-workflows.json" `
     -SensitiveTiming T1 `
     -SensitiveScripts default `
     -MaxConcurrent 5 `
@@ -95,11 +101,12 @@ scanyx `
 ## Reanudar sesión
 
 ```powershell
-# Reanuda la sesión continuando los que no se han completado y reintentando los fallidos
+# Reanuda la sesión continuando el escaneo con todos los hosts que no se han completado
 scanyx `
     -ResumeSession "workflow-01" `
-    -OutputDir "C:\Pentest\PROYECTO\scans" `
-    -ResumeRetryFailed
+    -OutputDir "scans" `
+    -Resume
+    -VerboseMode
 ```
 
 ---
@@ -124,7 +131,7 @@ $PSVersionTable.PSVersion
 # Escaneo básico
 scanyx -HostFile hosts.txt -ScanType "tcp-1000"
 
-# Escaneo directo sin archivo (parámetro inline)
+# Escaneo directo sin archivo
 scanyx -Hosts "192.168.1.0/24","10.0.0.50" -ScanType "tcp-1000"
 ```
 
@@ -133,7 +140,7 @@ scanyx -Hosts "192.168.1.0/24","10.0.0.50" -ScanType "tcp-1000"
 # Exclusiones desde archivo
 scanyx -HostFile hosts.txt -ExcludeFile gateways.txt -ScanType "tcp-1000"
 
-# Exclusiones inline (sin archivo)
+# Exclusiones sin archivo
 scanyx -Hosts "192.168.1.0/24" -ExcludeHosts "192.168.1.1","192.168.1.254" -ScanType "tcp-1000"
 ```
 
@@ -184,6 +191,41 @@ scanyx -HostFile hosts.txt -ScanType tcp-1000 -Force
 scanyx -Wizard
 ```
 
+## Carga Remota y ConfigFile desde URL
+
+### Carga con WebClient 
+```powershell
+# Cargar desde cualquier servidor web
+iex ((New-Object Net.WebClient).DownloadString('https://raw.githubusercontent.com/xtormin/Scanyx/refs/heads/main/scanyx.ps1'))
+# Usar la función
+scanyx -HostFile hosts.txt -ScanType tcp-1000
+```
+
+### Verificar carga exitosa
+```powershell
+# Verificar que la función está disponible
+Get-Command Invoke-Scanyx
+Get-Command scanyx
+
+# Ver ayuda
+Get-Help Invoke-Scanyx -Examples
+```
+
+### ConfigFile desde URL
+```powershell
+# Usar configuración remota
+scanyx -HostFile hosts.txt -ScanType tcp-1000 -ConfigFile "https://raw.githubusercontent.com/xtormin/Scanyx/refs/heads/main/nmap-profiles-workflows.json"
+```
+```powershell
+# Combinación: Script remoto + ConfigFile remoto
+iex ((New-Object Net.WebClient).DownloadString('https://raw.githubusercontent.com/xtormin/Scanyx/refs/heads/main/scanyx.ps1'))
+scanyx -Hosts "10.0.0.0/24" -ScanType tcp-full -ConfigFile "https://raw.githubusercontent.com/xtormin/Scanyx/refs/heads/main/nmap-profiles-workflows.json"
+```
+
+### Notas Importantes
+- ⚠️ **El script NO se ejecuta automáticamente** al cargarse con `iex` - solo define las funciones
+- ✅ **Funciona en la sesión actual** - al cerrar PowerShell se debe recargar
+
 ---
 
 # Perfiles de Escaneo Disponibles
@@ -198,41 +240,6 @@ scanyx -Wizard
 | `udp-full` | Todos los 65535 puertos UDP | 🐢 Muy lento |
 
 > **Nota**: Configura perfiles personalizados editando [nmap-profiles-workflows.json](nmap-profiles-workflows.json)
-
----
-
-# Comandos más usados
-
-```powershell
-# Escaneo básico
-scanyx -HostFile hosts.txt -ScanType tcp-1000 -OutputDir "C:\Pentest\PROYECTO\scans"
-
-# Escaneo rápido paralelo
-scanyx -HostFile hosts.txt -ScanType tcp-1000 -MaxConcurrent 20
-
-# Con exclusiones
-scanyx -HostFile hosts.txt -ExcludeFile excluded.txt -ScanType tcp-1000
-
-# Hosts sensibles
-scanyx -HostFile hosts.txt -SensitiveFile prod.txt -ScanType tcp-1000 -SensitiveTiming T2
-
-# Workflow completo
-scanyx -HostFile hosts.txt -Workflow full-discovery -MaxConcurrent 10
-
-# Gestión de sesiones
-scanyx -HostFile hosts.txt -ScanType tcp-1000 -SessionName "mi-proyecto" -OutputDir "C:\Pentest\PROYECTO\scans"
-scanyx -ListSessions -OutputDir "C:\Pentest\PROYECTO\scans"
-scanyx -ResumeSession "mi-proyecto" -Resume -OutputDir "C:\Pentest\PROYECTO\scans"
-
-# Reanudar interrumpido
-scanyx -HostFile hosts.txt -ScanType tcp-1000 -Resume
-
-# Reintentar fallidos
-scanyx -HostFile hosts.txt -ScanType tcp-1000 -RetryFailed
-
-# Modo verbose (debugging)
-scanyx -HostFile hosts.txt -ScanType tcp-1000 -VerboseMode
-```
 
 ---
 
@@ -268,11 +275,25 @@ python3 xnp.py -d nmap/ -M -R --open -C all
 
 # Registro de Cambios
 
+## Versión 2.8.1 (2025-10-22)
+- ✨ **Carga remota via IEX optimizada**: El script puede cargarse directamente desde URL sin descargar archivos:
+  - Eliminado bloque `param()` del nivel script (solo en función `Invoke-Scanyx`)
+  - Reemplazadas 22 sentencias `exit` por `return` para evitar cerrar la sesión
+  - Deshabilitada auto-ejecución del script al cargarlo
+  - Detección automática de contexto de ejecución (IEX vs local)
+  - No se ejecuta automáticamente cuando se carga via IEX
+  - Funciones y aliases disponibles tras la carga
+  - Compatible con `iex ((New-Object Net.WebClient).DownloadString('url'))`
+- ✨ **ConfigFile desde URL**: Soporte para cargar perfiles de configuración desde HTTP/HTTPS
+  - Fallback automático a configuración por defecto si falla la descarga
+  - Mensajes informativos sobre el origen de la configuración
+- 📚 **Documentación**: README ampliado con ejemplos detallados de carga remota.
+
 ## Versión 2.8.0 (2025-10-17)
 - ✨ **Nueva función `scanyx`**: Carga en memoria y ejecución desde URL
 - ✅ **Testing completo**: 118 de 118 tests (100%)
 - 🔧 **Archivo de configuración**: Renombrado a `nmap-profiles-workflows.json`
-- 📚 **Documentación**: README simplificado + WIKI.md exhaustivo
+- 📚 **Documentación**: README simplificado + WIKI completa
 
 
 ## Versión 2.7 (2025-10-13)
