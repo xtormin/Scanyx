@@ -325,10 +325,7 @@ python3 xnp.py -d nmap/ -M -R --open -C all
 
 Este proyecto está licenciado bajo la licencia GPL v3.0 - ver el archivo [LICENSE](LICENSE) para más detalles.
 
-> **Disclaimer**: Este script se proporciona con fines educativos y de pruebas de seguridad autorizadas únicamente. Escanea redes y sistemas para los que tienes permiso explícito.
-
 ---
-
 
 # Redes sociales
 
