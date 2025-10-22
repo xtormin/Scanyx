@@ -1,6 +1,6 @@
 ﻿<#
 .SYNOPSIS
-SCANYX (Scan Analysis eXecution) - Advanced Nmap scanner with parallel execution, state persistence, and comprehensive logging.
+SCANYX - Advanced Nmap scanner with parallel execution, state persistence, and comprehensive logging.
 
 .DESCRIPTION
 SCANYX is a PowerShell pentesting tool that performs port scans on hosts specified in a text file using Nmap with advanced features:
@@ -167,66 +167,6 @@ Requires: Nmap installed and available in PATH
 Scan profiles are loaded from nmap-profiles-workflows.json in the script directory.
 If the file doesn't exist, it will be created with default profiles.
 #>
-
-[CmdletBinding(DefaultParameterSetName='SingleScan')]
-param (
-    [Parameter(Mandatory = $false)]
-    [string]$HostFile = "",
-    [Parameter(Mandatory = $false)]
-    [string[]]$Hosts = @(),
-    [Parameter(Mandatory = $false, ParameterSetName='SingleScan')]
-    [string]$ScanType = "",
-    [Parameter(Mandatory = $false, ParameterSetName='WorkflowScan')]
-    [string]$Workflow = "",
-    [Parameter(Mandatory = $false)]
-    [ValidateSet("always", "previous_success", "previous_has_results")]
-    [string]$WorkflowCondition = "always",
-    [Parameter(Mandatory = $false)]
-    [string]$ExcludeFile = "",
-    [Parameter(Mandatory = $false)]
-    [string[]]$ExcludeHosts = @(),
-    [Parameter(Mandatory = $false)]
-    [switch]$ResolveHostnames,
-    [Parameter(Mandatory = $false)]
-    [string]$SensitiveFile = "",
-    [Parameter(Mandatory = $false)]
-    [string[]]$SensitiveHosts = @(),
-    [Parameter(Mandatory = $false)]
-    [ValidateSet("T0", "T1", "T2", "T3", "T4")]
-    [string]$SensitiveTiming = "T2",
-    [Parameter(Mandatory = $false)]
-    [ValidateSet("default", "vuln", "none", "default+vuln")]
-    [string]$SensitiveScripts = "default",
-    [Parameter(Mandatory = $false)]
-    [string]$OutputDir = "nmap",
-    [Parameter(Mandatory = $false)]
-    [ValidateRange(1, 50)]
-    [int]$MaxConcurrent = 5,
-    [Parameter(Mandatory = $false)]
-    [ValidateRange(0, 10)]
-    [int]$MaxRetries = 1,
-    [Parameter(Mandatory = $false)]
-    [int]$RetryDelay = 60,
-    [Parameter(Mandatory = $false)]
-    [ValidateSet("Skip", "Overwrite", "Ask")]
-    [string]$OverwriteMode = "Ask",
-    [Parameter(Mandatory = $false)]
-    [switch]$Resume,
-    [Parameter(Mandatory = $false)]
-    [switch]$ResumeRetryFailed,
-    [Parameter(Mandatory = $false)]
-    [switch]$RetryFailed,
-    [Parameter(Mandatory = $false)]
-    [switch]$Force,
-    [Parameter(Mandatory = $false)]
-    [switch]$Unprivileged,
-    [Parameter(Mandatory = $false)]
-    [string]$ConfigFile = "",
-    [Parameter(Mandatory = $false)]
-    [switch]$VerboseMode,
-    [Parameter(Mandatory = $false)]
-    [switch]$WhatIf
-)
 
 # ============================================
 # HELPER FUNCTIONS (Global Scope)
@@ -1020,6 +960,126 @@ function Get-UserChoice {
     return $Options[$choiceNum - 1]
 }
 
+function Get-ConfigContent {
+    <#
+    .SYNOPSIS
+    Gets configuration content from a file path or URL.
+
+    .DESCRIPTION
+    Attempts to load configuration content from either a local file or HTTP/HTTPS URL.
+    Returns a hashtable with Success status, Content, and Source information.
+
+    .PARAMETER ConfigPath
+    Path to local file or HTTP/HTTPS URL
+    #>
+    param([string]$ConfigPath)
+
+    # Detectar si es URL (http:// o https://)
+    if ($ConfigPath -match '^https?://') {
+        try {
+            Write-Host "[INFO] Downloading configuration from URL: $ConfigPath" -ForegroundColor Cyan
+            $content = (New-Object Net.WebClient).DownloadString($ConfigPath)
+            Write-Host "[INFO] Configuration downloaded successfully" -ForegroundColor Green
+            return @{
+                Success = $true
+                Content = $content
+                Source = "URL"
+            }
+        } catch {
+            Write-Warning "Failed to download configuration from URL: $_"
+            return @{
+                Success = $false
+                Error = $_.Exception.Message
+                Source = "URL"
+            }
+        }
+    } else {
+        # Archivo local
+        if (Test-Path $ConfigPath) {
+            try {
+                $content = Get-Content -Path $ConfigPath -Raw -ErrorAction Stop
+                return @{
+                    Success = $true
+                    Content = $content
+                    Source = "File"
+                }
+            } catch {
+                return @{
+                    Success = $false
+                    Error = $_.Exception.Message
+                    Source = "File"
+                }
+            }
+        } else {
+            return @{
+                Success = $false
+                Error = "File not found"
+                Source = "File"
+            }
+        }
+    }
+}
+
+function Convert-ScanConfigFromJson {
+    <#
+    .SYNOPSIS
+    Converts JSON configuration object to hashtables for profiles and workflows.
+
+    .DESCRIPTION
+    Helper function to avoid code duplication when converting loaded JSON config.
+    Handles both new format (with profiles/workflows keys) and old format (root level).
+    #>
+    param($LoadedConfig)
+
+    # Convert profiles
+    $profiles = @{}
+    if ($LoadedConfig.PSObject.Properties.Name -contains 'profiles') {
+        foreach ($prop in $LoadedConfig.profiles.PSObject.Properties) {
+            $profiles[$prop.Name] = @{
+                name = $prop.Value.name
+                description = $prop.Value.description
+                command = $prop.Value.command
+            }
+        }
+    } else {
+        # Old format: root level profiles
+        foreach ($prop in $LoadedConfig.PSObject.Properties) {
+            if ($prop.Name -ne 'workflows') {
+                $profiles[$prop.Name] = @{
+                    name = $prop.Value.name
+                    description = $prop.Value.description
+                    command = $prop.Value.command
+                }
+            }
+        }
+    }
+
+    # Convert workflows
+    $workflows = @{}
+    if ($LoadedConfig.PSObject.Properties.Name -contains 'workflows') {
+        foreach ($prop in $LoadedConfig.workflows.PSObject.Properties) {
+            $steps = @()
+            foreach ($step in $prop.Value.steps) {
+                $steps += @{
+                    profile = $step.profile
+                    description = $step.description
+                    condition = if ($step.PSObject.Properties.Name -contains 'condition') { $step.condition } else { "always" }
+                }
+            }
+            $workflows[$prop.Name] = @{
+                name = $prop.Value.name
+                description = $prop.Value.description
+                steps = $steps
+            }
+        }
+    }
+
+    return @{
+        profiles = $profiles
+        workflows = $workflows
+    }
+}
+
 function Load-ScanConfiguration {
     param(
         [string]$ConfigFile
@@ -1085,78 +1145,109 @@ function Load-ScanConfiguration {
         workflows = $defaultWorkflows
     }
 
-    # Check if config file exists
-    if (Test-Path $ConfigFile) {
+    # Try to get configuration content (from URL or file)
+    $configResult = Get-ConfigContent -ConfigPath $ConfigFile
+
+    if ($configResult.Success) {
         try {
-            $json = Get-Content -Path $ConfigFile -Raw -ErrorAction Stop
-            $loadedConfig = $json | ConvertFrom-Json
+            $loadedConfig = $configResult.Content | ConvertFrom-Json
 
-            # Convert profiles
-            $profiles = @{}
-            if ($loadedConfig.PSObject.Properties.Name -contains 'profiles') {
-                foreach ($prop in $loadedConfig.profiles.PSObject.Properties) {
-                    $profiles[$prop.Name] = @{
-                        name = $prop.Value.name
-                        description = $prop.Value.description
-                        command = $prop.Value.command
-                    }
-                }
+            # Show source information
+            if ($configResult.Source -eq "URL") {
+                Write-Host "[INFO] Loaded configuration from URL" -ForegroundColor Green
             } else {
-                # Old format: root level profiles
-                foreach ($prop in $loadedConfig.PSObject.Properties) {
-                    if ($prop.Name -ne 'workflows') {
-                        $profiles[$prop.Name] = @{
-                            name = $prop.Value.name
-                            description = $prop.Value.description
-                            command = $prop.Value.command
-                        }
-                    }
-                }
+                Write-Host "[INFO] Loaded configuration from local file" -ForegroundColor Green
             }
 
-            # Convert workflows
-            $workflows = @{}
-            if ($loadedConfig.PSObject.Properties.Name -contains 'workflows') {
-                foreach ($prop in $loadedConfig.workflows.PSObject.Properties) {
-                    $steps = @()
-                    foreach ($step in $prop.Value.steps) {
-                        $steps += @{
-                            profile = $step.profile
-                            description = $step.description
-                            condition = if ($step.PSObject.Properties.Name -contains 'condition') { $step.condition } else { "always" }
-                        }
-                    }
-                    $workflows[$prop.Name] = @{
-                        name = $prop.Value.name
-                        description = $prop.Value.description
-                        steps = $steps
-                    }
-                }
-            }
-
-            return @{
-                profiles = $profiles
-                workflows = $workflows
-            }
+            # Convert using helper function
+            return Convert-ScanConfigFromJson -LoadedConfig $loadedConfig
         } catch {
-            Write-Warning "Failed to load scan configuration from $ConfigFile : $_"
+            Write-Warning "Failed to parse configuration: $_"
             Write-Warning "Using default configuration"
             return $defaultConfig
         }
     } else {
-        # Create default config file
-        try {
-            $defaultConfig | ConvertTo-Json -Depth 5 | Set-Content -Path $ConfigFile -ErrorAction Stop
-            Write-Host "[INFO] Created default scan configuration file: $ConfigFile" -ForegroundColor Green
-            Write-Host "[WARNING] Default profiles use -sS (SYN scan) which requires administrator privileges." -ForegroundColor Yellow
-            Write-Host "          Options:" -ForegroundColor Yellow
-            Write-Host "          1. Use -Unprivileged parameter to auto-convert -sS to -sT" -ForegroundColor Yellow
-            Write-Host "          2. Edit $ConfigFile to change -sS to -sT manually" -ForegroundColor Yellow
-            Write-Host "          3. Create custom config and use -ConfigFile parameter" -ForegroundColor Yellow
-        } catch {
-            Write-Warning "Failed to create default configuration file: $_"
+        # Failed to get configuration
+        if ($configResult.Source -eq "URL") {
+            # URL failed - ask user what to do
+            Write-Host ""
+            Write-Host "╔═══════════════════════════════════════════════════════════════╗" -ForegroundColor Red
+            Write-Host "║  ERROR: Failed to download configuration from URL            ║" -ForegroundColor Red
+            Write-Host "╚═══════════════════════════════════════════════════════════════╝" -ForegroundColor Red
+            Write-Host ""
+            Write-Host "  URL: " -NoNewline -ForegroundColor Yellow
+            Write-Host "$ConfigFile" -ForegroundColor White
+            Write-Host "  Error: " -NoNewline -ForegroundColor Yellow
+            Write-Host "$($configResult.Error)" -ForegroundColor Gray
+            Write-Host ""
+
+            Write-Host "What would you like to do?" -ForegroundColor Cyan
+            Write-Host "  [1] Use default configuration (hardcoded profiles)" -ForegroundColor White
+            Write-Host "  [2] Specify a local configuration file path" -ForegroundColor White
+            Write-Host "  [3] Cancel execution" -ForegroundColor White
+            Write-Host ""
+
+            $choice = Read-Host "Select option [1-3]"
+
+            switch ($choice) {
+                "1" {
+                    Write-Host "[INFO] Using default configuration" -ForegroundColor Green
+                    return $defaultConfig
+                }
+                "2" {
+                    Write-Host ""
+                    $localPath = Read-Host "Enter path to local configuration file"
+
+                    if ([string]::IsNullOrWhiteSpace($localPath)) {
+                        Write-Host "[ERROR] No path specified. Using default configuration" -ForegroundColor Yellow
+                        return $defaultConfig
+                    }
+
+                    Write-Host "[INFO] Attempting to load: $localPath" -ForegroundColor Cyan
+                    $localResult = Get-ConfigContent -ConfigPath $localPath
+
+                    if ($localResult.Success) {
+                        try {
+                            $loadedConfig = $localResult.Content | ConvertFrom-Json
+                            Write-Host "[INFO] Configuration loaded successfully from local file" -ForegroundColor Green
+                            return Convert-ScanConfigFromJson -LoadedConfig $loadedConfig
+                        } catch {
+                            Write-Warning "Failed to parse local configuration: $_"
+                            Write-Host "[INFO] Using default configuration" -ForegroundColor Yellow
+                            return $defaultConfig
+                        }
+                    } else {
+                        Write-Warning "Failed to load local configuration: $($localResult.Error)"
+                        Write-Host "[INFO] Using default configuration" -ForegroundColor Yellow
+                        return $defaultConfig
+                    }
+                }
+                "3" {
+                    Write-Host ""
+                    Write-Host "[INFO] Execution cancelled by user" -ForegroundColor Yellow
+                    Write-Host ""
+                    return $null
+                }
+                default {
+                    Write-Host "[WARNING] Invalid option. Using default configuration" -ForegroundColor Yellow
+                    return $defaultConfig
+                }
+            }
+        } else {
+            # File not found - create default file
+            try {
+                $defaultConfig | ConvertTo-Json -Depth 5 | Set-Content -Path $ConfigFile -ErrorAction Stop
+                Write-Host "[INFO] Created default scan configuration file: $ConfigFile" -ForegroundColor Green
+                Write-Host "[WARNING] Default profiles use -sS (SYN scan) which requires administrator privileges." -ForegroundColor Yellow
+                Write-Host "          Options:" -ForegroundColor Yellow
+                Write-Host "          1. Use -Unprivileged parameter to auto-convert -sS to -sT" -ForegroundColor Yellow
+                Write-Host "          2. Edit $ConfigFile to change -sS to -sT manually" -ForegroundColor Yellow
+                Write-Host "          3. Create custom config and use -ConfigFile parameter" -ForegroundColor Yellow
+            } catch {
+                Write-Warning "Failed to create default configuration file: $_"
+            }
+            return $defaultConfig
         }
-        return $defaultConfig
     }
 }
 
@@ -1476,7 +1567,7 @@ function Get-SessionState {
     $stateFile = Join-Path $sessionDir "scan-state.json"
 
     if (-not (Test-Path $sessionDir)) {
-        Write-Host "`n[ERROR] Session '$SessionName' not found" -ForegroundColor Red
+        Write-Host "`n[ERROR] Session '$SessionName' not found" -ForegroundColor DarkRed
         Write-Host "Available sessions:" -ForegroundColor Yellow
         $sessions = Get-SessionList -OutputDir $OutputDir
         if ($sessions.Count -gt 0) {
@@ -1489,7 +1580,7 @@ function Get-SessionState {
     }
 
     if (-not (Test-Path $stateFile)) {
-        Write-Host "`n[ERROR] Session state file not found for session '$SessionName'" -ForegroundColor Red
+        Write-Host "`n[ERROR] Session state file not found for session '$SessionName'" -ForegroundColor DarkRed
         Write-Host "State file expected at: $stateFile`n" -ForegroundColor Gray
         return $null
     }
@@ -1502,17 +1593,20 @@ function Get-SessionState {
             StateFile = $stateFile
         }
     } catch {
-        Write-Host "`n[ERROR] Failed to load session state: $($_.Exception.Message)`n" -ForegroundColor Red
+        Write-Host "`n[ERROR] Failed to load session state: $($_.Exception.Message)`n" -ForegroundColor DarkRed
         return $null
     }
 }
 
-#region Wizard Functions
+function Show-ScanyxBanner {
+    <#
+    .SYNOPSIS
+    Displays the SCANYX ASCII art banner with branding.
 
-function Show-WizardHeader {
-    param([string]$Title, [int]$Step, [int]$TotalSteps)
-
-    Clear-Host
+    .DESCRIPTION
+    Centralized function to display the SCANYX banner consistently across the script.
+    Used in: main script start, wizard headers, and summary sections.
+    #>
     Write-Host ""
     Write-Host " ░▒▓███████▓▒░░▒▓██████▓▒░ ░▒▓██████▓▒░░▒▓███████▓▒░░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░" -ForegroundColor Red
     Write-Host "░▒▓█▓▒░      ░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░" -ForegroundColor Red
@@ -1522,9 +1616,18 @@ function Show-WizardHeader {
     Write-Host "       ░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░  ░▒▓█▓▒░   ░▒▓█▓▒░░▒▓█▓▒░" -ForegroundColor Red
     Write-Host "░▒▓███████▓▒░ ░▒▓██████▓▒░░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░  ░▒▓█▓▒░   ░▒▓█▓▒░░▒▓█▓▒░" -ForegroundColor Red
     Write-Host ""
-    Write-Host "                        https://github.com/xtormin/Scanyx" -ForegroundColor Red
+    Write-Host "                   https://github.com/xtormin/Scanyx (v2.8.1)" -ForegroundColor Red
     Write-Host "                           @xtormin (Jennifer Torres)" -ForegroundColor Red
     Write-Host ""
+}
+
+#region Wizard Functions
+
+function Show-WizardHeader {
+    param([string]$Title, [int]$Step, [int]$TotalSteps)
+
+    Clear-Host
+    Show-ScanyxBanner
     Write-Host "╭─────────────────────────────────────────────────────────────────────────────╮" -ForegroundColor Cyan
     Write-Host "│ INTERACTIVE CONFIGURATION                                                   │" -ForegroundColor Cyan
     Write-Host "╰─────────────────────────────────────────────────────────────────────────────╯" -ForegroundColor Cyan
@@ -1564,7 +1667,7 @@ function Get-ScanTypeChoice {
         return $profileList[[int]$selection - 1]
     } else {
         Write-Host ""
-        Write-Host "  [ERROR] Invalid selection. Using default profile: tcp-1000" -ForegroundColor Red
+        Write-Host "  [ERROR] Invalid selection. Using default profile: tcp-1000" -ForegroundColor DarkRed
         Start-Sleep -Seconds 2
         return "tcp-1000"
     }
@@ -1643,7 +1746,7 @@ function Get-SessionNameInput {
         $isValid = Test-SessionName -Name $sessionName
         if (-not $isValid) {
             Write-Host ""
-            Write-Host "  [ERROR] Invalid session name. Must be 3-50 chars, start with letter, only letters/numbers/hyphens/underscores allowed." -ForegroundColor Red
+            Write-Host "  [ERROR] Invalid session name. Must be 3-50 chars, start with letter, only letters/numbers/hyphens/underscores allowed." -ForegroundColor DarkRed
             Start-Sleep -Seconds 2
             return ""
         }
@@ -2050,10 +2153,10 @@ function Start-ScanWizard {
 
         if ($config.Hosts.Count -eq 0) {
             Write-Host ""
-            Write-Host "  [ERROR] Debes especificar al menos un host o archivo de hosts." -ForegroundColor Red
+            Write-Host "  [ERROR] Debes especificar al menos un host o archivo de hosts." -ForegroundColor DarkRed
             Write-Host "  Presiona Enter para salir del wizard..." -ForegroundColor Gray
             Read-Host
-            exit 1
+            return
         }
     }
 
@@ -2117,7 +2220,7 @@ function Start-ScanWizard {
         Write-Host ""
         Write-Host "  Escaneo cancelado. Comando guardado para referencia futura." -ForegroundColor Yellow
         Write-Host ""
-        exit 0
+        return
     }
 }
 
@@ -2279,9 +2382,7 @@ Invoke-Scanyx -Hosts "192.168.1.0/24" -ScanType tcp-full -MaxConcurrent 10
 $scriptStartTime = Get-Date
 $sessionId = (Get-Date -Format "yyyyMMdd-HHmmss") + "_session"
 
-Write-Host "`n========================================" -ForegroundColor Cyan
-Write-Host "  Network Scan Logger v2.8.0" -ForegroundColor Cyan
-Write-Host "========================================`n" -ForegroundColor Cyan
+Show-ScanyxBanner
 
 # Handle -ListSessions (exit early)
 # Convert OutputDir to absolute path for -ListSessions
@@ -2291,7 +2392,7 @@ if ($ListSessions) {
     if ($sessions.Count -gt 0) {
         Show-SessionList -Sessions $sessions
     }
-    exit 0
+    return
 }
 
 # Convert OutputDir to absolute path to ensure it works in background jobs
@@ -2299,20 +2400,43 @@ $OutputDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPS
 
 # Validate Nmap installation
 if (-not (Test-NmapInstalled)) {
-    Write-Host "[ERROR] Nmap is not installed or not in PATH. Please install Nmap first." -ForegroundColor Red
-    exit 1
+    Write-Host "[ERROR] Nmap is not installed or not in PATH. Please install Nmap first." -ForegroundColor DarkRed
+    return
 }
 
 # Load scan configuration (profiles and workflows)
-$scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+# When loaded via IEX, $PSScriptRoot and $MyInvocation.MyCommand.Path are $null
+# In that case, use current directory or rely on ConfigFile parameter
+$scriptDir = if ($PSScriptRoot) {
+    $PSScriptRoot
+} elseif ($MyInvocation.MyCommand.Path) {
+    Split-Path -Parent $MyInvocation.MyCommand.Path
+} else {
+    Get-Location | Select-Object -ExpandProperty Path
+}
+
 if (-not $ConfigFile -or $ConfigFile -eq "") {
     $configFile = Join-Path $scriptDir "nmap-profiles-workflows.json"
 } else {
     $configFile = $ConfigFile
 }
 $scanConfig = Load-ScanConfiguration -ConfigFile $configFile
+
+# Check if user cancelled configuration load
+if ($null -eq $scanConfig) {
+    Write-Host "[INFO] Configuration load cancelled. Exiting..." -ForegroundColor Yellow
+    return
+}
+
 $scanProfiles = $scanConfig.profiles
 $scanWorkflows = $scanConfig.workflows
+
+# Show configuration source info
+if ($ConfigFile -and $ConfigFile -match '^https?://') {
+    Write-Host "[INFO] Using remote configuration: $ConfigFile" -ForegroundColor Cyan
+} elseif ($ConfigFile -and $ConfigFile -ne "") {
+    Write-Host "[INFO] Using custom configuration: $ConfigFile" -ForegroundColor Cyan
+}
 
 # Handle -Wizard mode (interactive configuration)
 if ($Wizard) {
@@ -2346,6 +2470,13 @@ if ($Wizard) {
         $ConfigFile = $wizardConfig.ConfigFile
         # Reload configuration if custom file was specified
         $scanConfig = Load-ScanConfiguration -ConfigFile $wizardConfig.ConfigFile
+
+        # Check if user cancelled configuration load
+        if ($null -eq $scanConfig) {
+            Write-Host "[INFO] Configuration load cancelled. Exiting..." -ForegroundColor Yellow
+            return
+        }
+
         $scanProfiles = $scanConfig.profiles
         $scanWorkflows = $scanConfig.workflows
     }
@@ -2358,15 +2489,15 @@ if ($Wizard) {
 $resumeParams = @($Resume.IsPresent, $ResumeRetryFailed.IsPresent, $ResumeRetryDead.IsPresent, $RetryFailed.IsPresent, $RetryDead.IsPresent, $Force.IsPresent)
 $resumeParamsCount = ($resumeParams | Where-Object { $_ }).Count
 if ($resumeParamsCount -gt 1) {
-    Write-Host "[ERROR] Parameters -Resume, -ResumeRetryFailed, -ResumeRetryDead, -RetryFailed, -RetryDead, and -Force are mutually exclusive. Use only one." -ForegroundColor Red
-    exit 1
+    Write-Host "[ERROR] Parameters -Resume, -ResumeRetryFailed, -ResumeRetryDead, -RetryFailed, -RetryDead, and -Force are mutually exclusive. Use only one." -ForegroundColor DarkRed
+    return
 }
 
 # Validate SessionName if provided
 if ($SessionName -and $SessionName -ne "") {
     $isValid = Test-SessionName -Name $SessionName
     if (-not $isValid) {
-        Write-Host "[ERROR] Invalid session name" -ForegroundColor Red
+        Write-Host "[ERROR] Invalid session name" -ForegroundColor DarkRed
         Write-Host "`nSession name requirements:" -ForegroundColor Yellow
         Write-Host "  - 3-50 characters long" -ForegroundColor Gray
         Write-Host "  - Must start with a letter" -ForegroundColor Gray
@@ -2375,7 +2506,7 @@ if ($SessionName -and $SessionName -ne "") {
         Write-Host "  -SessionName `"pentest-client-2025`"" -ForegroundColor Cyan
         Write-Host "  -SessionName `"weekly_scan_oct`"" -ForegroundColor Cyan
         Write-Host "  -SessionName `"infrastructure-audit-phase1`"`n" -ForegroundColor Cyan
-        exit 1
+        return
     }
 }
 
@@ -2386,7 +2517,7 @@ if ($ResumeSession -and $ResumeSession -ne "") {
     Write-Host "[INFO] Resuming session: $ResumeSession" -ForegroundColor Cyan
     $resumedSessionData = Get-SessionState -SessionName $ResumeSession -OutputDir $OutputDir
     if ($null -eq $resumedSessionData) {
-        exit 1
+        return
     }
     $resumingSession = $true
 
@@ -2429,7 +2560,7 @@ if ($ResumeSession -and $ResumeSession -ne "") {
 # Skip this validation if resuming a session (will use session's config)
 if (-not $resumingSession) {
 if ((-not $ScanType -or $ScanType -eq "") -and (-not $Workflow -or $Workflow -eq "")) {
-    Write-Host "[ERROR] Either -ScanType or -Workflow parameter must be provided." -ForegroundColor Red
+    Write-Host "[ERROR] Either -ScanType or -Workflow parameter must be provided." -ForegroundColor DarkRed
     Write-Host "`nAvailable scan profiles:" -ForegroundColor Yellow
     foreach ($profile in $scanProfiles.GetEnumerator() | Sort-Object Key) {
         Write-Host "  - $($profile.Key): $($profile.Value.name)" -ForegroundColor Cyan
@@ -2439,12 +2570,12 @@ if ((-not $ScanType -or $ScanType -eq "") -and (-not $Workflow -or $Workflow -eq
         Write-Host "  - $($wf.Key): $($wf.Value.name)" -ForegroundColor Cyan
         Write-Host "    $($wf.Value.description)" -ForegroundColor Gray
     }
-    exit 1
+    return
 }
 
 if ($ScanType -and $ScanType -ne "" -and $Workflow -and $Workflow -ne "") {
-    Write-Host "[ERROR] Cannot use both -ScanType and -Workflow. Choose one." -ForegroundColor Red
-    exit 1
+    Write-Host "[ERROR] Cannot use both -ScanType and -Workflow. Choose one." -ForegroundColor DarkRed
+    return
 }
 
 # Validate ScanType or Workflow
@@ -2452,36 +2583,36 @@ $isWorkflowMode = $false
 if ($Workflow -and $Workflow -ne "") {
     $isWorkflowMode = $true
     if (-not $scanWorkflows.ContainsKey($Workflow)) {
-        Write-Host "[ERROR] Invalid workflow: $Workflow" -ForegroundColor Red
+        Write-Host "[ERROR] Invalid workflow: $Workflow" -ForegroundColor DarkRed
         Write-Host "`nAvailable workflows:" -ForegroundColor Yellow
         foreach ($wf in $scanWorkflows.GetEnumerator() | Sort-Object Key) {
             Write-Host "  - $($wf.Key): $($wf.Value.name)" -ForegroundColor Cyan
             Write-Host "    $($wf.Value.description)" -ForegroundColor Gray
         }
         Write-Host "`nYou can customize workflows by editing: $configFile`n" -ForegroundColor Yellow
-        exit 1
+        return
     }
 
     # Validate that all profiles in workflow exist
     $workflowDef = $scanWorkflows[$Workflow]
     foreach ($step in $workflowDef.steps) {
         if (-not $scanProfiles.ContainsKey($step.profile)) {
-            Write-Host "[ERROR] Workflow '$Workflow' references unknown profile: $($step.profile)" -ForegroundColor Red
-            exit 1
+            Write-Host "[ERROR] Workflow '$Workflow' references unknown profile: $($step.profile)" -ForegroundColor DarkRed
+            return
         }
     }
 
     Write-Host "[INFO] Using workflow: $($workflowDef.name) ($($workflowDef.steps.Count) steps)" -ForegroundColor Green
 } else {
     if (-not $scanProfiles.ContainsKey($ScanType)) {
-        Write-Host "[ERROR] Invalid scan type: $ScanType" -ForegroundColor Red
+        Write-Host "[ERROR] Invalid scan type: $ScanType" -ForegroundColor DarkRed
         Write-Host "`nAvailable scan profiles:" -ForegroundColor Yellow
         foreach ($profile in $scanProfiles.GetEnumerator() | Sort-Object Key) {
             Write-Host "  - $($profile.Key): $($profile.Value.name)" -ForegroundColor Cyan
             Write-Host "    $($profile.Value.description)" -ForegroundColor Gray
         }
         Write-Host "`nYou can customize scan profiles by editing: $configFile`n" -ForegroundColor Yellow
-        exit 1
+        return
     }
 
     Write-Host "[INFO] Using scan profile: $($scanProfiles[$ScanType].name)" -ForegroundColor Green
@@ -2492,14 +2623,14 @@ if ($Workflow -and $Workflow -ne "") {
 # Skip this validation if resuming a session
 if (-not $resumingSession) {
 if ((-not $HostFile -or $HostFile -eq "") -and ($Hosts.Count -eq 0)) {
-    Write-Host "[ERROR] Either -HostFile or -Hosts parameter must be provided." -ForegroundColor Red
-    exit 1
+    Write-Host "[ERROR] Either -HostFile or -Hosts parameter must be provided." -ForegroundColor DarkRed
+    return
 }
 
 # Validate host file if provided
 if ($HostFile -and $HostFile -ne "" -and -not (Test-Path $HostFile)) {
-    Write-Host "[ERROR] Host file not found: $HostFile" -ForegroundColor Red
-    exit 1
+    Write-Host "[ERROR] Host file not found: $HostFile" -ForegroundColor DarkRed
+    return
 }
 } # End of if (-not $resumingSession) for host validation
 
@@ -2516,8 +2647,8 @@ if ($isWorkflowMode) {
     try {
         New-Item -Path $workflowsFolder -ItemType Directory -Force -ErrorAction Stop | Out-Null
     } catch {
-        Write-Host "[ERROR] Failed to create workflow directories: $_" -ForegroundColor Red
-        exit 1
+        Write-Host "[ERROR] Failed to create workflow directories: $_" -ForegroundColor DarkRed
+        return
     }
     # Step folders will be created dynamically during workflow execution
 } else {
@@ -2530,8 +2661,8 @@ if ($isWorkflowMode) {
         New-Item -Path $hostsFolder -ItemType Directory -Force -ErrorAction Stop | Out-Null
         New-Item -Path $logsFolder -ItemType Directory -Force -ErrorAction Stop | Out-Null
     } catch {
-        Write-Host "[ERROR] Failed to create output directories: $_" -ForegroundColor Red
-        exit 1
+        Write-Host "[ERROR] Failed to create output directories: $_" -ForegroundColor DarkRed
+        return
     }
 }
 
@@ -2632,7 +2763,7 @@ if ($Hosts.Count -gt 0) {
 
     if ($targetHosts.Count -eq 0) {
         Write-Log -Message "No valid hosts found in target file" -Level "ERROR" -LogFile $logFile -ErrorLogFile $errorLogFile
-        exit 1
+        return
     }
 
     # Warn if large CIDR expansion
@@ -2671,7 +2802,7 @@ if ($Hosts.Count -gt 0) {
         Write-Log -Message "Loaded $($targetHosts.Count) hosts from session state" -Level "INFO" -LogFile $logFile
     } else {
         Write-Log -Message "No hosts found in session state" -Level "ERROR" -LogFile $logFile -ErrorLogFile $errorLogFile
-        exit 1
+        return
     }
 }
 
@@ -2880,7 +3011,7 @@ if ($excludedHosts.Count -gt 0) {
 
 if ($validHosts.Count -eq 0) {
     Write-Log -Message "No hosts remaining after exclusions" -Level "ERROR" -LogFile $logFile -ErrorLogFile $errorLogFile
-    exit 1
+    return
 }
 
 # Separate hosts into normal and sensitive groups
@@ -3078,7 +3209,7 @@ if ($existingState -and -not $Force) {
 
         if ($action -eq "Cancel") {
             Write-Host "`nScan cancelled by user." -ForegroundColor Yellow
-            exit 0
+            return
         }
     }
 
@@ -3262,7 +3393,7 @@ if ($existingState -and -not $Force) {
 
 if ($hostsToScan.Count -eq 0) {
     Write-Log -Message "No hosts to scan. All hosts already processed." -Level "SUCCESS" -LogFile $logFile
-    exit 0
+    return
 }
 
 # Ask once for overwrite mode if set to "Ask" and there are existing results
@@ -4112,18 +4243,7 @@ $durationFormatted = if ($totalDuration.TotalHours -ge 1) {
     "{0}m {1:D2}s" -f $totalDuration.Minutes, $totalDuration.Seconds
 }
 
-Write-Host ""
-Write-Host " ░▒▓███████▓▒░░▒▓██████▓▒░ ░▒▓██████▓▒░░▒▓███████▓▒░░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░" -ForegroundColor Red
-Write-Host "░▒▓█▓▒░      ░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░" -ForegroundColor Red
-Write-Host "░▒▓█▓▒░      ░▒▓█▓▒░      ░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░" -ForegroundColor Red
-Write-Host " ░▒▓██████▓▒░░▒▓█▓▒░      ░▒▓████████▓▒░▒▓█▓▒░░▒▓█▓▒░░▒▓██████▓▒░ ░▒▓██████▓▒░ " -ForegroundColor Red
-Write-Host "       ░▒▓█▓▒░▒▓█▓▒░      ░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░  ░▒▓█▓▒░   ░▒▓█▓▒░░▒▓█▓▒░" -ForegroundColor Red
-Write-Host "       ░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░  ░▒▓█▓▒░   ░▒▓█▓▒░░▒▓█▓▒░" -ForegroundColor Red
-Write-Host "░▒▓███████▓▒░ ░▒▓██████▓▒░░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░  ░▒▓█▓▒░   ░▒▓█▓▒░░▒▓█▓▒░" -ForegroundColor Red
-Write-Host ""
-Write-Host "                        https://github.com/xtormin/Scanyx" -ForegroundColor Red
-Write-Host "                           @xtormin (Jennifer Torres)" -ForegroundColor Red
-Write-Host ""
+Show-ScanyxBanner
 Write-Host "╭─────────────────────────────────────────────────╮" -ForegroundColor Cyan
 Write-Host "│ SCAN SUMMARY                                    │" -ForegroundColor Cyan
 Write-Host "╰─────────────────────────────────────────────────╯" -ForegroundColor Cyan
@@ -4145,6 +4265,14 @@ Write-Host "${avgTimePerHost}s/host" -NoNewline -ForegroundColor Gray
 Write-Host " | throughput: " -NoNewline -ForegroundColor DarkGray
 Write-Host "$throughput hosts/min" -NoNewline -ForegroundColor Gray
 Write-Host ")" -ForegroundColor DarkGray
+
+# Output directory info
+Write-Host "📁 Output   : " -NoNewline -ForegroundColor Cyan
+if ($isWorkflowMode) {
+    Write-Host "$OutputDir\$Workflow\" -ForegroundColor White
+} else {
+    Write-Host "$OutputDir\" -ForegroundColor White
+}
 
 Write-Host ""
 
@@ -4228,7 +4356,7 @@ Write-Host "$($excludedHosts.Count)" -NoNewline -ForegroundColor Gray
 Write-Host " | Conflicts: " -NoNewline -ForegroundColor DarkGray
 Write-Host "$conflictCount" -ForegroundColor Gray
 
-Write-Host "─────────────────────────────────────────────────`n" -ForegroundColor Cyan
+Write-Host ""
 
 Write-Log -Message "Scan session completed | Total: $($validHosts.Count) | Normal: $($normalSuccess + $normalFailed) (success: $normalSuccess, failed: $normalFailed) | Sensitive: $($sensitiveSuccess + $sensitiveFailed) (success: $sensitiveSuccess, failed: $sensitiveFailed) | Excluded: $($excludedHosts.Count) | Duration: $durationFormatted" -Level "SUCCESS" -LogFile $logFile
 
@@ -4240,6 +4368,22 @@ if ($failedCount -gt 0) {
         Write-Host "  .\scanyx.ps1 -HostFile $HostFile -ScanType $ScanType -RetryFailed`n" -ForegroundColor Yellow
     }
 }
+
+# Next steps suggestion with XNP
+Write-Host "🚀 Next Steps" -ForegroundColor Cyan
+Write-Host "   To analyze and merge scan results, use XtremeNmapParser (XNP):" -ForegroundColor White
+Write-Host ""
+if ($isWorkflowMode) {
+    Write-Host "   python3 xnp.py -d `"$OutputDir\$Workflow`" -M -R --open -C all" -ForegroundColor Yellow
+} else {
+    Write-Host "   python3 xnp.py -d `"$OutputDir`" -M -R --open -C all" -ForegroundColor Yellow
+}
+Write-Host ""
+Write-Host "   📖 XNP Repository: " -NoNewline -ForegroundColor DarkGray
+Write-Host "https://github.com/xtormin/XtremeNmapParser" -ForegroundColor Cyan
+
+Write-Host ""
+Write-Host "─────────────────────────────────────────────────`n" -ForegroundColor Cyan
 
     # End of workflow step
     if ($isWorkflowMode) {
@@ -4270,7 +4414,10 @@ if ($isWorkflowMode) {
 # Create alias for shorter invocation
 Set-Alias -Name scanyx -Value Invoke-Scanyx
 
-# Auto-execute if script is run directly (not dot-sourced)
-if ($MyInvocation.InvocationName -ne '.') {
-    Invoke-Scanyx @PSBoundParameters
-}
+# When loaded via iex or Import-Module, the function is now available
+# Users should call: Invoke-Scanyx -HostFile hosts.txt -ScanType tcp-1000
+# Or use the alias: scanyx -HostFile hosts.txt -ScanType tcp-1000
+
+# Note: Auto-execution has been disabled to support loading the script in memory.
+# If you want to run the script directly from a file, use:
+#   powershell -ExecutionPolicy Bypass -File scanyx.ps1 -HostFile hosts.txt -ScanType tcp-1000
