@@ -247,7 +247,7 @@ scanyx -Hosts "10.0.0.0/24" -ScanType tcp-full -ConfigFile "https://raw.githubus
 
 Para documentación exhaustiva, todos los parámetros, casos de uso avanzados, troubleshooting y cheatsheet completo:
 
-## ➡️ **[Ver WIKI.md](WIKI.md)**
+## ➡️ **[Ver WIKI](https://github.com/xtormin/Scanyx/wiki)**
 
 **Incluye:**
 - Tabla completa de parámetros (30+ parámetros)
