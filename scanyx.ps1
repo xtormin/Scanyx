@@ -1199,7 +1199,7 @@ function Load-ScanConfiguration {
                     $localPath = Read-Host "Enter path to local configuration file"
 
                     if ([string]::IsNullOrWhiteSpace($localPath)) {
-                        Write-Host "[ERROR] No path specified. Using default configuration" -ForegroundColor Yellow
+                        Write-Host "[ERROR] No path specified. Using default configuration" -ForegroundColor DarkRed
                         return $defaultConfig
                     }
 
