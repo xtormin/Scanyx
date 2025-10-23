@@ -766,15 +766,19 @@ function Show-ProgressBar {
         }
     }
 
-    # Helper function to format time with days if applicable
+    # Helper function to format time in HH:MM format (with days if >= 1 day)
     function Format-TimeSpan {
         param([TimeSpan]$TimeSpan)
 
         if ($TimeSpan.TotalDays -ge 1) {
             $days = [math]::Floor($TimeSpan.TotalDays)
-            return "${days}d $($TimeSpan.Hours.ToString('00')):$($TimeSpan.Minutes.ToString('00')):$($TimeSpan.Seconds.ToString('00'))"
+            $hours = $TimeSpan.Hours
+            $minutes = $TimeSpan.Minutes
+            return "${days}d $($hours.ToString('00')):$($minutes.ToString('00'))"
         } else {
-            return "$($TimeSpan.Hours.ToString('00')):$($TimeSpan.Minutes.ToString('00')):$($TimeSpan.Seconds.ToString('00'))"
+            $hours = [math]::Floor($TimeSpan.TotalHours)
+            $minutes = $TimeSpan.Minutes
+            return "$($hours.ToString('00')):$($minutes.ToString('00'))"
         }
     }
 
@@ -3178,6 +3182,10 @@ if ($isWorkflowMode) {
 
 # Workflow execution loop
 $workflowStepNumber = 1
+
+# Initialize timing tracking for entire scan session
+$scanStartTime = Get-Date
+
 foreach ($workflowStep in $workflowSteps) {
     $currentProfile = $workflowStep.profile
     $stepCondition = if ($workflowStep.condition) { $workflowStep.condition } else { $WorkflowCondition }
@@ -3628,8 +3636,7 @@ $completedCount = $state.completed
 $failedCount = $state.failed
 $jobQueue = @{}
 
-# Timing tracking
-$scanStartTime = Get-Date
+# Timing tracking for individual scans
 $scanDurations = @()  # Array to store completed scan durations in seconds
 $jobStartTimes = @{}  # Hashtable to track when each job started
 
@@ -3637,8 +3644,19 @@ Write-Host ""
 
 foreach ($currentHost in $hostsToScan) {
     # Wait if max concurrent jobs reached
+    $progressUpdateCounter = 0
     while ($jobQueue.Count -ge $MaxConcurrent) {
         Start-Sleep -Milliseconds 500
+        $progressUpdateCounter++
+
+        # Update progress bar every ~60 seconds (120 iterations * 500ms)
+        if ($progressUpdateCounter % 120 -eq 0) {
+            if ($isWorkflowMode) {
+                Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost "" -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -AliveHosts $aliveHostsCount -HostStateInfo $state.hosts -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations
+            } else {
+                Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost "" -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -HostStateInfo $state.hosts
+            }
+        }
 
         # Check completed jobs
         $completedJobs = $jobQueue.GetEnumerator() | Where-Object { $_.Value.Job.State -ne "Running" }
@@ -3857,8 +3875,19 @@ foreach ($currentHost in $hostsToScan) {
 }
 
 # Wait for remaining jobs to complete
+$progressUpdateCounter = 0
 while ($jobQueue.Count -gt 0) {
     Start-Sleep -Milliseconds 500
+    $progressUpdateCounter++
+
+    # Update progress bar every ~60 seconds (120 iterations * 500ms)
+    if ($progressUpdateCounter % 120 -eq 0) {
+        if ($isWorkflowMode) {
+            Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost "" -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -AliveHosts $aliveHostsCount -HostStateInfo $state.hosts -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations
+        } else {
+            Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost "" -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -HostStateInfo $state.hosts
+        }
+    }
 
     $completedJobs = $jobQueue.GetEnumerator() | Where-Object { $_.Value.Job.State -ne "Running" }
     foreach ($job in $completedJobs) {
