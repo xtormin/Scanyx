@@ -6,6 +6,17 @@
 # Nmap scan results
 nmap/
 
+# Scan output directories. The default is nmap/, but -OutputDir takes any path
+# and these fill up with .nmap/.xml/.gnmap plus .sessions/ state and logs.
+# Underscore-prefixed ones are the throwaway directories used while testing.
+_*/
+scan-results.json
+scan-results.jsonl
+scan-state.json
+scan-state_*.json
+scan.log
+scan-errors.log
+
 # PowerShell temporary files
 *.tmp
 *.temp
