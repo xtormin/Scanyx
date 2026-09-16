@@ -24,6 +24,7 @@ MODE_CHECK=0
 MODE_INSTALL=ask     # ask | yes | never
 MODE_SUDO=auto       # auto | force | never
 MODE_REMOTE=0
+MODE_ASSUME_YES=0
 
 C_RED=''; C_YEL=''; C_GRN=''; C_CYA=''; C_DIM=''; C_OFF=''
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
@@ -39,30 +40,32 @@ dim()  { printf '%s%s%s\n'           "$C_DIM" "$*" "$C_OFF"; }
 
 usage() {
     cat <<'USAGE'
-Scanyx - lanzador para macOS y Linux
+Scanyx - launcher for macOS and Linux
 
-  ./scanyx.sh [opciones-del-lanzador] [parametros-de-Scanyx]
+  ./scanyx.sh [launcher-options] [Scanyx-parameters]
 
-Opciones del lanzador (doble guion):
-  --check           Solo diagnostico: SO, arquitectura, pwsh, nmap, uid. No escanea.
-  --install, --yes  Instala lo que falte sin preguntar.
-  --no-install      Nunca instala; imprime las ordenes manuales y sale con 2.
-  --sudo            Re-ejecuta bajo sudo.
-  --no-sudo         Nunca escala privilegios.
-  --remote [URL]    Carga scanyx.ps1 desde una URL en vez del fichero local.
-  --help            Esta ayuda.
+Launcher options (double dash):
+  --check           Environment check only: OS, arch, pwsh, nmap, uid. No scan.
+  --install         Install whatever is missing without asking.
+  --yes             Yes to everything: install without asking and skip the
+                    pre-flight scan confirmation.
+  --no-install      Never install; print the manual commands and exit 2.
+  --sudo            Re-run under sudo.
+  --no-sudo         Never escalate privileges.
+  --remote [URL]    Load scanyx.ps1 from a URL instead of the local file.
+  --help            This help.
 
-Todo lo demas se reenvia tal cual a Invoke-Scanyx. Ejemplos:
+Everything else is forwarded verbatim to Invoke-Scanyx. Examples:
 
   ./scanyx.sh --check
   ./scanyx.sh -Hosts 127.0.0.1 -ScanType tcp-100
   sudo ./scanyx.sh -HostFile hosts.txt -Workflow full-discovery
   ./scanyx.sh -Wizard
 
-Los perfiles de serie usan -sS / -sU / -A, que en Unix requieren root.
-Sin root, Scanyx te ofrece degradar el escaneo o abortar.
+The stock profiles use -sS / -sU / -A, which require root on Unix.
+Without root, Scanyx offers to downgrade the scan or abort.
 
-Parametros completos:  pwsh -c '. ./scanyx.ps1; Get-Help Invoke-Scanyx -Full'
+Full parameter list:  pwsh -c '. ./scanyx.ps1; Get-Help Invoke-Scanyx -Full'
 USAGE
 }
 
@@ -71,7 +74,8 @@ FORWARD=()
 while [ $# -gt 0 ]; do
     case "$1" in
         --check)      MODE_CHECK=1 ;;
-        --install|--yes) MODE_INSTALL=yes ;;
+        --install)    MODE_INSTALL=yes ;;
+        --yes)        MODE_INSTALL=yes; MODE_ASSUME_YES=1 ;;
         --no-install) MODE_INSTALL=never ;;
         --sudo)       MODE_SUDO=force ;;
         --no-sudo)    MODE_SUDO=never ;;
@@ -121,7 +125,7 @@ confirm() {
     [ "$MODE_INSTALL" = "yes" ] && return 0
     [ "$MODE_INSTALL" = "never" ] && return 1
     [ -t 0 ] || return 1
-    printf '%s[?]%s %s [s/N]: ' "$C_CYA" "$C_OFF" "$1"
+    printf '%s[?]%s %s [y/N]: ' "$C_CYA" "$C_OFF" "$1"
     read -r reply
     case "$reply" in [sSyY]*) return 0 ;; *) return 1 ;; esac
 }
@@ -142,15 +146,15 @@ pwsh_version_ok() {
 install_pwsh_tarball() {
     local rid="$1" dest="/opt/microsoft/powershell/7"
     if [ -z "$rid" ]; then
-        err "Arquitectura no soportada para el tarball de PowerShell: $ARCH"
+        err "Unsupported architecture for the PowerShell tarball: $ARCH"
         return 1
     fi
     local url="https://github.com/PowerShell/PowerShell/releases/download/v${PWSH_TARBALL_VERSION}/powershell-${PWSH_TARBALL_VERSION}-${rid}.tar.gz"
-    info "Descargando PowerShell ${PWSH_TARBALL_VERSION} (${rid})"
+    info "Downloading PowerShell ${PWSH_TARBALL_VERSION} (${rid})"
     dim "  $url"
     local tmp; tmp="$(mktemp -d)" || return 1
     if ! curl -fsSL "$url" -o "$tmp/pwsh.tar.gz"; then
-        err "No se pudo descargar el tarball de PowerShell."
+        err "Could not download the PowerShell tarball."
         rm -rf "$tmp"; return 1
     fi
     sudo mkdir -p "$dest" \
@@ -166,15 +170,15 @@ install_pwsh_tarball_macos() {
     # User-local install: no sudo, no .pkg, nothing outside $HOME.
     local rid="$1" dest="$HOME/.local/share/powershell/7"
     if [ -z "$rid" ]; then
-        err "Arquitectura no soportada para el tarball de PowerShell: $ARCH"
+        err "Unsupported architecture for the PowerShell tarball: $ARCH"
         return 1
     fi
     local url="https://github.com/PowerShell/PowerShell/releases/download/v${PWSH_TARBALL_VERSION}/powershell-${PWSH_TARBALL_VERSION}-${rid}.tar.gz"
-    info "Descargando PowerShell ${PWSH_TARBALL_VERSION} (${rid})"
+    info "Downloading PowerShell ${PWSH_TARBALL_VERSION} (${rid})"
     dim "  $url"
     local tmp; tmp="$(mktemp -d)" || return 1
     if ! curl -fsSL "$url" -o "$tmp/pwsh.tar.gz"; then
-        err "No se pudo descargar el tarball de PowerShell."
+        err "Could not download the PowerShell tarball."
         rm -rf "$tmp"; return 1
     fi
     mkdir -p "$dest" && tar zxf "$tmp/pwsh.tar.gz" -C "$dest" && chmod +x "$dest/pwsh"
@@ -186,8 +190,8 @@ install_pwsh_tarball_macos() {
     if ! have pwsh; then
         PATH="$HOME/.local/bin:$PATH"
         export PATH
-        warn "pwsh instalado en $HOME/.local/bin, que no esta en tu PATH."
-        dim "  Anade esto a tu ~/.zshrc:  export PATH=\"\$HOME/.local/bin:\$PATH\""
+        warn "pwsh installed in $HOME/.local/bin, which is not on your PATH."
+        dim "  Add this to your ~/.zshrc:  export PATH=\"\$HOME/.local/bin:\$PATH\""
     fi
     return 0
 }
@@ -198,19 +202,19 @@ install_pwsh() {
             # PowerShell moved from a cask to a core formula. Probe instead of
             # assuming: the formula needs no password, the old cask does.
             if brew info --formula powershell >/dev/null 2>&1; then
-                info "Instalando PowerShell con Homebrew (formula)"
+                info "Installing PowerShell with Homebrew (formula)"
                 brew install powershell && return 0
             elif brew info --cask powershell >/dev/null 2>&1; then
-                info "Instalando PowerShell con Homebrew (cask; te pedira la contrasena para el .pkg)"
+                info "Installing PowerShell with Homebrew (cask; it will ask for your password for the .pkg)"
                 brew install --cask powershell && return 0
             else
-                warn "Homebrew no conoce ningun paquete llamado powershell."
+                warn "Homebrew knows no package named powershell."
             fi
-            warn "La instalacion con Homebrew fallo; probando el tarball oficial"
+            warn "Homebrew install failed; trying the official tarball"
         else
-            warn "Homebrew no esta instalado."
-            dim "  Instalalo desde https://brew.sh y vuelve a ejecutar --install,"
-            dim "  o deja que Scanyx use el tarball oficial de Microsoft."
+            warn "Homebrew is not installed."
+            dim "  Install it from https://brew.sh and run --install again,"
+            dim "  or let Scanyx use the official Microsoft tarball."
         fi
         install_pwsh_tarball_macos "$PWSH_RID_OSX"
         return $?
@@ -220,11 +224,11 @@ install_pwsh() {
         # Rather than parsing apt-cache output (locale-dependent), just try it.
         # On Kali arm64 the powershell package usually does not exist, and the
         # official tarball is the only route.
-        info "Buscando PowerShell en apt"
+        info "Looking for PowerShell in apt"
         if sudo apt-get update >/dev/null 2>&1 && sudo apt-get install -y powershell 2>/dev/null; then
             return 0
         fi
-        info "PowerShell no esta disponible en apt para $ARCH; usando el tarball oficial"
+        info "PowerShell is not available in apt for $ARCH; using the official tarball"
     fi
     install_pwsh_tarball "$PWSH_RID_LINUX"
 }
@@ -232,48 +236,48 @@ install_pwsh() {
 install_nmap() {
     if [ "$OS" = "Darwin" ]; then
         if have brew; then
-            info "Instalando nmap con Homebrew"
+            info "Installing nmap with Homebrew"
             brew install nmap
             return $?
         fi
-        err "Homebrew no esta instalado."
-        dim "  Instala Homebrew (https://brew.sh) y luego: brew install nmap"
+        err "Homebrew is not installed."
+        dim "  Install Homebrew (https://brew.sh) then run: brew install nmap"
         return 1
     fi
-    info "Instalando nmap con apt"
+    info "Installing nmap with apt"
     sudo apt-get update && sudo apt-get install -y nmap
 }
 
 # ── Diagnostics ───────────────────────────────────────────────────────────────
 print_check() {
-    printf '\n%sScanyx - diagnostico del entorno%s\n\n' "$C_CYA" "$C_OFF"
-    printf '  SO            : %s %s\n' "$OS" "$ARCH"
-    [ -n "$DISTRO_ID" ] && printf '  Distribucion  : %s\n' "$DISTRO_ID"
-    printf '  Usuario       : uid=%s%s\n' "$(id -u)" "$([ "$(id -u)" -eq 0 ] && echo ' (root)')"
+    printf '\n%sScanyx - environment check%s\n\n' "$C_CYA" "$C_OFF"
+    printf '  OS            : %s %s\n' "$OS" "$ARCH"
+    [ -n "$DISTRO_ID" ] && printf '  Distribution  : %s\n' "$DISTRO_ID"
+    printf '  User          : uid=%s%s\n' "$(id -u)" "$([ "$(id -u)" -eq 0 ] && echo ' (root)')"
 
     if have pwsh; then
         local v; v="$(pwsh -NoProfile -NoLogo -Command '$PSVersionTable.PSVersion.ToString()' 2>/dev/null)"
         if pwsh_version_ok; then
             printf '  PowerShell    : %s%s%s (%s)\n' "$C_GRN" "$v" "$C_OFF" "$(command -v pwsh)"
         else
-            printf '  PowerShell    : %s%s - se requiere >= %s.%s%s\n' "$C_YEL" "$v" "$PWSH_MIN_MAJOR" "$PWSH_MIN_MINOR" "$C_OFF"
+            printf '  PowerShell    : %s%s - requires >= %s.%s%s\n' "$C_YEL" "$v" "$PWSH_MIN_MAJOR" "$PWSH_MIN_MINOR" "$C_OFF"
         fi
     else
-        printf '  PowerShell    : %sno encontrado%s\n' "$C_RED" "$C_OFF"
+        printf '  PowerShell    : %snot found%s\n' "$C_RED" "$C_OFF"
     fi
 
     if have nmap; then
         printf '  nmap          : %s%s%s (%s)\n' "$C_GRN" "$(nmap --version 2>/dev/null | head -1 | sed -n 's/.*version \([^ ]*\).*/\1/p')" "$C_OFF" "$(command -v nmap)"
     else
-        printf '  nmap          : %sno encontrado%s\n' "$C_RED" "$C_OFF"
+        printf '  nmap          : %snot found%s\n' "$C_RED" "$C_OFF"
     fi
 
     if [ "$MODE_REMOTE" -eq 1 ]; then
-        printf '  scanyx.ps1    : remoto - %s\n' "$REMOTE_URL"
+        printf '  scanyx.ps1    : remote - %s\n' "$REMOTE_URL"
     elif [ -r "$PS1_PATH" ]; then
         printf '  scanyx.ps1    : %s%s%s\n' "$C_GRN" "$PS1_PATH" "$C_OFF"
     else
-        printf '  scanyx.ps1    : %sno encontrado en %s%s\n' "$C_RED" "$PS1_PATH" "$C_OFF"
+        printf '  scanyx.ps1    : %snot found at %s%s\n' "$C_RED" "$PS1_PATH" "$C_OFF"
     fi
     printf '\n'
 }
@@ -284,11 +288,11 @@ ensure_deps() {
 
     if ! pwsh_version_ok; then
         if have pwsh; then
-            warn "PowerShell instalado pero por debajo de ${PWSH_MIN_MAJOR}.${PWSH_MIN_MINOR} (Start-Job es inestable en 6.x)."
+            warn "PowerShell is installed but older than ${PWSH_MIN_MAJOR}.${PWSH_MIN_MINOR} (Start-Job is unreliable on 6.x)."
         else
-            warn "PowerShell (pwsh) no esta instalado."
+            warn "PowerShell (pwsh) is not installed."
         fi
-        if confirm "Instalar PowerShell ahora?"; then
+        if confirm "Install PowerShell now?"; then
             install_pwsh || missing=1
             pwsh_version_ok || missing=1
         else
@@ -296,14 +300,14 @@ ensure_deps() {
             if [ "$OS" = "Darwin" ]; then
                 dim "  Manual: brew install powershell"
             else
-                dim "  Manual: sudo apt-get install -y powershell   (o usa --install para el tarball)"
+                dim "  Manual: sudo apt-get install -y powershell   (or use --install for the tarball)"
             fi
         fi
     fi
 
     if ! have nmap; then
-        warn "nmap no esta instalado."
-        if confirm "Instalar nmap ahora?"; then
+        warn "nmap is not installed."
+        if confirm "Install nmap now?"; then
             install_nmap || missing=1
             have nmap || missing=1
         else
@@ -323,28 +327,28 @@ ensure_deps() {
 if [ "$MODE_CHECK" -eq 1 ]; then
     print_check
     if pwsh_version_ok && have nmap; then
-        ok "Todo listo."
+        ok "Everything is ready."
         exit 0
     fi
-    err "Faltan dependencias. Ejecuta: ./scanyx.sh --install"
+    err "Missing dependencies. Run: ./scanyx.sh --install"
     exit 2
 fi
 
 if [ "$MODE_REMOTE" -eq 0 ] && [ ! -r "$PS1_PATH" ]; then
-    err "No encuentro scanyx.ps1 en $PS1_PATH"
-    dim "  Usa --remote para cargarlo desde GitHub."
+    err "Cannot find scanyx.ps1 at $PS1_PATH"
+    dim "  Use --remote to load it from GitHub."
     exit 2
 fi
 
 if ! ensure_deps; then
-    err "No se puede continuar sin las dependencias."
+    err "Cannot continue without the dependencies."
     exit 2
 fi
 
 # "--install" with nothing else to do is a request to install, not to scan.
-if [ "$MODE_INSTALL" = "yes" ] && [ "${#FORWARD[@]}" -eq 0 ]; then
+if [ "$MODE_INSTALL" = "yes" ] && [ "$MODE_ASSUME_YES" -eq 0 ] && [ "${#FORWARD[@]}" -eq 0 ]; then
     print_check
-    ok "Todo listo. Lanza un escaneo, por ejemplo:"
+    ok "Everything is ready. Run a scan, for example:"
     dim "  ./scanyx.sh -Hosts 127.0.0.1 -ScanType tcp-100"
     exit 0
 fi
@@ -353,7 +357,7 @@ fi
 # knows which profile is in play and prints the exact sudo command to use,
 # so prompting here too would ask the same question twice.
 if [ "$MODE_SUDO" = "force" ] && [ "$(id -u)" -ne 0 ]; then
-    info "Escalando privilegios con sudo"
+    info "Escalating privileges with sudo"
     if [ "$MODE_REMOTE" -eq 1 ]; then
         exec sudo -E "$0" --no-sudo --remote "$REMOTE_URL" ${FORWARD[@]+"${FORWARD[@]}"}
     fi
@@ -363,6 +367,10 @@ fi
 # Build a PowerShell array literal from the forwarded arguments.
 # Single-quoted PowerShell strings escape an embedded quote by doubling it,
 # so nothing in an argument can break out into code.
+if [ "$MODE_ASSUME_YES" -eq 1 ]; then
+    FORWARD+=("-Yes")
+fi
+
 ps_args=""
 if [ "${#FORWARD[@]}" -gt 0 ]; then
     for a in "${FORWARD[@]}"; do
@@ -402,14 +410,14 @@ while ($i -lt $raw.Count) {
             if ($cands.Count -eq 1) {
                 $name = $cands[0]
             } elseif ($cands.Count -gt 1) {
-                Write-Host "[ERROR] Parametro ambiguo: $tok" -ForegroundColor Red
-                Write-Host "        Coincide con: $($cands -join ", ")" -ForegroundColor Yellow
+                Write-Host "[ERROR] Ambiguous parameter: $tok" -ForegroundColor Red
+                Write-Host "        Matches: $($cands -join ", ")" -ForegroundColor Yellow
                 exit 64
             }
         }
         if (-not $name) {
-            Write-Host "[ERROR] Parametro desconocido: $tok" -ForegroundColor Red
-            Write-Host "        Parametros disponibles: Get-Help Invoke-Scanyx -Full" -ForegroundColor Yellow
+            Write-Host "[ERROR] Unknown parameter: $tok" -ForegroundColor Red
+            Write-Host "        Available parameters: Get-Help Invoke-Scanyx -Full" -ForegroundColor Yellow
             exit 64
         }
 
@@ -427,7 +435,7 @@ while ($i -lt $raw.Count) {
             $value = $raw[$i + 1]
             $i += 2
         } else {
-            Write-Host "[ERROR] Falta el valor del parametro $tok" -ForegroundColor Red
+            Write-Host "[ERROR] Missing value for parameter $tok" -ForegroundColor Red
             exit 64
         }
 
@@ -458,7 +466,7 @@ if [ -n "${SUDO_UID:-}" ] && [ "$(id -u)" -eq 0 ]; then
     case "$out_dir" in /*) : ;; *) out_dir="$PWD/$out_dir" ;; esac
     if [ -d "$out_dir" ]; then
         chown -R "${SUDO_UID}:${SUDO_GID:-$SUDO_UID}" "$out_dir" 2>/dev/null \
-            && dim "[INFO] Propiedad de $out_dir devuelta a uid ${SUDO_UID}"
+            && dim "[INFO] Ownership of $out_dir returned to uid ${SUDO_UID}"
     fi
 fi
 

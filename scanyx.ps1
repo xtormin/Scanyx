@@ -243,6 +243,102 @@ function ConvertTo-ScanyxDateTime {
     return $null
 }
 
+function Format-Duration {
+    # Adaptive: a scan shorter than a minute must not read as "00:00", and a
+    # scan longer than a day must not wrap around. One formatter for the
+    # progress bar and the final summary so they never disagree.
+    param([TimeSpan]$TimeSpan)
+
+    if ($TimeSpan.TotalSeconds -lt 0) { return "0s" }
+
+    if ($TimeSpan.TotalDays -ge 1) {
+        return "{0}d {1:D2}h" -f [math]::Floor($TimeSpan.TotalDays), $TimeSpan.Hours
+    }
+    if ($TimeSpan.TotalHours -ge 1) {
+        return "{0}h {1:D2}m" -f [math]::Floor($TimeSpan.TotalHours), $TimeSpan.Minutes
+    }
+    if ($TimeSpan.TotalMinutes -ge 1) {
+        return "{0}m {1:D2}s" -f [math]::Floor($TimeSpan.TotalMinutes), $TimeSpan.Seconds
+    }
+    return "{0}s" -f [math]::Floor($TimeSpan.TotalSeconds)
+}
+
+function Get-SensitiveScanCommand {
+    # The command actually used for a host marked sensitive. Shared by the
+    # pre-flight preview and the scan loop so the preview can never drift from
+    # what really runs.
+    param(
+        [string]$BaseCommand,
+        [string]$Timing = "T2",
+        [string]$Scripts = "default"
+    )
+
+    $cmd = $BaseCommand -replace '-T\d+', "-$Timing"
+    if ($Scripts -eq "none") {
+        $cmd = $cmd -replace '--script=[^\s]+', ''
+        $cmd = $cmd -replace '\s+', ' '
+    }
+    return $cmd.Trim()
+}
+
+function Get-TargetBreakdown {
+    # How many hosts each source network contributed, plus the individually
+    # listed ones. A wrong mask is the expensive mistake, so the pre-flight
+    # shows the expansion rather than just a grand total.
+    param(
+        [array]$ValidHosts,
+        [hashtable]$TargetHostsData
+    )
+
+    $perCidr = @{}
+    $individual = @()
+
+    foreach ($h in $ValidHosts) {
+        $meta = $TargetHostsData[$h]
+        $cidrs = if ($meta -and $meta.CIDRs) { @($meta.CIDRs) } else { @() }
+        if ($cidrs.Count -gt 0) {
+            foreach ($c in $cidrs) {
+                if (-not $perCidr.ContainsKey($c)) { $perCidr[$c] = 0 }
+                $perCidr[$c]++
+            }
+        } else {
+            $individual += $h
+        }
+    }
+
+    return @{
+        Networks   = $perCidr
+        Individual = @($individual)
+    }
+}
+
+function Format-CommandForDisplay {
+    # Wrap a long nmap command so the pre-flight stays readable in an 80-col
+    # terminal instead of forcing a horizontal scroll.
+    param([string]$Command, [int]$Width = 74, [string]$Indent = "                ")
+
+    $words = $Command -split '\s+' | Where-Object { $_ }
+    $lines = @()
+    $current = ""
+    foreach ($w in $words) {
+        if ($current -eq "") {
+            $current = $w
+        } elseif (($current.Length + 1 + $w.Length) -le $Width) {
+            $current = "$current $w"
+        } else {
+            $lines += $current
+            $current = $w
+        }
+    }
+    if ($current -ne "") { $lines += $current }
+
+    $out = @()
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($i -eq 0) { $out += $lines[$i] } else { $out += "$Indent$($lines[$i])" }
+    }
+    return $out
+}
+
 function Get-InvocationHint {
     # How the user launches Scanyx on this platform, for copy-paste hints.
     # $IsLinux/$IsMacOS do not exist on Windows PowerShell 5.1 (they are $null there).
@@ -872,28 +968,12 @@ function Show-ProgressBar {
         }
     }
 
-    # Helper function to format time in HH:MM format (with days if >= 1 day)
-    function Format-TimeSpan {
-        param([TimeSpan]$TimeSpan)
-
-        if ($TimeSpan.TotalDays -ge 1) {
-            $days = [math]::Floor($TimeSpan.TotalDays)
-            $hours = $TimeSpan.Hours
-            $minutes = $TimeSpan.Minutes
-            return "${days}d $($hours.ToString('00')):$($minutes.ToString('00'))"
-        } else {
-            $hours = [math]::Floor($TimeSpan.TotalHours)
-            $minutes = $TimeSpan.Minutes
-            return "$($hours.ToString('00')):$($minutes.ToString('00'))"
-        }
-    }
-
     # Calculate elapsed time
     $elapsedStr = ""
     $etaStr = ""
     if ($ScanStartTime -ne [DateTime]::MinValue) {
         $elapsed = (Get-Date) - $ScanStartTime
-        $elapsedStr = Format-TimeSpan -TimeSpan $elapsed
+        $elapsedStr = Format-Duration -TimeSpan $elapsed
 
         # Calculate ETA (only after 10 completed scans)
         if ($CompletedDurations.Count -ge 10 -and $Total -gt $Completed) {
@@ -904,7 +984,7 @@ function Show-ProgressBar {
             $parallel = [math]::Max(1, [math]::Min($Concurrency, $remainingHosts))
             $estimatedSeconds = ($remainingHosts * $avgDuration) / $parallel
             $eta = [TimeSpan]::FromSeconds($estimatedSeconds)
-            $etaStr = " / ~$(Format-TimeSpan -TimeSpan $eta) ETA"
+            $etaStr = " / ~$(Format-Duration -TimeSpan $eta) ETA"
         }
     }
 
@@ -953,14 +1033,7 @@ function Show-ProgressBar {
 
         # Build secondary status - Ultra compact format
         $secondaryStatus = "$Completed/$Total ($percent%) | OK: $successful | Fail: $Failed"
-
-        if ($liveHosts -gt 0) {
-            $secondaryStatus += " | Live: $liveHosts"
-        }
-
-        if ($deadHosts -gt 0) {
-            $secondaryStatus += " | Dead: $deadHosts"
-        }
+        $secondaryStatus += " | Live: $liveHosts | Dead: $deadHosts"
 
         if ($elapsedStr -ne "") {
             $secondaryStatus += " | Time: $elapsedStr$etaStr"
@@ -981,14 +1054,7 @@ function Show-ProgressBar {
     } else {
         # Single scan mode: Show single progress bar - Ultra compact format
         $statusMessage = "$Completed/$Total ($percent%) | OK: $successful | Fail: $Failed"
-
-        if ($liveHosts -gt 0) {
-            $statusMessage += " | Live: $liveHosts"
-        }
-
-        if ($deadHosts -gt 0) {
-            $statusMessage += " | Dead: $deadHosts"
-        }
+        $statusMessage += " | Live: $liveHosts | Dead: $deadHosts"
 
         if ($elapsedStr -ne "") {
             $statusMessage += " | Time: $elapsedStr$etaStr"
@@ -1558,23 +1624,23 @@ function Get-SessionList {
 
     # Check if .sessions directory exists
     if (-not (Test-Path $sessionsDir)) {
-        Write-Host "`nNo se encontraron sesiones en: " -NoNewline -ForegroundColor Yellow
+        Write-Host "`nNo sessions found in: " -NoNewline -ForegroundColor Yellow
         Write-Host "$OutputDir" -ForegroundColor White
         Write-Host ""
-        Write-Host "El directorio " -NoNewline -ForegroundColor Gray
+        Write-Host "The " -NoNewline -ForegroundColor Gray
         Write-Host ".sessions/" -NoNewline -ForegroundColor Cyan
-        Write-Host " no existe en este directorio." -ForegroundColor Gray
+        Write-Host " directory does not exist here." -ForegroundColor Gray
         Write-Host ""
-        Write-Host "Sugerencias:" -ForegroundColor Cyan
-        Write-Host "  • Usa " -NoNewline -ForegroundColor Gray
-        Write-Host "-OutputDir <directorio>" -NoNewline -ForegroundColor Yellow
-        Write-Host " para buscar en un directorio diferente" -ForegroundColor Gray
-        Write-Host "  • Usa " -NoNewline -ForegroundColor Gray
-        Write-Host "-SessionName <nombre>" -NoNewline -ForegroundColor Yellow
-        Write-Host " para crear una nueva sesión con nombre" -ForegroundColor Gray
+        Write-Host "Suggestions:" -ForegroundColor Cyan
+        Write-Host "  • Use " -NoNewline -ForegroundColor Gray
+        Write-Host "-OutputDir <directory>" -NoNewline -ForegroundColor Yellow
+        Write-Host " to look in a different directory" -ForegroundColor Gray
+        Write-Host "  • Use " -NoNewline -ForegroundColor Gray
+        Write-Host "-SessionName <name>" -NoNewline -ForegroundColor Yellow
+        Write-Host " to create a new named session" -ForegroundColor Gray
         Write-Host ""
-        Write-Host "Ejemplo:" -ForegroundColor Cyan
-        Write-Host "  $(Get-InvocationHint) -ListSessions -OutputDir <tu-directorio>" -ForegroundColor White
+        Write-Host "Example:" -ForegroundColor Cyan
+        Write-Host "  $(Get-InvocationHint) -ListSessions -OutputDir <your-directory>" -ForegroundColor White
         Write-Host ""
         return @()
     }
@@ -1583,15 +1649,15 @@ function Get-SessionList {
     $sessionDirs = Get-ChildItem -Path $sessionsDir -Directory
 
     if ($sessionDirs.Count -eq 0) {
-        Write-Host "`nNo se encontraron sesiones en: " -NoNewline -ForegroundColor Yellow
+        Write-Host "`nNo sessions found in: " -NoNewline -ForegroundColor Yellow
         Write-Host "$OutputDir" -ForegroundColor White
         Write-Host ""
-        Write-Host "El directorio existe pero no contiene sesiones." -ForegroundColor Gray
+        Write-Host "The directory exists but contains no sessions." -ForegroundColor Gray
         Write-Host ""
-        Write-Host "Sugerencias:" -ForegroundColor Cyan
-        Write-Host "  • Usa " -NoNewline -ForegroundColor Gray
-        Write-Host "-SessionName <nombre>" -NoNewline -ForegroundColor Yellow
-        Write-Host " para crear una nueva sesión con nombre" -ForegroundColor Gray
+        Write-Host "Suggestions:" -ForegroundColor Cyan
+        Write-Host "  • Use " -NoNewline -ForegroundColor Gray
+        Write-Host "-SessionName <name>" -NoNewline -ForegroundColor Yellow
+        Write-Host " to create a new named session" -ForegroundColor Gray
         Write-Host ""
         return @()
     }
@@ -2084,11 +2150,11 @@ function Get-AdvancedOptions {
         ConfigFile = ""
     }
 
-    Write-Host "  ¿Usar modo no privilegiado (--unprivileged)? [s/N]: " -NoNewline -ForegroundColor Cyan
+    Write-Host "  Use unprivileged mode (--unprivileged)? [y/N]: " -NoNewline -ForegroundColor Cyan
     $unprivileged = Read-Host
-    $result.Unprivileged = ($unprivileged -match '^[Ss]')
+    $result.Unprivileged = ($unprivileged -match '^[YySs]')
 
-    Write-Host "  Archivo de configuración personalizado (opcional): " -NoNewline -ForegroundColor Cyan
+    Write-Host "  Custom configuration file (optional): " -NoNewline -ForegroundColor Cyan
     $configFile = Read-Host
     if ($configFile -ne "") {
         $result.ConfigFile = $configFile
@@ -2102,7 +2168,7 @@ function Show-WizardSummary {
 
     Write-Host ""
     Write-Host "╭─────────────────────────────────────────────────────────────────────────────╮" -ForegroundColor Cyan
-    Write-Host "│ RESUMEN DE CONFIGURACIÓN                                                    │" -ForegroundColor Cyan
+    Write-Host "│ CONFIGURATION SUMMARY                                                       │" -ForegroundColor Cyan
     Write-Host "╰─────────────────────────────────────────────────────────────────────────────╯" -ForegroundColor Cyan
     Write-Host ""
 
@@ -2125,7 +2191,7 @@ function Show-WizardSummary {
     }
 
     if ($Config.SessionName) {
-        Write-Host "  Nombre Sesión  : " -NoNewline -ForegroundColor White
+        Write-Host "  Session name   : " -NoNewline -ForegroundColor White
         Write-Host "$($Config.SessionName)" -ForegroundColor Magenta
     }
 
@@ -2287,10 +2353,10 @@ function Show-GeneratedCommand {
 }
 
 function Confirm-Execution {
-    Write-Host "  ¿Deseas ejecutar este escaneo ahora? [S/n]: " -NoNewline -ForegroundColor Cyan
+    Write-Host "  Run this scan now? [Y/n]: " -NoNewline -ForegroundColor Cyan
     $execute = Read-Host
 
-    return ($execute -eq "" -or $execute -match '^[Ss]')
+    return ($execute -eq "" -or $execute -match '^[YySs]')
 }
 
 function Start-ScanWizard {
@@ -2545,6 +2611,10 @@ Invoke-Scanyx -Hosts "192.168.1.0/24" -ScanType tcp-full -MaxConcurrent 10
         # Intended for non-interactive use (CI, cron). Cannot rescue -sU / -sO.
         [Parameter(Mandatory = $false)]
         [switch]$AutoUnprivileged,
+
+        # Skip the pre-flight confirmation and start scanning straight away
+        [Parameter(Mandatory = $false)]
+        [switch]$Yes,
 
         # Path to custom scan profiles configuration file
         [Parameter(Mandatory = $false)]
@@ -2832,10 +2902,10 @@ if ($IsLinux -or $IsMacOS) {
         $stepNum = 0
         foreach ($step in $scanWorkflows[$Workflow].steps) {
             $stepNum++
-            $profilesToCheck += @{ Label = "paso $stepNum ('$($step.profile)')"; Profile = $step.profile }
+            $profilesToCheck += @{ Label = "Step $stepNum ('$($step.profile)')"; Profile = $step.profile }
         }
     } elseif ($ScanType -and $ScanType -ne "" -and $scanProfiles.ContainsKey($ScanType)) {
-        $profilesToCheck += @{ Label = "perfil '$ScanType'"; Profile = $ScanType }
+        $profilesToCheck += @{ Label = "Profile '$ScanType'"; Profile = $ScanType }
     }
 
     if ($profilesToCheck.Count -gt 0 -and -not (Test-IsElevated)) {
@@ -2856,16 +2926,16 @@ if ($IsLinux -or $IsMacOS) {
         if ($blockingHits.Count -gt 0) {
             Write-Host ""
             foreach ($hit in $blockingHits) {
-                Write-Host "[ERROR] El $($hit.Label) requiere privilegios de root en macOS/Linux (flag: $($hit.Flags))." -ForegroundColor DarkRed
+                Write-Host "[ERROR] $($hit.Label) requires root privileges on macOS/Linux (flag: $($hit.Flags))." -ForegroundColor DarkRed
             }
-            Write-Host "        Ese flag no se puede degradar: nmap no escanea UDP ni protocolos IP sin raw sockets." -ForegroundColor Yellow
-            Write-Host "        Relanza con:  $relaunch`n" -ForegroundColor Yellow
+            Write-Host "        That flag cannot be downgraded: nmap cannot scan UDP or IP protocols without raw sockets." -ForegroundColor Yellow
+            Write-Host "        Re-run with:  $relaunch`n" -ForegroundColor Yellow
             return
         }
 
         if ($degradableHits.Count -gt 0) {
             Write-Host ""
-            Write-Host "[WARNING] No tienes privilegios de root y el escaneo los necesita:" -ForegroundColor Yellow
+            Write-Host "[WARNING] This scan needs root privileges and you do not have them:" -ForegroundColor Yellow
             foreach ($hit in $degradableHits) {
                 Write-Host "          - $($hit.Label): $($hit.Flags)" -ForegroundColor Yellow
             }
@@ -2873,26 +2943,26 @@ if ($IsLinux -or $IsMacOS) {
             $doDegrade = $false
             if ($Unprivileged -or $AutoUnprivileged) {
                 $doDegrade = $true
-                Write-Host "[INFO] Modo no privilegiado solicitado: se degradan los perfiles." -ForegroundColor Cyan
+                Write-Host "[INFO] Unprivileged mode requested: downgrading the profiles." -ForegroundColor Cyan
             } elseif ([Console]::IsInputRedirected) {
                 Write-Host ""
-                Write-Host "[ERROR] Sin terminal interactiva no se degrada en silencio: cambiaria los resultados." -ForegroundColor DarkRed
-                Write-Host "        Relanza con:       $relaunch" -ForegroundColor Yellow
-                Write-Host "        O acepta degradar: -AutoUnprivileged`n" -ForegroundColor Yellow
+                Write-Host "[ERROR] Refusing to downgrade silently without a terminal: it would change the results." -ForegroundColor DarkRed
+                Write-Host "        Re-run with:        $relaunch" -ForegroundColor Yellow
+                Write-Host "        Or accept the downgrade: -AutoUnprivileged`n" -ForegroundColor Yellow
                 return
             } else {
                 Write-Host ""
-                Write-Host "  [1] Degradar a escaneo no privilegiado (-sT, --unprivileged)" -ForegroundColor White
-                Write-Host "      Mas lento y mas ruidoso: deja conexiones completas en el log del objetivo," -ForegroundColor Gray
-                Write-Host "      y se pierden la deteccion de SO (-O) y el traceroute." -ForegroundColor Gray
-                Write-Host "  [2] Abortar y relanzar con sudo (recomendado)" -ForegroundColor White
+                Write-Host "  [1] Downgrade to an unprivileged scan (-sT, --unprivileged)" -ForegroundColor White
+                Write-Host "      Slower and noisier: it leaves full connections in the target log," -ForegroundColor Gray
+                Write-Host "      and you lose OS detection (-O) and traceroute." -ForegroundColor Gray
+                Write-Host "  [2] Abort and re-run with sudo (recommended)" -ForegroundColor White
                 Write-Host ""
-                Write-Host "  Opcion [2]: " -NoNewline -ForegroundColor Cyan
+                Write-Host "  Option [2]: " -NoNewline -ForegroundColor Cyan
                 $privChoice = Read-Host
                 if ($privChoice -eq "1") {
                     $doDegrade = $true
                 } else {
-                    Write-Host "`n[INFO] Abortado. Relanza con:  $relaunch`n" -ForegroundColor Yellow
+                    Write-Host "`n[INFO] Aborted. Re-run with:  $relaunch`n" -ForegroundColor Yellow
                     return
                 }
             }
@@ -3149,9 +3219,12 @@ if ($excludedHosts.Count -gt 0) {
     Write-Log -Message "Unique exclusion hosts: $($excludedHosts.Count)" -Level "INFO" -LogFile $logFile
 }
 
-# Process sensitive hosts from file and/or command line
-$sensitiveHosts = @()
-$sensitiveHostsData = @{}  # Host -> {CIDRs: [], Type: "", Original: ""}
+# Process sensitive hosts from file and/or command line.
+# NOTE: this accumulator must NOT be called $sensitiveHosts. PowerShell variable
+# names are case-insensitive, so that name IS the -SensitiveHosts parameter and
+# initialising it here silently discarded whatever the caller passed.
+$sensitiveTargets = @()
+$sensitiveTargetsData = @{}  # Host -> {CIDRs: [], Type: "", Original: ""}
 
 # Process sensitive file if provided
 if ($SensitiveFile -and $SensitiveFile -ne "") {
@@ -3166,11 +3239,11 @@ if ($SensitiveFile -and $SensitiveFile -ne "") {
                 Write-Log -Message "Invalid sensitive entry: $($entry.Original)" -Level "WARNING" -LogFile $logFile
             } elseif ($entry.Type -ne "Comment") {
                 foreach ($currentHost in $entry.Hosts) {
-                    $sensitiveHosts += $currentHost
+                    $sensitiveTargets += $currentHost
 
                     # Store metadata
-                    if (-not $sensitiveHostsData.ContainsKey($currentHost)) {
-                        $sensitiveHostsData[$currentHost] = @{
+                    if (-not $sensitiveTargetsData.ContainsKey($currentHost)) {
+                        $sensitiveTargetsData[$currentHost] = @{
                             CIDRs = @()
                             Type = $entry.Type
                             Original = $entry.Original
@@ -3178,7 +3251,7 @@ if ($SensitiveFile -and $SensitiveFile -ne "") {
                     }
 
                     if ($entry.SourceCIDR) {
-                        $sensitiveHostsData[$currentHost].CIDRs += $entry.SourceCIDR
+                        $sensitiveTargetsData[$currentHost].CIDRs += $entry.SourceCIDR
                     }
                 }
             }
@@ -3198,11 +3271,11 @@ if ($SensitiveHosts.Count -gt 0) {
             Write-Log -Message "Invalid sensitive entry: $($entry.Original)" -Level "WARNING" -LogFile $logFile
         } elseif ($entry.Type -ne "Comment") {
             foreach ($currentHost in $entry.Hosts) {
-                $sensitiveHosts += $currentHost
+                $sensitiveTargets += $currentHost
 
                 # Store metadata
-                if (-not $sensitiveHostsData.ContainsKey($currentHost)) {
-                    $sensitiveHostsData[$currentHost] = @{
+                if (-not $sensitiveTargetsData.ContainsKey($currentHost)) {
+                    $sensitiveTargetsData[$currentHost] = @{
                         CIDRs = @()
                         Type = $entry.Type
                         Original = $entry.Original
@@ -3210,7 +3283,7 @@ if ($SensitiveHosts.Count -gt 0) {
                 }
 
                 if ($entry.SourceCIDR) {
-                    $sensitiveHostsData[$currentHost].CIDRs += $entry.SourceCIDR
+                    $sensitiveTargetsData[$currentHost].CIDRs += $entry.SourceCIDR
                 }
             }
         }
@@ -3218,21 +3291,21 @@ if ($SensitiveHosts.Count -gt 0) {
 }
 
 # Deduplicate sensitive hosts
-if ($sensitiveHosts.Count -gt 0) {
-    $beforeSensitiveDedup = $sensitiveHosts.Count
-    $sensitiveHosts = $sensitiveHosts | Select-Object -Unique
-    $sensitiveDuplicatesRemoved = $beforeSensitiveDedup - $sensitiveHosts.Count
+if ($sensitiveTargets.Count -gt 0) {
+    $beforeSensitiveDedup = $sensitiveTargets.Count
+    $sensitiveTargets = $sensitiveTargets | Select-Object -Unique
+    $sensitiveDuplicatesRemoved = $beforeSensitiveDedup - $sensitiveTargets.Count
 
     Write-Log -Message "Total sensitive hosts after expansion: $beforeSensitiveDedup" -Level "INFO" -LogFile $logFile
     if ($sensitiveDuplicatesRemoved -gt 0) {
         Write-Log -Message "Sensitive duplicates removed: $sensitiveDuplicatesRemoved" -Level "INFO" -LogFile $logFile
     }
-    Write-Log -Message "Unique sensitive hosts: $($sensitiveHosts.Count)" -Level "INFO" -LogFile $logFile
+    Write-Log -Message "Unique sensitive hosts: $($sensitiveTargets.Count)" -Level "INFO" -LogFile $logFile
 
     # Debug: Show sample of sensitive hosts
-    if ($sensitiveHosts.Count -gt 0) {
-        $sampleCount = [Math]::Min(5, $sensitiveHosts.Count)
-        $sampleHosts = $sensitiveHosts[0..($sampleCount-1)] -join ', '
+    if ($sensitiveTargets.Count -gt 0) {
+        $sampleCount = [Math]::Min(5, $sensitiveTargets.Count)
+        $sampleHosts = $sensitiveTargets[0..($sampleCount-1)] -join ', '
         Write-Log -Message "Sample sensitive hosts loaded: $sampleHosts" -Level "INFO" -LogFile $logFile
     }
 }
@@ -3247,17 +3320,17 @@ $excludedSet = @{}
 foreach ($h in $excludedHosts) { $excludedSet[$h] = $true }
 
 $sensitiveSet = @{}
-foreach ($h in $sensitiveHosts) { $sensitiveSet[$h] = $true }
+foreach ($h in $sensitiveTargets) { $sensitiveSet[$h] = $true }
 
 # Merge sensitive hosts into target hosts if not already present
 $addedSensitiveHosts = 0
-foreach ($sh in $sensitiveHosts) {
+foreach ($sh in $sensitiveTargets) {
     if (-not $targetHostsData.ContainsKey($sh)) {
         # Add sensitive host to target hosts
         $targetHostsData[$sh] = @{
-            CIDRs = $sensitiveHostsData[$sh].CIDRs
-            Type = $sensitiveHostsData[$sh].Type
-            Original = $sensitiveHostsData[$sh].Original
+            CIDRs = $sensitiveTargetsData[$sh].CIDRs
+            Type = $sensitiveTargetsData[$sh].Type
+            Original = $sensitiveTargetsData[$sh].Original
         }
         $addedSensitiveHosts++
     }
@@ -3346,6 +3419,126 @@ if ($isWorkflowMode) {
             condition = "always"
         }
     )
+}
+
+# ---------------------------------------------------------------------------
+# Pre-flight: show exactly what is about to run and let the user back out.
+# Scanning the wrong range is expensive, and the moment to notice is now.
+# ---------------------------------------------------------------------------
+$breakdown = Get-TargetBreakdown -ValidHosts $validHosts -TargetHostsData $targetHostsData
+
+Write-Host ""
+Write-Host "╭─────────────────────────────────────────────────╮" -ForegroundColor Cyan
+Write-Host "│ SCAN CONFIGURATION                              │" -ForegroundColor Cyan
+Write-Host "╰─────────────────────────────────────────────────╯" -ForegroundColor Cyan
+
+Write-Host "🎯 Targets    : " -NoNewline -ForegroundColor Cyan
+Write-Host "$($validHosts.Count) host(s)" -ForegroundColor White
+
+foreach ($cidr in ($breakdown.Networks.Keys | Sort-Object)) {
+    Write-Host "   Network    : " -NoNewline -ForegroundColor Cyan
+    Write-Host "$cidr " -NoNewline -ForegroundColor White
+    Write-Host "-> $($breakdown.Networks[$cidr]) host(s)" -ForegroundColor Gray
+}
+
+if ($breakdown.Individual.Count -gt 0) {
+    $shown = if ($breakdown.Individual.Count -le 6) {
+        $breakdown.Individual -join ", "
+    } else {
+        ($breakdown.Individual[0..5] -join ", ") + ", ... (+$($breakdown.Individual.Count - 6) more)"
+    }
+    Write-Host "   Individual : " -NoNewline -ForegroundColor Cyan
+    Write-Host "$($breakdown.Individual.Count) host(s) " -NoNewline -ForegroundColor White
+    Write-Host "($shown)" -ForegroundColor Gray
+}
+
+if ($isWorkflowMode) {
+    Write-Host "🔍 Workflow   : " -NoNewline -ForegroundColor Cyan
+    Write-Host "$Workflow " -NoNewline -ForegroundColor White
+    Write-Host "- $($scanWorkflows[$Workflow].name) ($($workflowSteps.Count) steps)" -ForegroundColor Gray
+
+    $stepNum = 0
+    foreach ($step in $workflowSteps) {
+        $stepNum++
+        $cond = if ($step.condition) { $step.condition } else { $WorkflowCondition }
+        Write-Host "   Step $stepNum     : " -NoNewline -ForegroundColor Cyan
+        Write-Host "$($step.profile) " -NoNewline -ForegroundColor White
+        Write-Host "($cond)" -ForegroundColor Gray
+        foreach ($line in (Format-CommandForDisplay -Command $scanProfiles[$step.profile].command)) {
+            Write-Host "                $line" -ForegroundColor DarkGray
+        }
+    }
+} else {
+    Write-Host "🔍 Profile    : " -NoNewline -ForegroundColor Cyan
+    Write-Host "$ScanType " -NoNewline -ForegroundColor White
+    Write-Host "- $($scanProfiles[$ScanType].name)" -ForegroundColor Gray
+    Write-Host "   Command    : " -NoNewline -ForegroundColor Cyan
+    $cmdLines = Format-CommandForDisplay -Command $scanProfiles[$ScanType].command
+    Write-Host $cmdLines[0] -ForegroundColor DarkGray
+    foreach ($line in ($cmdLines | Select-Object -Skip 1)) {
+        Write-Host $line -ForegroundColor DarkGray
+    }
+}
+
+if ($sensitiveHostsToScan.Count -gt 0) {
+    Write-Host "🔒 Sensitive  : " -NoNewline -ForegroundColor Cyan
+    Write-Host "$($sensitiveHostsToScan.Count) host(s) " -NoNewline -ForegroundColor White
+    Write-Host "| timing $SensitiveTiming | scripts $SensitiveScripts" -ForegroundColor Gray
+    $firstProfile = if ($isWorkflowMode) { $workflowSteps[0].profile } else { $ScanType }
+    $sensCmd = Get-SensitiveScanCommand -BaseCommand $scanProfiles[$firstProfile].command -Timing $SensitiveTiming -Scripts $SensitiveScripts
+    Write-Host "   Command    : " -NoNewline -ForegroundColor Cyan
+    $sLines = Format-CommandForDisplay -Command $sensCmd
+    Write-Host $sLines[0] -ForegroundColor DarkGray
+    foreach ($line in ($sLines | Select-Object -Skip 1)) {
+        Write-Host $line -ForegroundColor DarkGray
+    }
+}
+
+if ($excludedHosts.Count -gt 0) {
+    $exShown = if ($excludedHosts.Count -le 6) {
+        $excludedHosts -join ", "
+    } else {
+        ($excludedHosts[0..5] -join ", ") + ", ... (+$($excludedHosts.Count - 6) more)"
+    }
+    Write-Host "🚫 Excluded   : " -NoNewline -ForegroundColor Cyan
+    Write-Host "$($excludedHosts.Count) host(s) " -NoNewline -ForegroundColor White
+    Write-Host "($exShown)" -ForegroundColor Gray
+}
+
+Write-Host "📁 Output     : " -NoNewline -ForegroundColor Cyan
+Write-Host "$OutputDir$([IO.Path]::DirectorySeparatorChar)" -ForegroundColor White
+Write-Host "   Session    : " -NoNewline -ForegroundColor Cyan
+Write-Host "$sessionId" -ForegroundColor White
+
+Write-Host "⚙️  Execution  : " -NoNewline -ForegroundColor Cyan
+Write-Host "$MaxConcurrent concurrent | $MaxRetries retry | ${RetryDelay}s delay | $OverwriteMode" -ForegroundColor White
+if ($Unprivileged) {
+    Write-Host "   Privileges : " -NoNewline -ForegroundColor Cyan
+    Write-Host "unprivileged (downgraded, no raw sockets)" -ForegroundColor Yellow
+}
+Write-Host ""
+
+# The wizard already asked; -Yes is an explicit opt-out; and with no terminal
+# there is nobody to ask, so run unattended rather than hang.
+if ($Yes) {
+    Write-Log -Message "Pre-flight confirmation skipped (-Yes)" -Level "INFO" -LogFile $logFile
+} elseif ($Wizard) {
+    Write-Log -Message "Pre-flight confirmation already given in the wizard" -Level "INFO" -LogFile $logFile
+} elseif ([Console]::IsInputRedirected) {
+    Write-Log -Message "No interactive terminal: starting unattended" -Level "INFO" -LogFile $logFile
+} else {
+    Write-Host "  Proceed with this scan? [Y/n]: " -NoNewline -ForegroundColor Cyan
+    $proceed = Read-Host
+    if ($proceed -ne "" -and $proceed -notmatch '^[YySs]') {
+        Write-Log -Message "Aborted by user at the pre-flight confirmation" -Level "WARNING" -LogFile $logFile
+        Write-Host ""
+        Write-Host "[INFO] Aborted by user. No hosts were scanned." -ForegroundColor Yellow
+        Write-Host "       The output directory and scan.log were already created: " -NoNewline -ForegroundColor Gray
+        Write-Host "$OutputDir" -ForegroundColor Gray
+        Write-Host ""
+        return
+    }
+    Write-Host ""
 }
 
 # Workflow execution loop
@@ -3854,7 +4047,7 @@ foreach ($currentHost in $hostsToScan) {
 
                 Update-HostState -State $state -TargetHost $jobHost -Status "completed" -Attempts $attempts -ScanFile $nmapFile
                 $completedCount++
-                Write-Log -Message "Scan completed: $jobHost | $currentScanType | Attempt: $attempts | Duration: $($jobResult.Duration)" -Level "SUCCESS" -LogFile $logFile
+                Write-Log -Message "Scan completed: $jobHost | $currentScanType | Attempt: $attempts | Duration: $(Format-Duration -TimeSpan ([TimeSpan]::FromSeconds($jobResult.DurationSeconds)))" -Level "SUCCESS" -LogFile $logFile
 
                 # Track scan duration for ETA calculation
                 if ($jobStartTimes.ContainsKey($jobHost)) {
@@ -3971,14 +4164,7 @@ foreach ($currentHost in $hostsToScan) {
     # Determine scan command (normal or sensitive)
     $baseScanCommand = $scanProfiles[$currentScanType].command
     if ($isSensitive) {
-        # Modify command for sensitive hosts
-        $currentScanCommand = $baseScanCommand -replace '-T\d+', "-$SensitiveTiming"
-
-        # Handle script parameter replacement
-        if ($SensitiveScripts -eq "none") {
-            $currentScanCommand = $currentScanCommand -replace '--script=[^\s]+', ''
-            $currentScanCommand = $currentScanCommand -replace '\s+', ' '
-        }
+        $currentScanCommand = Get-SensitiveScanCommand -BaseCommand $baseScanCommand -Timing $SensitiveTiming -Scripts $SensitiveScripts
     } else {
         $currentScanCommand = $baseScanCommand
     }
@@ -4083,7 +4269,7 @@ while ($jobQueue.Count -gt 0) {
 
             Update-HostState -State $state -TargetHost $jobHost -Status "completed" -Attempts $attempts -ScanFile $nmapFile
             $completedCount++
-            Write-Log -Message "Scan completed: $jobHost | $currentScanType | Attempt: $attempts | Duration: $($jobResult.Duration)" -Level "SUCCESS" -LogFile $logFile
+            Write-Log -Message "Scan completed: $jobHost | $currentScanType | Attempt: $attempts | Duration: $(Format-Duration -TimeSpan ([TimeSpan]::FromSeconds($jobResult.DurationSeconds)))" -Level "SUCCESS" -LogFile $logFile
             if (Test-HostHasOpenPorts -XmlFile $nmapFile) {
                 $aliveHostsCount++
                 $hostCIDR = $state.hosts[$jobHost].source_cidr
@@ -4303,13 +4489,9 @@ $deadPercent = if ($totalCompleted -gt 0) {
 }
 
 # Format duration (remove leading zeros)
-$durationFormatted = if ($totalDuration.TotalHours -ge 1) {
-    "{0}h {1:D2}m {2:D2}s" -f [math]::Floor($totalDuration.TotalHours), $totalDuration.Minutes, $totalDuration.Seconds
-} else {
-    "{0}m {1:D2}s" -f $totalDuration.Minutes, $totalDuration.Seconds
-}
+$durationFormatted = Format-Duration -TimeSpan $totalDuration
 
-Show-ScanyxBanner
+Write-Host ""
 Write-Host "╭─────────────────────────────────────────────────╮" -ForegroundColor Cyan
 Write-Host "│ SCAN SUMMARY                                    │" -ForegroundColor Cyan
 Write-Host "╰─────────────────────────────────────────────────╯" -ForegroundColor Cyan
