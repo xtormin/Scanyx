@@ -1188,33 +1188,109 @@ function Update-HostState {
     $State.pending = ($State.hosts.GetEnumerator() | Where-Object { $_.Value.status -eq "pending" }).Count
 }
 
+function Get-ScanResultsLogPath {
+    # The append-only companion of scan-results.json, in the same directory.
+    param([string]$ResultsFile)
+
+    if ([string]::IsNullOrWhiteSpace($ResultsFile)) { return "" }
+    $dir = [IO.Path]::GetDirectoryName($ResultsFile)
+    $name = [IO.Path]::GetFileNameWithoutExtension($ResultsFile)
+    if ([string]::IsNullOrWhiteSpace($dir)) { return "$name.jsonl" }
+    return [IO.Path]::Combine($dir, "$name.jsonl")
+}
+
 function Add-ScanResult {
+    # One appended line per result. The previous version re-read and rewrote
+    # the whole JSON document on every scan, which is quadratic in the number
+    # of scans and leaves a truncated file if the run is killed mid-write.
+    # scan-results.json keeps its shape: it is rendered once, at the end.
     param(
         [string]$ResultsFile,
         [hashtable]$ScanResult
     )
 
     try {
-        # Load existing results or create new structure
-        if (Test-Path $ResultsFile) {
-            $results = Get-Content -Path $ResultsFile -Raw | ConvertFrom-Json
-            $scansList = [System.Collections.ArrayList]@($results.scans)
-        } else {
-            $results = @{
-                scan_session = ""
-                scans = @()
+        $logPath = Get-ScanResultsLogPath -ResultsFile $ResultsFile
+        if (-not $logPath) { return }
+
+        # A process killed mid-append leaves a line with no terminator. Without
+        # this, the next record would be glued onto it and both would be lost.
+        if (Test-Path $logPath) {
+            $stream = $null
+            try {
+                $stream = [IO.File]::Open($logPath, 'Open', 'ReadWrite')
+                if ($stream.Length -gt 0) {
+                    $null = $stream.Seek(-1, 'End')
+                    if ($stream.ReadByte() -ne 10) {
+                        $nl = [Text.Encoding]::UTF8.GetBytes("`n")
+                        $stream.Write($nl, 0, $nl.Length)
+                    }
+                }
+            } finally {
+                if ($stream) { $stream.Dispose() }
             }
-            $scansList = [System.Collections.ArrayList]@()
         }
 
-        # Add new scan result
-        $null = $scansList.Add($ScanResult)
-        $results.scans = $scansList
+        # -Compress keeps one result on one line; embedded newlines in error
+        # text are escaped by ConvertTo-Json, so a line is always one record.
+        $line = $ScanResult | ConvertTo-Json -Depth 10 -Compress
+        Add-Content -Path $logPath -Value $line -Encoding UTF8 -ErrorAction Stop
 
-        # Save
-        $results | ConvertTo-Json -Depth 10 | Set-Content -Path $ResultsFile
+        # Render scan-results.json every so often. The clean paths (end of run,
+        # Ctrl+C) render it too, but a hard kill fires no handler at all, and
+        # the artifact would otherwise stay the empty skeleton written at start.
+        # Throttled by time rather than by count, so the cost does not grow
+        # with the size of the list.
+        if (-not $script:lastResultsExport) { $script:lastResultsExport = @{} }
+        $last = $script:lastResultsExport[$logPath]
+        if (-not $last -or ((Get-Date) - $last).TotalSeconds -ge 30) {
+            Export-ScanResults -ResultsFile $ResultsFile
+            $script:lastResultsExport[$logPath] = Get-Date
+        }
     } catch {
         Write-Warning "Failed to save scan result: $_"
+    }
+}
+
+function Export-ScanResults {
+    # Render the append-only log into scan-results.json. Called when the run
+    # ends and again if it is interrupted, so the artifact is never left behind
+    # by a scan that did finish.
+    param(
+        [string]$ResultsFile,
+        [string]$SessionId = ""
+    )
+
+    try {
+        $logPath = Get-ScanResultsLogPath -ResultsFile $ResultsFile
+        if (-not $logPath -or -not (Test-Path $logPath)) { return }
+
+        $scans = @()
+        foreach ($line in (Get-Content -Path $logPath -ErrorAction Stop)) {
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            try {
+                $scans += ($line | ConvertFrom-Json)
+            } catch {
+                # A partial last line means the process died mid-append; the
+                # records before it are still good, so keep them.
+                Write-Warning "Skipping unreadable scan result line: $_"
+            }
+        }
+
+        $session = $SessionId
+        if ([string]::IsNullOrWhiteSpace($session) -and (Test-Path $ResultsFile)) {
+            try {
+                $existing = Get-Content -Path $ResultsFile -Raw | ConvertFrom-Json
+                if ($existing.scan_session) { $session = $existing.scan_session }
+            } catch { }
+        }
+
+        @{
+            scan_session = $session
+            scans = $scans
+        } | ConvertTo-Json -Depth 10 | Set-Content -Path $ResultsFile -Encoding UTF8
+    } catch {
+        Write-Warning "Failed to write $ResultsFile : $_"
     }
 }
 
@@ -4552,6 +4628,11 @@ Write-Log -Message "  - Verbose mode: $VerboseMode" -Level "INFO" -LogFile $logF
 # Save initial state
 Save-StateFile -StateFile $stateFile -State $state
 
+# Remembered for the interrupt handler, which runs in its own scope and may
+# fire on any workflow step.
+$script:currentResultsFile = $resultsFile
+$script:currentSessionId = $sessionId
+
 # Initialize results file
 if (-not (Test-Path $resultsFile)) {
     @{
@@ -4583,6 +4664,13 @@ $exitSubscriber = Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Act
         Get-Job | Where-Object { $_.PSJobTypeName -eq "BackgroundJob" } |
             Stop-Job -ErrorAction SilentlyContinue
     } catch { }
+
+    # The results of everything that did complete are already on disk in the
+    # append-only log; render them so an interrupted run still leaves the
+    # artifact behind.
+    if ($script:currentResultsFile) {
+        Export-ScanResults -ResultsFile $script:currentResultsFile -SessionId $script:currentSessionId
+    }
 
     Write-Host "[INFO] Cleanup completed. Exiting...`n" -ForegroundColor Yellow
 }
@@ -4676,7 +4764,7 @@ foreach ($currentHost in $hostsToScan) {
                     end_time = $jobResult.EndTime
                     duration_seconds = $jobResult.DurationSeconds
                     attempts = $attempts
-                    output_files = @("$([IO.Path]::Combine($jobData.HostFolder, $jobData.FileName)).nmap")
+                    output_files = @($nmapFile)
                 }
             } else {
                 # Check if retry needed
@@ -4909,7 +4997,7 @@ while ($jobQueue.Count -gt 0) {
                 end_time = $jobResult.EndTime
                 duration_seconds = $jobResult.DurationSeconds
                 attempts = $attempts
-                output_files = @("$([IO.Path]::Combine($jobData.HostFolder, $jobData.FileName)).nmap")
+                output_files = @($nmapFile)
             }
         } else {
             if ($attempts -lt ($MaxRetries + 1)) {
@@ -5244,6 +5332,7 @@ Write-Host "──────────────────────�
     }
 
     $workflowStepNumber++
+    Export-ScanResults -ResultsFile $resultsFile -SessionId $sessionId
 } # End of workflow loop
 
 # Clear all progress bars after workflow completes
