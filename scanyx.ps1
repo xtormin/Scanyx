@@ -264,32 +264,6 @@ function Test-IsElevated {
     }
 }
 
-function Get-EnvironmentLine {
-    # One-line environment fingerprint shown under the banner. Cached: the banner
-    # is redrawn on every wizard step and nmap --version spawns a process.
-    if ($script:envLine) { return $script:envLine }
-
-    $psVer = $PSVersionTable.PSVersion.ToString()
-    if ($IsLinux -or $IsMacOS) {
-        $osName = try { (& uname -s).Trim() } catch { "Unix" }
-        $arch   = try { (& uname -m).Trim() } catch { "?" }
-        $uid    = try { (& id -u).Trim() } catch { "?" }
-        $who    = if ($uid -eq '0') { "root" } else { "uid=$uid, no root" }
-        $plat   = "$osName $arch | $who"
-    } else {
-        $plat = "Windows | " + $(if (Test-IsElevated) { "Administrator" } else { "no elevado" })
-    }
-
-    $nmapVer = "nmap no encontrado"
-    try {
-        $raw = (& nmap --version 2>$null | Select-Object -First 1)
-        if ($raw -match 'version\s+(\S+)') { $nmapVer = "nmap $($Matches[1])" }
-    } catch { }
-
-    $script:envLine = "pwsh $psVer | $plat | $nmapVer"
-    return $script:envLine
-}
-
 # Nmap flags that need raw sockets (root on Linux/macOS).
 # Degradable ones have an unprivileged equivalent; blocking ones do not.
 $Global:ScanyxRootFlags = @{
@@ -1836,8 +1810,6 @@ function Show-ScanyxBanner {
     Write-Host ""
     Write-Host "                   https://github.com/xtormin/Scanyx (v2.8.1)" -ForegroundColor Red
     Write-Host "                           @xtormin (Jennifer Torres)" -ForegroundColor Red
-    Write-Host ""
-    Write-Host "  $(Get-EnvironmentLine)" -ForegroundColor DarkGray
     Write-Host ""
 }
 
@@ -4469,9 +4441,9 @@ Write-Host "🚀 Next Steps" -ForegroundColor Cyan
 Write-Host "   To analyze and merge scan results, you can use XtremeNmapParser (XNP):" -ForegroundColor White
 Write-Host ""
 if ($isWorkflowMode) {
-    Write-Host "   python3 xnp.py -d `"$([IO.Path]::Combine($OutputDir, $Workflow))`" -M -R --open -C all" -ForegroundColor Yellow
+    Write-Host "   xnp -d `"$([IO.Path]::Combine($OutputDir, $Workflow))`" --show" -ForegroundColor Yellow
 } else {
-    Write-Host "   python3 xnp.py -d `"$OutputDir`" -M -R --open -C all" -ForegroundColor Yellow
+    Write-Host "   xnp -d `"$OutputDir`" --show" -ForegroundColor Yellow
 }
 Write-Host ""
 Write-Host "   📖 XNP Repository: " -NoNewline -ForegroundColor DarkGray

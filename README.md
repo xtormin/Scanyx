@@ -357,7 +357,7 @@ Usa [XtremeNmapParser (XNP)](https://github.com/xtormin/XtremeNmapParser) para f
 
 ```bash
 # Fusionar todos los XMLs con salida en Excel, CSV y JSON
-python3 xnp.py -d nmap/ -M -R --open -C all
+xnp -d nmap/ --show
 ```
 
 ---
