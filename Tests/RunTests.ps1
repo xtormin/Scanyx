@@ -62,21 +62,21 @@ Write-Host "========================================`n" -ForegroundColor Cyan
 $testPaths = @()
 switch ($Category) {
     "Unit" {
-        $testPaths += Join-Path $testRoot "Unit\*.Tests.ps1"
+        $testPaths += [IO.Path]::Combine($testRoot, 'Unit', '*.Tests.ps1')
         Write-Host "Running Unit Tests..." -ForegroundColor Yellow
     }
     "Integration" {
-        $testPaths += Join-Path $testRoot "Integration\*.Tests.ps1"
+        $testPaths += [IO.Path]::Combine($testRoot, 'Integration', '*.Tests.ps1')
         Write-Host "Running Integration Tests..." -ForegroundColor Yellow
     }
     "Functional" {
-        $testPaths += Join-Path $testRoot "Functional\*.Tests.ps1"
+        $testPaths += [IO.Path]::Combine($testRoot, 'Functional', '*.Tests.ps1')
         Write-Host "Running Functional Tests..." -ForegroundColor Yellow
     }
     "All" {
-        $testPaths += Join-Path $testRoot "Unit\*.Tests.ps1"
-        $testPaths += Join-Path $testRoot "Integration\*.Tests.ps1"
-        $testPaths += Join-Path $testRoot "Functional\*.Tests.ps1"
+        $testPaths += [IO.Path]::Combine($testRoot, 'Unit', '*.Tests.ps1')
+        $testPaths += [IO.Path]::Combine($testRoot, 'Integration', '*.Tests.ps1')
+        $testPaths += [IO.Path]::Combine($testRoot, 'Functional', '*.Tests.ps1')
         Write-Host "Running All Tests..." -ForegroundColor Yellow
     }
 }

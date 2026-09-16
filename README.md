@@ -5,7 +5,8 @@
 </p>
 
 [![Version](https://img.shields.io/badge/version-2.8.1-blue.svg)](https://github.com/xtormin/scanyx)
-[![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-blue.svg)](https://github.com/PowerShell/PowerShell)
+[![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B%20(Windows)%20%C2%B7%207.2%2B%20(macOS%2FLinux)-blue.svg)](https://github.com/PowerShell/PowerShell)
+[![Plataformas](https://img.shields.io/badge/plataformas-Windows%20%C2%B7%20macOS%20%C2%B7%20Linux-lightgrey.svg)](#instalación-en-macos--linux)
 
 **SCANYX** es una herramienta para automatizar escaneos de red con Nmap. Soporta ejecución paralela, workflows secuenciales, sesiones, hosts sensibles y excluidos, y persistencia de estado, entre otras.
 
@@ -28,7 +29,37 @@
 # TL;DR - Inicio Rápido
 
 ## Carga del script
-### Carga local
+
+### Instalación en macOS / Linux
+
+En Unix se usa el lanzador `scanyx.sh`, que resuelve `pwsh` y `nmap` y arranca el script por ti.
+
+```bash
+git clone "https://github.com/xtormin/scanyx.git"
+cd scanyx
+chmod +x scanyx.sh
+./scanyx.sh --check      # diagnóstico: SO, arquitectura, pwsh, nmap, uid
+./scanyx.sh --install    # instala lo que falte (brew / apt / tarball oficial)
+```
+
+`--check` no instala nada: solo informa y sale con código 2 si falta algo. La
+instalación solo ocurre con `--install` (o `--yes`). En Kali sobre ARM64, donde
+el paquete `powershell` no suele estar en apt, el lanzador cae automáticamente
+al tarball oficial de Microsoft.
+
+Después, se invoca igual que en Windows pero a través del lanzador:
+
+```bash
+./scanyx.sh -Hosts "192.168.1.2" -ScanType "tcp-1000"
+./scanyx.sh -HostFile hosts.txt -Workflow "full-discovery" -MaxConcurrent 5
+```
+
+Opciones propias del lanzador (siempre con doble guion, para no chocar con los
+parámetros de Scanyx): `--check`, `--install`/`--yes`, `--no-install`,
+`--sudo`/`--no-sudo`, `--remote [URL]`, `--help`. Cualquier otro argumento se
+reenvía tal cual a `Invoke-Scanyx`.
+
+### Carga local (Windows)
 ```powershell
 git clone "https://github.com/xtormin/scanyx.git"
 cd scanyx
@@ -42,7 +73,12 @@ iex ((New-Object Net.WebClient).DownloadString('https://raw.githubusercontent.co
 
 ## Edición de la configuración de perfiles y workflows (opcional)
 ```powershell
+# Windows
 notepad "nmap-profiles-workflows.json"
+```
+```bash
+# macOS / Linux
+${EDITOR:-nano} nmap-profiles-workflows.json
 ```
 
 ## Crear archivo con hosts/redes
@@ -111,15 +147,61 @@ scanyx `
 
 ---
 
+# Privilegios
+
+En Windows no cambia nada. En **macOS y Linux**, nmap necesita privilegios de
+root para abrir raw sockets, y **los seis perfiles de serie lo requieren**:
+`tcp-100`, `tcp-1000` y `tcp-full` usan `-sS` y `-A`; `udp-common`, `udp-1000` y
+`udp-full` usan `-sU` y `-A`.
+
+Si lanzas Scanyx sin root, comprueba **todos los pasos del workflow antes de
+empezar** (no tiene sentido abortar en el paso 3 tras 40 minutos de escaneo) y
+se comporta así:
+
+| Situación | Qué hace |
+|---|---|
+| Perfil degradable, con terminal | Te ofrece degradar o abortar. **Por defecto aborta** |
+| Perfil degradable, sin terminal | Aborta e imprime la orden exacta con `sudo` |
+| Perfil con `-sU` o `-sO` | **Aborta siempre**: no se puede degradar |
+
+Degradar no es gratis y por eso no se hace en silencio: `-sS` pasa a `-sT`, que
+es más lento y deja conexiones completas en el log del objetivo, y se pierden la
+detección de sistema operativo (`-O`) y el traceroute. `-sU` directamente no
+tiene equivalente sin privilegios.
+
+```bash
+# Lo normal: escanear con privilegios
+sudo ./scanyx.sh -Hosts 192.168.1.0/24 -ScanType tcp-1000
+
+# Aceptar la degradación sin que pregunte (CI, cron)
+./scanyx.sh -Hosts 192.168.1.0/24 -ScanType tcp-1000 -AutoUnprivileged
+```
+
+Cuando lanzas con `sudo`, el lanzador devuelve la propiedad del directorio de
+resultados a tu usuario al terminar, para no dejarte ficheros de root en el home.
+
+> **Ctrl+C en macOS/Linux**: la limpieza de procesos no siempre alcanza a nmap.
+> Si interrumpes un escaneo, comprueba con `pgrep -fl nmap` y limpia con
+> `pkill -f nmap` si quedan huérfanos.
+
+---
+
 # Requisitos
 
-- **PowerShell**: 5.1 o superior
+- **PowerShell**: 5.1 o superior en Windows; **7.2 o superior** en macOS y Linux
+  (en 6.x `Start-Job` es inestable, así que el lanzador lo rechaza)
 - **Nmap**: Instalado y en PATH ([descargar](https://nmap.org/download.html))
+- **En macOS/Linux**: privilegios de root para los perfiles de serie (ver
+  [Privilegios](#privilegios))
 
 ```powershell
-# Verificar instalación
+# Verificar instalación (Windows)
 nmap --version
 $PSVersionTable.PSVersion
+```
+```bash
+# Verificar instalación (macOS / Linux)
+./scanyx.sh --check
 ```
 
 ---
@@ -171,6 +253,11 @@ scanyx -ListSessions -OutputDir "C:\Pentest\PROYECTO\scans"
 
 # Reanudar sesión específica
 scanyx -ResumeSession "pentest-cliente-2025" -Resume -OutputDir "C:\Pentest\PROYECTO\scans"
+```
+```bash
+# Lo mismo en macOS / Linux
+./scanyx.sh -ListSessions -OutputDir ~/Pentest/PROYECTO/scans
+./scanyx.sh -ResumeSession "pentest-cliente-2025" -Resume -OutputDir ~/Pentest/PROYECTO/scans
 ```
 
 ## Reanudar Escaneos
@@ -323,7 +410,7 @@ python3 xnp.py -d nmap/ -M -R --open -C all
 
 # Licencia
 
-Este proyecto está licenciado bajo la licencia GPL v3.0 - ver el archivo [LICENSE](LICENSE) para más detalles.
+Este proyecto está licenciado bajo la licencia **AGPL v3.0** - ver el archivo [LICENSE](LICENSE) para más detalles.
 
 ---
 

@@ -3,8 +3,8 @@
 
 BeforeAll {
     # Load the main script and mocks
-    . $PSScriptRoot\..\..\scanyx.ps1
-    . $PSScriptRoot\..\Mocks\Nmap.Mock.ps1
+    . ([IO.Path]::Combine($PSScriptRoot, '..', '..', 'scanyx.ps1'))
+    . ([IO.Path]::Combine($PSScriptRoot, '..', 'Mocks', 'Nmap.Mock.ps1'))
 }
 
 Describe "Load-ScanConfiguration" -Tag "Integration", "Configuration" {
@@ -31,21 +31,21 @@ Describe "Load-ScanConfiguration" -Tag "Integration", "Configuration" {
 
         It "Profiles have expected structure" {
             $config = Load-ScanConfiguration -ConfigFile $testConfigPath
-            $config.profiles.PSObject.Properties.Count | Should -BeGreaterThan 0
+            $config.profiles.Count | Should -BeGreaterThan 0
 
-            foreach ($profile in $config.profiles.PSObject.Properties) {
-                $profile.Value.name | Should -Not -BeNullOrEmpty
-                $profile.Value.args | Should -Not -BeNullOrEmpty
+            foreach ($profileName in $config.profiles.Keys) {
+                $config.profiles[$profileName].name | Should -Not -BeNullOrEmpty
+                $config.profiles[$profileName].command | Should -Not -BeNullOrEmpty
             }
         }
 
         It "Workflows have expected structure" {
             $config = Load-ScanConfiguration -ConfigFile $testConfigPath
-            $config.workflows.PSObject.Properties.Count | Should -BeGreaterThan 0
+            $config.workflows.Count | Should -BeGreaterThan 0
 
-            foreach ($workflow in $config.workflows.PSObject.Properties) {
-                $workflow.Value.name | Should -Not -BeNullOrEmpty
-                $workflow.Value.steps | Should -Not -BeNullOrEmpty
+            foreach ($workflowName in $config.workflows.Keys) {
+                $config.workflows[$workflowName].name | Should -Not -BeNullOrEmpty
+                $config.workflows[$workflowName].steps | Should -Not -BeNullOrEmpty
             }
         }
     }
@@ -62,14 +62,14 @@ Describe "Load-ScanConfiguration" -Tag "Integration", "Configuration" {
             $newConfigPath = Join-Path $TestDrive "default-config.json"
             $config = Load-ScanConfiguration -ConfigFile $newConfigPath
 
-            $config.profiles.PSObject.Properties.Name | Should -Contain "tcp-1000"
+            $config.profiles.Keys | Should -Contain "tcp-1000"
         }
 
         It "Default config has udp profiles" {
             $newConfigPath = Join-Path $TestDrive "default-udp-config.json"
             $config = Load-ScanConfiguration -ConfigFile $newConfigPath
 
-            $config.profiles.PSObject.Properties.Name | Should -Contain "udp-common"
+            $config.profiles.Keys | Should -Contain "udp-common"
         }
 
         It "Default config has workflows" {
@@ -114,7 +114,7 @@ Describe "Load-ScanConfiguration" -Tag "Integration", "Configuration" {
                     "my-custom-scan" = @{
                         name = "My Custom Scan"
                         description = "Custom scan profile"
-                        args = "-sT -p 1-100 -T3 --script banner"
+                        command = "-sT -p 1-100 -T3 --script banner"
                     }
                 }
                 workflows = @{}
@@ -132,8 +132,8 @@ Describe "Load-ScanConfiguration" -Tag "Integration", "Configuration" {
             $profile = $config.profiles."my-custom-scan"
 
             $profile.name | Should -Be "My Custom Scan"
-            $profile.args | Should -Match "-sT"
-            $profile.args | Should -Match "--script banner"
+            $profile.command | Should -Match "-sT"
+            $profile.command | Should -Match "--script banner"
         }
     }
 
@@ -171,7 +171,7 @@ Describe "Load-ScanConfiguration" -Tag "Integration", "Configuration" {
             $workflow = $config.workflows."multi-step"
 
             foreach ($step in $workflow.steps) {
-                $config.profiles.PSObject.Properties.Name | Should -Contain $step.profile
+                $config.profiles.Keys | Should -Contain $step.profile
             }
         }
 

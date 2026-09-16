@@ -178,7 +178,7 @@ Invoke-Pester -Path .\Tests\Unit\ -FullNameFilter "*Test-ValidIPOrHost*"
 
 BeforeAll {
     # Load the main script
-    . $PSScriptRoot\..\..\scanyx.ps1
+    . ([IO.Path]::Combine($PSScriptRoot, '..', '..', 'scanyx.ps1'))
 }
 
 Describe "MyFunction" -Tag "Unit", "MyTag" {
@@ -203,8 +203,8 @@ Describe "MyFunction" -Tag "Unit", "MyTag" {
 # MyIntegration.Tests.ps1
 
 BeforeAll {
-    . $PSScriptRoot\..\..\scanyx.ps1
-    . $PSScriptRoot\..\Mocks\Nmap.Mock.ps1
+    . ([IO.Path]::Combine($PSScriptRoot, '..', '..', 'scanyx.ps1'))
+    . ([IO.Path]::Combine($PSScriptRoot, '..', 'Mocks', 'Nmap.Mock.ps1'))
 }
 
 Describe "MyIntegration" -Tag "Integration" {
@@ -259,7 +259,11 @@ on: [push, pull_request]
 
 jobs:
   test:
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v3
 
@@ -269,7 +273,7 @@ jobs:
 
       - name: Run Tests
         shell: pwsh
-        run: .\Tests\RunTests.ps1 -CI -CodeCoverage
+        run: ./Tests/RunTests.ps1 -CI -CodeCoverage
 
       - name: Upload Results
         uses: actions/upload-artifact@v3
@@ -302,7 +306,7 @@ Install-Module -Name Pester -Force -SkipPublisherCheck -MinimumVersion 5.0.0
 
 Tests should NOT require real Nmap installation. If they fail:
 
-1. Check that mocks are loaded: `. $PSScriptRoot\..\Mocks\Nmap.Mock.ps1`
+1. Check that mocks are loaded: `. ([IO.Path]::Combine($PSScriptRoot, '..', 'Mocks', 'Nmap.Mock.ps1'))`
 2. Ensure `Mock-NmapCommand` is called in tests
 3. Verify test isolation
 

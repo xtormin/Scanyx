@@ -212,6 +212,137 @@ function Test-NmapInstalled {
     }
 }
 
+function Get-NmapPath {
+    # Resolve nmap to a full path. Under sudo, secure_path drops /opt/homebrew/bin
+    # and /usr/local/bin, so passing a bare "nmap" to Start-Process can fail.
+    try {
+        return (Get-Command nmap -ErrorAction Stop).Source
+    } catch {
+        return "nmap"
+    }
+}
+
+function ConvertTo-ScanyxDateTime {
+    # ConvertFrom-Json on PowerShell 7 turns ISO-8601 strings into [DateTime]
+    # objects, and interpolating one yields an invariant "MM/dd/yyyy" string that
+    # [DateTime]::Parse then rejects under a non-English culture (es-ES reads it
+    # as day 09, month 16). Accept both shapes and never parse culture-dependent.
+    param($Value)
+
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [datetime]) { return $Value }
+
+    $parsed = [datetime]::MinValue
+    $styles = [System.Globalization.DateTimeStyles]::None
+    foreach ($culture in @([System.Globalization.CultureInfo]::InvariantCulture,
+                           [System.Globalization.CultureInfo]::CurrentCulture)) {
+        if ([datetime]::TryParse([string]$Value, $culture, $styles, [ref]$parsed)) {
+            return $parsed
+        }
+    }
+    return $null
+}
+
+function Get-InvocationHint {
+    # How the user launches Scanyx on this platform, for copy-paste hints.
+    # $IsLinux/$IsMacOS do not exist on Windows PowerShell 5.1 (they are $null there).
+    if ($IsLinux -or $IsMacOS) { return "./scanyx.sh" } else { return ".\scanyx.ps1" }
+}
+
+function Test-IsElevated {
+    # Root on Unix, Administrator on Windows.
+    # Not [Environment]::IsPrivilegedProcess: that is .NET 7+ and breaks PS 5.1.
+    if ($IsLinux -or $IsMacOS) {
+        try { return ((& id -u) -eq '0') } catch { return $false }
+    }
+    try {
+        $identity  = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+        return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch {
+        return $false
+    }
+}
+
+function Get-EnvironmentLine {
+    # One-line environment fingerprint shown under the banner. Cached: the banner
+    # is redrawn on every wizard step and nmap --version spawns a process.
+    if ($script:envLine) { return $script:envLine }
+
+    $psVer = $PSVersionTable.PSVersion.ToString()
+    if ($IsLinux -or $IsMacOS) {
+        $osName = try { (& uname -s).Trim() } catch { "Unix" }
+        $arch   = try { (& uname -m).Trim() } catch { "?" }
+        $uid    = try { (& id -u).Trim() } catch { "?" }
+        $who    = if ($uid -eq '0') { "root" } else { "uid=$uid, no root" }
+        $plat   = "$osName $arch | $who"
+    } else {
+        $plat = "Windows | " + $(if (Test-IsElevated) { "Administrator" } else { "no elevado" })
+    }
+
+    $nmapVer = "nmap no encontrado"
+    try {
+        $raw = (& nmap --version 2>$null | Select-Object -First 1)
+        if ($raw -match 'version\s+(\S+)') { $nmapVer = "nmap $($Matches[1])" }
+    } catch { }
+
+    $script:envLine = "pwsh $psVer | $plat | $nmapVer"
+    return $script:envLine
+}
+
+# Nmap flags that need raw sockets (root on Linux/macOS).
+# Degradable ones have an unprivileged equivalent; blocking ones do not.
+$Global:ScanyxRootFlags = @{
+    Degradable = @('-sS','-sA','-sF','-sN','-sX','-sW','-sM','-sY','-sZ','-O','-A',
+                   '--traceroute','--osscan-guess','--spoof-mac','-D','-S','-f')
+    Blocking   = @('-sU','-sO')
+}
+
+function Get-RootRequiredFlags {
+    param([string]$Command)
+
+    $result = @{ Degradable = @(); Blocking = @() }
+    if ([string]::IsNullOrWhiteSpace($Command)) { return $result }
+
+    # Tokenise so that -sU is not matched inside --script=vuln or a filename
+    $tokens = $Command -split '\s+' | Where-Object { $_ }
+
+    foreach ($token in $tokens) {
+        $bare = ($token -split '=')[0]
+        if ($Global:ScanyxRootFlags.Blocking -contains $bare) {
+            $result.Blocking += $bare
+        } elseif ($Global:ScanyxRootFlags.Degradable -contains $bare) {
+            $result.Degradable += $bare
+        }
+    }
+
+    $result.Degradable = @($result.Degradable | Select-Object -Unique)
+    $result.Blocking   = @($result.Blocking   | Select-Object -Unique)
+    return $result
+}
+
+function ConvertTo-UnprivilegedCommand {
+    param([string]$Command)
+
+    $flags = Get-RootRequiredFlags -Command $Command
+    # -sU / -sO cannot be degraded: nmap has no connect()-style UDP or IP-proto scan
+    if ($flags.Blocking.Count -gt 0) { return $null }
+
+    $tokens = $Command -split '\s+' | Where-Object { $_ }
+    $out = @()
+    foreach ($token in $tokens) {
+        switch -Regex ($token) {
+            '^-sS$'                        { $out += '-sT'; break }
+            # -A implies -O and --traceroute, both of which need root
+            '^-A$'                         { $out += '-sV'; $out += '-sC'; break }
+            '^(-O|--traceroute|--osscan-guess)$' { break }
+            default                        { $out += $token }
+        }
+    }
+    if ($out -notcontains '--unprivileged') { $out += '--unprivileged' }
+    return ($out -join ' ')
+}
+
 function Test-ValidIPOrHost {
     param([string]$Address)
 
@@ -496,7 +627,7 @@ function Get-OutputFolder {
 
     # Simple mode for tests (includes scan type in path)
     if ($ScanType -and -not $WorkflowName) {
-        return Join-Path $BaseDir "$hostKey\$ScanType"
+        return [IO.Path]::Combine($BaseDir, $hostKey, $ScanType)
     }
 
     if ($WorkflowName -and $WorkflowName -ne "") {
@@ -504,19 +635,19 @@ function Get-OutputFolder {
         $stepFolder = "S$WorkflowStep-$StepProfile"
         if ($SourceCIDR) {
             $cidrFolder = $SourceCIDR -replace '/', '-'
-            return "$BaseDir\$stepFolder\networks\$cidrFolder\$hostKey"
+            return [IO.Path]::Combine($BaseDir, $stepFolder, "networks", $cidrFolder, $hostKey)
         } else {
-            return "$BaseDir\$stepFolder\hosts\$hostKey"
+            return [IO.Path]::Combine($BaseDir, $stepFolder, "hosts", $hostKey)
         }
     } else {
         # Single scan mode: each host has its own folder
         if ($SourceCIDR) {
             # From CIDR: goes to networks/cidr/host/ folder
             $cidrFolder = $SourceCIDR -replace '/', '-'
-            return "$BaseDir\networks\$cidrFolder\$hostKey"
+            return [IO.Path]::Combine($BaseDir, "networks", $cidrFolder, $hostKey)
         } else {
             # Individual host: goes to hosts/host/ folder
-            return "$BaseDir\hosts\$hostKey"
+            return [IO.Path]::Combine($BaseDir, "hosts", $hostKey)
         }
     }
 }
@@ -987,7 +1118,15 @@ function Get-ConfigContent {
     if ($ConfigPath -match '^https?://') {
         try {
             Write-Host "[INFO] Downloading configuration from URL: $ConfigPath" -ForegroundColor Cyan
-            $content = (New-Object Net.WebClient).DownloadString($ConfigPath)
+            $response = Invoke-WebRequest -Uri $ConfigPath -UseBasicParsing -ErrorAction Stop
+            # .Content is a byte[] when the server does not advertise a text
+            # content type (WebClient.DownloadString always returned a string)
+            $content = if ($response.Content -is [byte[]]) {
+                [System.Text.Encoding]::UTF8.GetString($response.Content)
+            } else {
+                $response.Content
+            }
+            $content = $content -replace "^\uFEFF", ""
             Write-Host "[INFO] Configuration downloaded successfully" -ForegroundColor Green
             return @{
                 Success = $true
@@ -1260,64 +1399,9 @@ function Load-ScanConfiguration {
     }
 }
 
-function Invoke-NmapScan {
-    param(
-        [string]$Host,
-        [string]$ScanCommand,
-        [string]$OutputPath,
-        [string]$FileName
-    )
-
-    try {
-        # Construct full command
-        $fullCommand = "$ScanCommand -oA `"$OutputPath\$FileName`" $Host"
-
-        # Execute nmap using Start-Process for better security
-        $processArgs = @{
-            FilePath = "nmap"
-            ArgumentList = ($ScanCommand -replace '^nmap\s+', '') + " -oA `"$OutputPath\$FileName`" $Host"
-            Wait = $true
-            NoNewWindow = $true
-            RedirectStandardOutput = "$OutputPath\$FileName.stdout"
-            RedirectStandardError = "$OutputPath\$FileName.stderr"
-            PassThru = $true
-        }
-
-        $process = Start-Process @processArgs
-
-        $errorOutput = if (Test-Path "$OutputPath\$FileName.stderr") {
-            Get-Content "$OutputPath\$FileName.stderr" -Raw
-        } else { "" }
-
-        # Verify that nmap actually created output files
-        $nmapFileExists = Test-Path "$OutputPath\$FileName.nmap"
-        $exitCodeOk = $process.ExitCode -eq 0
-
-        # Success only if exit code is 0 AND .nmap file exists
-        $scanSuccess = $exitCodeOk -and $nmapFileExists
-
-        # If exit code was 0 but no file, add to error
-        if ($exitCodeOk -and -not $nmapFileExists) {
-            $errorOutput = "Nmap exited with code 0 but did not generate output files. " + $errorOutput
-        }
-
-        return @{
-            Success = $scanSuccess
-            ExitCode = $process.ExitCode
-            ErrorOutput = $errorOutput
-        }
-    } catch {
-        return @{
-            Success = $false
-            ExitCode = -1
-            ErrorOutput = $_.Exception.Message
-        }
-    }
-}
-
 # Global ScriptBlock for nmap scan jobs (reusable across retry and initial scans)
 $Global:NmapScanScriptBlock = {
-    param($TargetHost, $ScanCommand, $OutputPath, $FileName, $Attempts, $Unprivileged)
+    param($TargetHost, $ScanCommand, $OutputPath, $FileName, $Attempts, $Unprivileged, $NmapPath)
 
     $startTime = Get-Date
 
@@ -1327,9 +1411,9 @@ $Global:NmapScanScriptBlock = {
     # Parse command into arguments (handle quoted strings)
     $cmdWithoutNmap = $ScanCommand -replace '^nmap\s+', ''
     $regex = [regex]'(?:[^\s"'']+|"[^"]*"|''[^'']*'')+'
-    $matches = $regex.Matches($cmdWithoutNmap)
-    foreach ($match in $matches) {
-        $arg = $match.Value.Trim('"').Trim("'")
+    $argMatches = $regex.Matches($cmdWithoutNmap)
+    foreach ($argMatch in $argMatches) {
+        $arg = $argMatch.Value.Trim('"').Trim("'")
         # Replace -sS with -sT if unprivileged mode is enabled
         if ($Unprivileged -and $arg -eq "-sS") {
             $nmapArgs += "-sT"
@@ -1338,46 +1422,49 @@ $Global:NmapScanScriptBlock = {
         }
     }
 
-    # Add --unprivileged if specified
-    if ($Unprivileged) {
+    # Add --unprivileged if specified. ConvertTo-UnprivilegedCommand may have
+    # already added it at the command-string level, so guard against duplicates.
+    if ($Unprivileged -and $nmapArgs -notcontains "--unprivileged") {
         $nmapArgs += "--unprivileged"
     }
 
-    # Add output and target (quote the path if it contains spaces)
-    $outputFullPath = "$OutputPath\$FileName"
-    if ($outputFullPath -match '\s') {
-        $nmapArgs += @("-oA", "`"$outputFullPath`"", $TargetHost)
-    } else {
-        $nmapArgs += @("-oA", $outputFullPath, $TargetHost)
-    }
+    # Add output and target. Never quote here: each ArgumentList element is
+    # passed to the process verbatim, so quotes would end up inside the filename.
+    $outputFullPath = [IO.Path]::Combine($OutputPath, $FileName)
+    $nmapArgs += @("-oA", $outputFullPath, $TargetHost)
 
-    $processArgs = @{
-        FilePath = "nmap"
-        ArgumentList = $nmapArgs
-        Wait = $true
-        NoNewWindow = $true
-        RedirectStandardOutput = "$OutputPath\$FileName.stdout"
-        RedirectStandardError = "$OutputPath\$FileName.stderr"
-        PassThru = $true
-    }
+    # Use the resolved nmap path: under sudo, secure_path hides Homebrew's bin
+    $nmapExe = if ($NmapPath) { $NmapPath } else { "nmap" }
+
+    $stdoutFile = "$outputFullPath.stdout"
+    $stderrFile = "$outputFullPath.stderr"
+
+    # Native stderr must not be turned into a terminating error, and a non-zero
+    # exit code is handled below rather than thrown (PS 7.4+ default).
+    $ErrorActionPreference = "Continue"
+    $PSNativeCommandUseErrorActionPreference = $false
 
     try {
-        $process = Start-Process @processArgs
+        # The call operator, not Start-Process: on Linux/macOS, Start-Process
+        # flattens -ArgumentList into a single string and the arguments are then
+        # re-split on whitespace, so any path containing a space reaches nmap as
+        # several bogus targets. "&" passes the array as argv.
+        & $nmapExe @nmapArgs 1> $stdoutFile 2> $stderrFile
+        $exitCode = $LASTEXITCODE
         $endTime = Get-Date
         $duration = $endTime - $startTime
 
-        $errorOutput = if (Test-Path "$OutputPath\$FileName.stderr") {
-            Get-Content "$OutputPath\$FileName.stderr" -Raw
+        $errorOutput = if (Test-Path $stderrFile) {
+            Get-Content $stderrFile -Raw
         } else { "" }
 
         # Add exit code to error message for debugging
-        $exitCode = $process.ExitCode
         if ($exitCode -ne 0) {
             $errorOutput = "Nmap exited with code $exitCode. " + $errorOutput
         }
 
         # Verify that nmap actually created output files
-        $nmapFileExists = Test-Path "$OutputPath\$FileName.nmap"
+        $nmapFileExists = Test-Path "$outputFullPath.nmap"
         $exitCodeOk = $exitCode -eq 0
 
         # Success only if exit code is 0 AND .nmap file exists
@@ -1425,10 +1512,11 @@ function Start-NmapScanJob {
         [string]$OutputPath,
         [string]$FileName,
         [int]$Attempts,
-        [bool]$Unprivileged
+        [bool]$Unprivileged,
+        [string]$NmapPath = "nmap"
     )
 
-    return Start-Job -ScriptBlock $Global:NmapScanScriptBlock -ArgumentList $TargetHost, $ScanCommand, $OutputPath, $FileName, $Attempts, $Unprivileged
+    return Start-Job -ScriptBlock $Global:NmapScanScriptBlock -ArgumentList $TargetHost, $ScanCommand, $OutputPath, $FileName, $Attempts, $Unprivileged, $NmapPath
 }
 
 function Test-SessionName {
@@ -1508,7 +1596,7 @@ function Get-SessionList {
         Write-Host " para crear una nueva sesión con nombre" -ForegroundColor Gray
         Write-Host ""
         Write-Host "Ejemplo:" -ForegroundColor Cyan
-        Write-Host "  .\scanyx.ps1 -ListSessions -OutputDir <tu-directorio>" -ForegroundColor White
+        Write-Host "  $(Get-InvocationHint) -ListSessions -OutputDir <tu-directorio>" -ForegroundColor White
         Write-Host ""
         return @()
     }
@@ -1540,10 +1628,10 @@ function Get-SessionList {
                 $state = Get-Content $stateFile -Raw | ConvertFrom-Json
 
                 $elapsed = 0
-                if ($state.start_time) {
-                    $startTime = [DateTime]::Parse($state.start_time)
-                    if ($state.end_time) {
-                        $endTime = [DateTime]::Parse($state.end_time)
+                $startTime = ConvertTo-ScanyxDateTime $state.start_time
+                if ($startTime) {
+                    $endTime = ConvertTo-ScanyxDateTime $state.end_time
+                    if ($endTime) {
                         $elapsed = ($endTime - $startTime).TotalSeconds
                     } else {
                         $elapsed = ((Get-Date) - $startTime).TotalSeconds
@@ -1564,7 +1652,7 @@ function Get-SessionList {
                     StateFile = $stateFile
                 }
             } catch {
-                Write-Warning "Failed to load session state: $($dir.Name)"
+                Write-Warning "Failed to load session state: $($dir.Name) - $($_.Exception.Message)"
             }
         }
     }
@@ -1641,7 +1729,8 @@ function Show-SessionList {
         Write-Host "│" -ForegroundColor Cyan
 
         if ($session.StartTime) {
-            $startFormatted = ([DateTime]::Parse($session.StartTime)).ToString("yyyy-MM-dd HH:mm:ss")
+            $startParsed = ConvertTo-ScanyxDateTime $session.StartTime
+            $startFormatted = if ($startParsed) { $startParsed.ToString("yyyy-MM-dd HH:mm:ss") } else { "?" }
             Write-Host "│ Started    : " -NoNewline -ForegroundColor Cyan
             Write-Host "$startFormatted" -NoNewline -ForegroundColor White
             Write-Host (" " * (56 - $startFormatted.Length)) -NoNewline
@@ -1660,7 +1749,7 @@ function Show-SessionList {
             Write-Host "│" -ForegroundColor Cyan
         }
 
-        $relativePath = $session.StateFile.Replace($OutputDir, "").TrimStart('\')
+        $relativePath = $session.StateFile.Replace($OutputDir, "").TrimStart([char[]]@('\', '/'))
         # Truncate path if too long
         if ($relativePath.Length -gt 56) {
             $relativePath = "..." + $relativePath.Substring($relativePath.Length - 53)
@@ -1744,6 +1833,8 @@ function Show-ScanyxBanner {
     Write-Host "                   https://github.com/xtormin/Scanyx (v2.8.1)" -ForegroundColor Red
     Write-Host "                           @xtormin (Jennifer Torres)" -ForegroundColor Red
     Write-Host ""
+    Write-Host "  $(Get-EnvironmentLine)" -ForegroundColor DarkGray
+    Write-Host ""
 }
 
 #region Wizard Functions
@@ -1751,7 +1842,8 @@ function Show-ScanyxBanner {
 function Show-WizardHeader {
     param([string]$Title, [int]$Step, [int]$TotalSteps)
 
-    Clear-Host
+    # Clear-Host writes escape codes; skip it when output is redirected (no TTY)
+    if (-not [Console]::IsOutputRedirected) { try { Clear-Host } catch { } }
     Show-ScanyxBanner
     Write-Host "╭─────────────────────────────────────────────────────────────────────────────╮" -ForegroundColor Cyan
     Write-Host "│ INTERACTIVE CONFIGURATION                                                   │" -ForegroundColor Cyan
@@ -2111,7 +2203,7 @@ function Show-WizardSummary {
 function New-CommandString {
     param([hashtable]$Config)
 
-    $cmd = ".\scanyx.ps1"
+    $cmd = Get-InvocationHint
 
     # Scan type or workflow
     if ($Config.Workflow) {
@@ -2473,6 +2565,11 @@ Invoke-Scanyx -Hosts "192.168.1.0/24" -ScanType tcp-full -MaxConcurrent 10
         [Parameter(Mandatory = $false)]
         [switch]$Unprivileged,
 
+        # On Linux/macOS, degrade root-only scans instead of prompting or aborting.
+        # Intended for non-interactive use (CI, cron). Cannot rescue -sU / -sO.
+        [Parameter(Mandatory = $false)]
+        [switch]$AutoUnprivileged,
+
         # Path to custom scan profiles configuration file
         [Parameter(Mandatory = $false)]
         [string]$ConfigFile = "",
@@ -2526,8 +2623,14 @@ $OutputDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPS
 # Validate Nmap installation
 if (-not (Test-NmapInstalled)) {
     Write-Host "[ERROR] Nmap is not installed or not in PATH. Please install Nmap first." -ForegroundColor DarkRed
+    if ($IsLinux -or $IsMacOS) {
+        Write-Host "        macOS: brew install nmap    Debian/Kali: sudo apt-get install -y nmap" -ForegroundColor Yellow
+    }
     return
 }
+
+# Resolve nmap once, up front: background jobs inherit a reduced PATH under sudo
+$nmapExePath = Get-NmapPath
 
 # Load scan configuration (profiles and workflows)
 # When loaded via IEX, $PSScriptRoot and $MyInvocation.MyCommand.Path are $null
@@ -2744,6 +2847,95 @@ if ($Workflow -and $Workflow -ne "") {
 }
 } # End of if (-not $resumingSession)
 
+# Privilege gate (Linux/macOS only - Windows keeps its previous behaviour).
+# nmap needs root for raw sockets, and every stock profile uses -sS or -sU plus -A.
+# Every workflow step is checked up front: aborting on step 3 after 40 minutes is useless.
+if ($IsLinux -or $IsMacOS) {
+    $profilesToCheck = @()
+    if ($Workflow -and $Workflow -ne "" -and $scanWorkflows.ContainsKey($Workflow)) {
+        $stepNum = 0
+        foreach ($step in $scanWorkflows[$Workflow].steps) {
+            $stepNum++
+            $profilesToCheck += @{ Label = "paso $stepNum ('$($step.profile)')"; Profile = $step.profile }
+        }
+    } elseif ($ScanType -and $ScanType -ne "" -and $scanProfiles.ContainsKey($ScanType)) {
+        $profilesToCheck += @{ Label = "perfil '$ScanType'"; Profile = $ScanType }
+    }
+
+    if ($profilesToCheck.Count -gt 0 -and -not (Test-IsElevated)) {
+        $blockingHits = @()
+        $degradableHits = @()
+        foreach ($entry in $profilesToCheck) {
+            $flags = Get-RootRequiredFlags -Command $scanProfiles[$entry.Profile].command
+            if ($flags.Blocking.Count -gt 0) {
+                $blockingHits += @{ Label = $entry.Label; Flags = ($flags.Blocking -join ', ') }
+            } elseif ($flags.Degradable.Count -gt 0) {
+                $degradableHits += @{ Label = $entry.Label; Flags = ($flags.Degradable -join ', ') }
+            }
+        }
+
+        $relaunchTarget = if ($Workflow) { "-Workflow $Workflow" } else { "-ScanType $ScanType" }
+        $relaunch = "sudo $(Get-InvocationHint) $relaunchTarget"
+
+        if ($blockingHits.Count -gt 0) {
+            Write-Host ""
+            foreach ($hit in $blockingHits) {
+                Write-Host "[ERROR] El $($hit.Label) requiere privilegios de root en macOS/Linux (flag: $($hit.Flags))." -ForegroundColor DarkRed
+            }
+            Write-Host "        Ese flag no se puede degradar: nmap no escanea UDP ni protocolos IP sin raw sockets." -ForegroundColor Yellow
+            Write-Host "        Relanza con:  $relaunch`n" -ForegroundColor Yellow
+            return
+        }
+
+        if ($degradableHits.Count -gt 0) {
+            Write-Host ""
+            Write-Host "[WARNING] No tienes privilegios de root y el escaneo los necesita:" -ForegroundColor Yellow
+            foreach ($hit in $degradableHits) {
+                Write-Host "          - $($hit.Label): $($hit.Flags)" -ForegroundColor Yellow
+            }
+
+            $doDegrade = $false
+            if ($Unprivileged -or $AutoUnprivileged) {
+                $doDegrade = $true
+                Write-Host "[INFO] Modo no privilegiado solicitado: se degradan los perfiles." -ForegroundColor Cyan
+            } elseif ([Console]::IsInputRedirected) {
+                Write-Host ""
+                Write-Host "[ERROR] Sin terminal interactiva no se degrada en silencio: cambiaria los resultados." -ForegroundColor DarkRed
+                Write-Host "        Relanza con:       $relaunch" -ForegroundColor Yellow
+                Write-Host "        O acepta degradar: -AutoUnprivileged`n" -ForegroundColor Yellow
+                return
+            } else {
+                Write-Host ""
+                Write-Host "  [1] Degradar a escaneo no privilegiado (-sT, --unprivileged)" -ForegroundColor White
+                Write-Host "      Mas lento y mas ruidoso: deja conexiones completas en el log del objetivo," -ForegroundColor Gray
+                Write-Host "      y se pierden la deteccion de SO (-O) y el traceroute." -ForegroundColor Gray
+                Write-Host "  [2] Abortar y relanzar con sudo (recomendado)" -ForegroundColor White
+                Write-Host ""
+                Write-Host "  Opcion [2]: " -NoNewline -ForegroundColor Cyan
+                $privChoice = Read-Host
+                if ($privChoice -eq "1") {
+                    $doDegrade = $true
+                } else {
+                    Write-Host "`n[INFO] Abortado. Relanza con:  $relaunch`n" -ForegroundColor Yellow
+                    return
+                }
+            }
+
+            if ($doDegrade) {
+                foreach ($profileName in @($profilesToCheck.Profile | Select-Object -Unique)) {
+                    $converted = ConvertTo-UnprivilegedCommand -Command $scanProfiles[$profileName].command
+                    if ($converted) {
+                        $scanProfiles[$profileName].command = $converted
+                        Write-Host "[INFO] $profileName -> $converted" -ForegroundColor DarkGray
+                    }
+                }
+                $Unprivileged = $true
+                Write-Host ""
+            }
+        }
+    }
+}
+
 # Validate that at least one host source is provided
 # Skip this validation if resuming a session
 if (-not $resumingSession) {
@@ -2767,7 +2959,7 @@ if ($SessionName -and $SessionName -ne "") {
 # Create output directories
 if ($isWorkflowMode) {
     # Workflow mode: create workflows base folder
-    $workflowsFolder = "$OutputDir\$Workflow"
+    $workflowsFolder = [IO.Path]::Combine($OutputDir, $Workflow)
     $logsFolder = $workflowsFolder
     try {
         New-Item -Path $workflowsFolder -ItemType Directory -Force -ErrorAction Stop | Out-Null
@@ -2778,8 +2970,8 @@ if ($isWorkflowMode) {
     # Step folders will be created dynamically during workflow execution
 } else {
     # Single scan mode: traditional structure
-    $networksFolder = "$OutputDir\networks"
-    $hostsFolder = "$OutputDir\hosts"
+    $networksFolder = [IO.Path]::Combine($OutputDir, "networks")
+    $hostsFolder = [IO.Path]::Combine($OutputDir, "hosts")
     $logsFolder = $OutputDir
     try {
         New-Item -Path $networksFolder -ItemType Directory -Force -ErrorAction Stop | Out-Null
@@ -2792,9 +2984,9 @@ if ($isWorkflowMode) {
 }
 
 # Define log files
-$logFile = "$logsFolder\scan.log"
-$errorLogFile = "$logsFolder\scan-errors.log"
-$resultsFile = "$logsFolder\scan-results.json"
+$logFile = [IO.Path]::Combine($logsFolder, "scan.log")
+$errorLogFile = [IO.Path]::Combine($logsFolder, "scan-errors.log")
+$resultsFile = [IO.Path]::Combine($logsFolder, "scan-results.json")
 # Note: $stateFile will be defined inside the workflow loop to support per-step state files
 
 # Process target hosts from file and/or command line
@@ -3533,7 +3725,7 @@ if ($hasValidState -and -not $Force) {
             # Archive old state files
             $archiveTimestamp = Get-Date -Format "yyyy-MM-dd_HHmmss"
             if (Test-Path $stateFile) {
-                Move-Item $stateFile "$logsFolder\scan-state_$archiveTimestamp.json" -Force
+                Move-Item $stateFile ([IO.Path]::Combine((Split-Path $stateFile -Parent), "scan-state_$archiveTimestamp.json")) -Force
                 Write-Log -Message "Archived old state file" -Level "INFO" -LogFile $logFile
             }
             # Force mode implies Overwrite mode
@@ -3548,7 +3740,7 @@ if ($hasValidState -and -not $Force) {
         # Archive old state files
         $archiveTimestamp = Get-Date -Format "yyyy-MM-dd_HHmmss"
         if (Test-Path $stateFile) {
-            Move-Item $stateFile "$logsFolder\scan-state_$archiveTimestamp.json" -Force
+            Move-Item $stateFile ([IO.Path]::Combine((Split-Path $stateFile -Parent), "scan-state_$archiveTimestamp.json")) -Force
             Write-Log -Message "Archived old state file (Force mode)" -Level "INFO" -LogFile $logFile
         }
         # Force mode implies Overwrite mode
@@ -3571,7 +3763,7 @@ if ($OverwriteMode -eq "Ask") {
         if ($hostMeta) {
             $hostFolder = $hostMeta.output_folder
             $fileName = "$currentScanType"
-            if ($hostFolder -and (Test-Path "$hostFolder\$fileName.nmap")) {
+            if ($hostFolder -and (Test-Path "$([IO.Path]::Combine($hostFolder, $fileName)).nmap")) {
                 $hostsWithExistingResults++
             }
         }
@@ -3616,7 +3808,12 @@ if (-not (Test-Path $resultsFile)) {
 
 # Ctrl+C handler
 $global:cleanupJobs = @()
-$null = Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action {
+$script:scanCompleted = $false
+$exitSubscriber = Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action {
+    # This fires on ANY exit, not just Ctrl+C, so only claim an interruption
+    # when the scan loop did not reach its end.
+    if ($script:scanCompleted) { return }
+
     Write-Host "`n`n[INFO] Scan interrupted by user (Ctrl+C)" -ForegroundColor Yellow
 
     # Show network summary if available
@@ -3625,8 +3822,13 @@ $null = Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action {
     }
 
     Write-Host "`n[INFO] Cleaning up background jobs..." -ForegroundColor Yellow
-    Get-Job | Stop-Job
-    Get-Job | Remove-Job -Force
+    try {
+        # Only the scan jobs. Removing every job would also remove this handler's
+        # own PSEventJob, and the engine then aborts the process (FailFast) when it
+        # tries to unsubscribe a disposed job while closing the runspace.
+        Get-Job | Where-Object { $_.PSJobTypeName -eq "BackgroundJob" } |
+            Stop-Job -ErrorAction SilentlyContinue
+    } catch { }
 
     Write-Host "[INFO] Cleanup completed. Exiting...`n" -ForegroundColor Yellow
 }
@@ -3672,7 +3874,7 @@ foreach ($currentHost in $hostsToScan) {
 
             if ($scanSuccess) {
                 # Check if host has open ports and update counters
-                $nmapFile = "$($jobData.HostFolder)\$($jobData.FileName).nmap"
+                $nmapFile = "$([IO.Path]::Combine($jobData.HostFolder, $jobData.FileName)).nmap"
 
                 Update-HostState -State $state -TargetHost $jobHost -Status "completed" -Attempts $attempts -ScanFile $nmapFile
                 $completedCount++
@@ -3700,7 +3902,7 @@ foreach ($currentHost in $hostsToScan) {
 
                 # Verbose: Show nmap output after completion
                 if ($VerboseMode) {
-                    $stdoutFile = "$($jobData.HostFolder)\$($jobData.FileName).stdout"
+                    $stdoutFile = "$([IO.Path]::Combine($jobData.HostFolder, $jobData.FileName)).stdout"
                     if (Test-Path $stdoutFile) {
                         $nmapOutput = Get-Content $stdoutFile -Raw
                         if ($nmapOutput) {
@@ -3720,7 +3922,7 @@ foreach ($currentHost in $hostsToScan) {
                     end_time = $jobResult.EndTime
                     duration_seconds = $jobResult.DurationSeconds
                     attempts = $attempts
-                    output_files = @("$($jobData.HostFolder)\$($jobData.FileName).nmap")
+                    output_files = @("$([IO.Path]::Combine($jobData.HostFolder, $jobData.FileName)).nmap")
                 }
             } else {
                 # Check if retry needed
@@ -3737,11 +3939,11 @@ foreach ($currentHost in $hostsToScan) {
 
                     # Verbose: Show retry command
                     if ($VerboseMode) {
-                        $fullNmapCommand = "$($jobData.ScanCommand) -oA `"$($jobData.HostFolder)\$($jobData.FileName)`" $jobHost"
+                        $fullNmapCommand = "$($jobData.ScanCommand) -oA `"$([IO.Path]::Combine($jobData.HostFolder, $jobData.FileName))`" $jobHost"
                         Write-Log -Message "Retry command: $fullNmapCommand" -Level "VERBOSE" -LogFile $logFile
                     }
 
-                    $retryJob = Start-NmapScanJob -TargetHost $jobHost -ScanCommand $jobData.ScanCommand -OutputPath $jobData.HostFolder -FileName $jobData.FileName -Attempts $newAttempts -Unprivileged $Unprivileged
+                    $retryJob = Start-NmapScanJob -TargetHost $jobHost -ScanCommand $jobData.ScanCommand -OutputPath $jobData.HostFolder -FileName $jobData.FileName -Attempts $newAttempts -Unprivileged $Unprivileged -NmapPath $nmapExePath
 
                     $jobQueue[$jobHost] = @{
                         Job = $retryJob
@@ -3807,12 +4009,12 @@ foreach ($currentHost in $hostsToScan) {
 
     # Check if results already exist
     $skipHost = $false
-    if (Test-Path "$hostFolder\$fileName.nmap") {
+    if (Test-Path "$([IO.Path]::Combine($hostFolder, $fileName)).nmap") {
         # If host was in_progress, always overwrite incomplete results
         if ($hostMeta.status -eq "in_progress") {
             Write-Log -Message "Overwriting incomplete scan for $currentHost (was in_progress)" -Level "INFO" -LogFile $logFile
         } else {
-            $existingNmapFile = "$hostFolder\$fileName.nmap"
+            $existingNmapFile = "$([IO.Path]::Combine($hostFolder, $fileName)).nmap"
             switch ($OverwriteMode) {
                 "Skip" {
                     Write-Log -Message "Skipping $currentHost (results already exist)" -Level "INFO" -LogFile $logFile
@@ -3852,11 +4054,11 @@ foreach ($currentHost in $hostsToScan) {
 
     # Verbose: Show full nmap command
     if ($VerboseMode) {
-        $fullNmapCommand = "$currentScanCommand -oA `"$hostFolder\$fileName`" $currentHost"
+        $fullNmapCommand = "$currentScanCommand -oA `"$([IO.Path]::Combine($hostFolder, $fileName))`" $currentHost"
         Write-Log -Message "Command: $fullNmapCommand" -Level "VERBOSE" -LogFile $logFile
     }
 
-    $job = Start-NmapScanJob -TargetHost $currentHost -ScanCommand $currentScanCommand -OutputPath $hostFolder -FileName $fileName -Attempts 1 -Unprivileged $Unprivileged
+    $job = Start-NmapScanJob -TargetHost $currentHost -ScanCommand $currentScanCommand -OutputPath $hostFolder -FileName $fileName -Attempts 1 -Unprivileged $Unprivileged -NmapPath $nmapExePath
 
     $jobQueue[$currentHost] = @{
         Job = $job
@@ -3901,12 +4103,12 @@ while ($jobQueue.Count -gt 0) {
 
         if ($scanSuccess) {
             # Check if host has open ports and update counters
-            $nmapFile = "$($jobData.HostFolder)\$($jobData.FileName).nmap"
+            $nmapFile = "$([IO.Path]::Combine($jobData.HostFolder, $jobData.FileName)).nmap"
 
             Update-HostState -State $state -TargetHost $jobHost -Status "completed" -Attempts $attempts -ScanFile $nmapFile
             $completedCount++
             Write-Log -Message "Scan completed: $jobHost | $currentScanType | Attempt: $attempts | Duration: $($jobResult.Duration)" -Level "SUCCESS" -LogFile $logFile
-            if (Test-HostHasOpenPorts -NmapFilePath $nmapFile) {
+            if (Test-HostHasOpenPorts -XmlFile $nmapFile) {
                 $aliveHostsCount++
                 $hostCIDR = $state.hosts[$jobHost].source_cidr
                 if ($hostCIDR -and $script:networkProgress.ContainsKey($hostCIDR)) {
@@ -3922,7 +4124,7 @@ while ($jobQueue.Count -gt 0) {
 
             # Verbose: Show nmap output after completion
             if ($VerboseMode) {
-                $stdoutFile = "$($jobData.HostFolder)\$($jobData.FileName).stdout"
+                $stdoutFile = "$([IO.Path]::Combine($jobData.HostFolder, $jobData.FileName)).stdout"
                 if (Test-Path $stdoutFile) {
                     $nmapOutput = Get-Content $stdoutFile -Raw
                     if ($nmapOutput) {
@@ -3941,7 +4143,7 @@ while ($jobQueue.Count -gt 0) {
                 end_time = $jobResult.EndTime
                 duration_seconds = $jobResult.DurationSeconds
                 attempts = $attempts
-                output_files = @("$($jobData.HostFolder)\$($jobData.FileName).nmap")
+                output_files = @("$([IO.Path]::Combine($jobData.HostFolder, $jobData.FileName)).nmap")
             }
         } else {
             if ($attempts -lt ($MaxRetries + 1)) {
@@ -3956,11 +4158,11 @@ while ($jobQueue.Count -gt 0) {
 
                 # Verbose: Show retry command
                 if ($VerboseMode) {
-                    $fullNmapCommand = "$($jobData.ScanCommand) -oA `"$($jobData.HostFolder)\$($jobData.FileName)`" $jobHost"
+                    $fullNmapCommand = "$($jobData.ScanCommand) -oA `"$([IO.Path]::Combine($jobData.HostFolder, $jobData.FileName))`" $jobHost"
                     Write-Log -Message "Retry command: $fullNmapCommand" -Level "VERBOSE" -LogFile $logFile
                 }
 
-                $retryJob = Start-NmapScanJob -TargetHost $jobHost -ScanCommand $jobData.ScanCommand -OutputPath $jobData.HostFolder -FileName $jobData.FileName -Attempts $newAttempts -Unprivileged $Unprivileged
+                $retryJob = Start-NmapScanJob -TargetHost $jobHost -ScanCommand $jobData.ScanCommand -OutputPath $jobData.HostFolder -FileName $jobData.FileName -Attempts $newAttempts -Unprivileged $Unprivileged -NmapPath $nmapExePath
 
                 $jobQueue[$jobHost] = @{
                     Job = $retryJob
@@ -4157,9 +4359,9 @@ Write-Host ")" -ForegroundColor DarkGray
 # Output directory info
 Write-Host "📁 Output   : " -NoNewline -ForegroundColor Cyan
 if ($isWorkflowMode) {
-    Write-Host "$OutputDir\$Workflow\" -ForegroundColor White
+    Write-Host "$([IO.Path]::Combine($OutputDir, $Workflow))$([IO.Path]::DirectorySeparatorChar)" -ForegroundColor White
 } else {
-    Write-Host "$OutputDir\" -ForegroundColor White
+    Write-Host "$OutputDir$([IO.Path]::DirectorySeparatorChar)" -ForegroundColor White
 }
 
 Write-Host ""
@@ -4251,9 +4453,9 @@ Write-Log -Message "Scan session completed | Total: $($validHosts.Count) | Norma
 if ($failedCount -gt 0) {
     Write-Host "[INFO] To retry failed hosts, run:" -ForegroundColor Yellow
     if ($isWorkflowMode) {
-        Write-Host "  .\scanyx.ps1 -HostFile $HostFile -Workflow $Workflow -RetryFailed`n" -ForegroundColor Yellow
+        Write-Host "  $(Get-InvocationHint) -HostFile $HostFile -Workflow $Workflow -RetryFailed`n" -ForegroundColor Yellow
     } else {
-        Write-Host "  .\scanyx.ps1 -HostFile $HostFile -ScanType $ScanType -RetryFailed`n" -ForegroundColor Yellow
+        Write-Host "  $(Get-InvocationHint) -HostFile $HostFile -ScanType $ScanType -RetryFailed`n" -ForegroundColor Yellow
     }
 }
 
@@ -4263,7 +4465,7 @@ Write-Host "🚀 Next Steps" -ForegroundColor Cyan
 Write-Host "   To analyze and merge scan results, you can use XtremeNmapParser (XNP):" -ForegroundColor White
 Write-Host ""
 if ($isWorkflowMode) {
-    Write-Host "   python3 xnp.py -d `"$OutputDir\$Workflow`" -M -R --open -C all" -ForegroundColor Yellow
+    Write-Host "   python3 xnp.py -d `"$([IO.Path]::Combine($OutputDir, $Workflow))`" -M -R --open -C all" -ForegroundColor Yellow
 } else {
     Write-Host "   python3 xnp.py -d `"$OutputDir`" -M -R --open -C all" -ForegroundColor Yellow
 }
@@ -4292,6 +4494,14 @@ if ($isWorkflowMode) {
     Write-Host "  All $($workflowSteps.Count) steps finished" -ForegroundColor Green
     Write-Host "========================================`n" -ForegroundColor Green
     Write-Log -Message "Workflow completed: $Workflow" -Level "SUCCESS" -LogFile $logFile
+}
+
+# Normal completion: stop the exiting handler from firing and reporting an
+# interruption that never happened.
+$script:scanCompleted = $true
+if ($exitSubscriber) {
+    Unregister-Event -SubscriptionId $exitSubscriber.Id -ErrorAction SilentlyContinue
+    Remove-Job -Job $exitSubscriber -Force -ErrorAction SilentlyContinue
 }
 
 #endregion

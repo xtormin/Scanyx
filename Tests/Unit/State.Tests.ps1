@@ -3,7 +3,7 @@
 
 BeforeAll {
     # Load the main script
-    . $PSScriptRoot\..\..\scanyx.ps1
+    . ([IO.Path]::Combine($PSScriptRoot, '..', '..', 'scanyx.ps1'))
 }
 
 Describe "Save-StateFile" -Tag "Unit", "State" {
@@ -59,7 +59,7 @@ Describe "Save-StateFile" -Tag "Unit", "State" {
         }
 
         It "Creates parent directory if needed" {
-            $deepPath = Join-Path $TestDrive "deep\nested\path\state.json"
+            $deepPath = [IO.Path]::Combine($TestDrive, "deep", "nested", "path", "state.json")
             $testState = @{ "test" = "value" }
 
             Save-StateFile -StateFile $deepPath -State $testState
@@ -238,6 +238,47 @@ Describe "Get-OutputFolder" -Tag "Unit", "State" {
         It "Handles special characters in scan type" {
             $result = Get-OutputFolder -BaseDir $TestDrive -TargetHost "192.168.1.1" -ScanType "custom-scan"
             $result | Should -Not -BeNullOrEmpty
+        }
+    }
+}
+
+Describe "Cross-platform paths" -Tag "Unit", "State", "CrossPlatform" {
+    Context "Get-OutputFolder uses the native separator" {
+        It "Never emits a backslash on Unix (single scan, from CIDR)" -Skip:($null -eq $IsLinux -or -not ($IsLinux -or $IsMacOS)) {
+            $result = Get-OutputFolder -BaseDir "/tmp/scanyx" -TargetHost "10.0.0.5" -SourceCIDR "10.0.0.0/24"
+            $result | Should -Not -Match '\\'
+            $result | Should -Match 'networks'
+        }
+
+        It "Never emits a backslash on Unix (single scan, individual host)" -Skip:($null -eq $IsLinux -or -not ($IsLinux -or $IsMacOS)) {
+            $result = Get-OutputFolder -BaseDir "/tmp/scanyx" -TargetHost "10.0.0.5"
+            $result | Should -Not -Match '\\'
+            $result | Should -Match 'hosts'
+        }
+
+        It "Never emits a backslash on Unix (workflow mode)" -Skip:($null -eq $IsLinux -or -not ($IsLinux -or $IsMacOS)) {
+            $result = Get-OutputFolder -BaseDir "/tmp/scanyx" -TargetHost "10.0.0.5" `
+                        -WorkflowName "full-discovery" -WorkflowStep 1 -StepProfile "tcp-1000"
+            $result | Should -Not -Match '\\'
+            $result | Should -Match 'S1-tcp-1000'
+        }
+
+        It "Uses the platform separator in every mode" {
+            $sep = [IO.Path]::DirectorySeparatorChar
+            $paths = @(
+                (Get-OutputFolder -BaseDir $TestDrive -TargetHost "10.0.0.5" -SourceCIDR "10.0.0.0/24"),
+                (Get-OutputFolder -BaseDir $TestDrive -TargetHost "10.0.0.5"),
+                (Get-OutputFolder -BaseDir $TestDrive -TargetHost "10.0.0.5" -ScanType "tcp-1000"),
+                (Get-OutputFolder -BaseDir $TestDrive -TargetHost "10.0.0.5" -WorkflowName "wf" -WorkflowStep 2 -StepProfile "tcp-full")
+            )
+            foreach ($path in $paths) {
+                $path | Should -BeLike "*$sep*"
+            }
+        }
+
+        It "Replaces the CIDR slash so it does not become a directory level" {
+            $result = Get-OutputFolder -BaseDir $TestDrive -TargetHost "10.0.0.5" -SourceCIDR "10.0.0.0/24"
+            $result | Should -Match '10\.0\.0\.0-24'
         }
     }
 }

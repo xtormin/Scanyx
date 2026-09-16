@@ -177,12 +177,12 @@ function New-MockScanProfiles {
             "tcp-test" = @{
                 name = "TCP Test Scan"
                 description = "Test profile for unit tests"
-                args = "-sT -p 80,443 -T4"
+                command = "-sT -p 80,443 -T4"
             }
             "udp-test" = @{
                 name = "UDP Test Scan"
                 description = "UDP test profile"
-                args = "-sU -p 53,161 -T4"
+                command = "-sU -p 53,161 -T4"
             }
         }
         workflows = @{
@@ -235,7 +235,7 @@ function New-MockSessionStructure {
         [string]$SessionName
     )
 
-    $sessionDir = Join-Path $BaseDir ".sessions\$SessionName"
+    $sessionDir = [IO.Path]::Combine($BaseDir, ".sessions", $SessionName)
     New-Item -ItemType Directory -Path $sessionDir -Force | Out-Null
 
     # Create mock state file
@@ -252,7 +252,9 @@ function New-MockSessionStructure {
     return $sessionDir
 }
 
-# Export functions
+# Export functions (only meaningful when imported as a module; this file is
+# normally dot-sourced from a test, where Export-ModuleMember would throw)
+if ($ExecutionContext.SessionState.Module) {
 Export-ModuleMember -Function @(
     'New-MockNmapXml',
     'Mock-NmapCommand',
@@ -261,3 +263,4 @@ Export-ModuleMember -Function @(
     'New-MockHostsFile',
     'New-MockSessionStructure'
 )
+}

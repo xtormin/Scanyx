@@ -3,7 +3,7 @@
 
 BeforeAll {
     # Load the main script
-    . $PSScriptRoot\..\..\scanyx.ps1
+    . ([IO.Path]::Combine($PSScriptRoot, '..', '..', 'scanyx.ps1'))
 }
 
 Describe "Test-HostHasOpenPorts" -Tag "Unit", "Results" {
