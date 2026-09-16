@@ -190,6 +190,8 @@ resultados a tu usuario al terminar, para no dejarte ficheros de root en el home
 
 - **PowerShell**: 5.1 o superior en Windows; **7.2 o superior** en macOS y Linux
   (en 6.x `Start-Job` es inestable, así que el lanzador lo rechaza)
+  - macOS: `brew install powershell` (es una fórmula, no un cask: no pide contraseña)
+  - Debian/Kali: `sudo apt-get install -y powershell`, o el tarball oficial en ARM64
 - **Nmap**: Instalado y en PATH ([descargar](https://nmap.org/download.html))
 - **En macOS/Linux**: privilegios de root para los perfiles de serie (ver
   [Privilegios](#privilegios))

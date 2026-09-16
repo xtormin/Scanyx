@@ -162,18 +162,58 @@ install_pwsh_tarball() {
     return $rc
 }
 
+install_pwsh_tarball_macos() {
+    # User-local install: no sudo, no .pkg, nothing outside $HOME.
+    local rid="$1" dest="$HOME/.local/share/powershell/7"
+    if [ -z "$rid" ]; then
+        err "Arquitectura no soportada para el tarball de PowerShell: $ARCH"
+        return 1
+    fi
+    local url="https://github.com/PowerShell/PowerShell/releases/download/v${PWSH_TARBALL_VERSION}/powershell-${PWSH_TARBALL_VERSION}-${rid}.tar.gz"
+    info "Descargando PowerShell ${PWSH_TARBALL_VERSION} (${rid})"
+    dim "  $url"
+    local tmp; tmp="$(mktemp -d)" || return 1
+    if ! curl -fsSL "$url" -o "$tmp/pwsh.tar.gz"; then
+        err "No se pudo descargar el tarball de PowerShell."
+        rm -rf "$tmp"; return 1
+    fi
+    mkdir -p "$dest" && tar zxf "$tmp/pwsh.tar.gz" -C "$dest" && chmod +x "$dest/pwsh"
+    local rc=$?
+    rm -rf "$tmp"
+    [ $rc -ne 0 ] && return $rc
+
+    mkdir -p "$HOME/.local/bin" && ln -sf "$dest/pwsh" "$HOME/.local/bin/pwsh"
+    if ! have pwsh; then
+        PATH="$HOME/.local/bin:$PATH"
+        export PATH
+        warn "pwsh instalado en $HOME/.local/bin, que no esta en tu PATH."
+        dim "  Anade esto a tu ~/.zshrc:  export PATH=\"\$HOME/.local/bin:\$PATH\""
+    fi
+    return 0
+}
+
 install_pwsh() {
     if [ "$OS" = "Darwin" ]; then
         if have brew; then
-            info "Instalando PowerShell con Homebrew (te pedira la contrasena para el .pkg)"
-            brew install --cask powershell
-            return $?
+            # PowerShell moved from a cask to a core formula. Probe instead of
+            # assuming: the formula needs no password, the old cask does.
+            if brew info --formula powershell >/dev/null 2>&1; then
+                info "Instalando PowerShell con Homebrew (formula)"
+                brew install powershell && return 0
+            elif brew info --cask powershell >/dev/null 2>&1; then
+                info "Instalando PowerShell con Homebrew (cask; te pedira la contrasena para el .pkg)"
+                brew install --cask powershell && return 0
+            else
+                warn "Homebrew no conoce ningun paquete llamado powershell."
+            fi
+            warn "La instalacion con Homebrew fallo; probando el tarball oficial"
+        else
+            warn "Homebrew no esta instalado."
+            dim "  Instalalo desde https://brew.sh y vuelve a ejecutar --install,"
+            dim "  o deja que Scanyx use el tarball oficial de Microsoft."
         fi
-        err "Homebrew no esta instalado y PowerShell en macOS se instala como .pkg."
-        dim "  Instala Homebrew: https://brew.sh   luego: brew install --cask powershell"
-        dim "  O baja el .pkg:   https://github.com/PowerShell/PowerShell/releases/latest"
-        dim "  (para $ARCH necesitas el paquete ${PWSH_RID_OSX})"
-        return 1
+        install_pwsh_tarball_macos "$PWSH_RID_OSX"
+        return $?
     fi
 
     if is_debian_like; then
@@ -254,7 +294,7 @@ ensure_deps() {
         else
             missing=1
             if [ "$OS" = "Darwin" ]; then
-                dim "  Manual: brew install --cask powershell"
+                dim "  Manual: brew install powershell"
             else
                 dim "  Manual: sudo apt-get install -y powershell   (o usa --install para el tarball)"
             fi
@@ -299,6 +339,14 @@ fi
 if ! ensure_deps; then
     err "No se puede continuar sin las dependencias."
     exit 2
+fi
+
+# "--install" with nothing else to do is a request to install, not to scan.
+if [ "$MODE_INSTALL" = "yes" ] && [ "${#FORWARD[@]}" -eq 0 ]; then
+    print_check
+    ok "Todo listo. Lanza un escaneo, por ejemplo:"
+    dim "  ./scanyx.sh -Hosts 127.0.0.1 -ScanType tcp-100"
+    exit 0
 fi
 
 # Re-exec under sudo only when explicitly asked. Scanyx's own privilege gate
