@@ -339,6 +339,313 @@ function Format-CommandForDisplay {
     return $out
 }
 
+#region Command-list mode
+
+# One token of an nmap command line. Shared by the parser and the job so that
+# what the pre-flight shows and what nmap receives come from the same split.
+$Global:ScanyxCommandTokenRegex = [regex]'(?:[^\s"'']+|"[^"]*"|''[^'']*'')+'
+
+function Split-NmapCommandLine {
+    # Tokenise a command line the same way the scan job does, so the parser
+    # and the executor can never disagree about where the arguments are.
+    param([string]$Command)
+
+    if ([string]::IsNullOrWhiteSpace($Command)) { return @() }
+    return @($Global:ScanyxCommandTokenRegex.Matches($Command) |
+             ForEach-Object { $_.Value.Trim('"').Trim("'") })
+}
+
+function Get-CommandUnitId {
+    # Content-addressed identity: reordering the list must not lose progress,
+    # and editing a line must make it a new unit so it runs again.
+    # The label prefix keeps the id readable in the progress bar and the log
+    # while staying valid as both a folder name and a JSON property name.
+    param(
+        [string]$Command,
+        [string]$Label = ""
+    )
+
+    $normalised = ($Command -replace '\s+', ' ').Trim()
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($normalised))
+    } finally {
+        $sha.Dispose()
+    }
+    $hash = -join ($bytes[0..3] | ForEach-Object { $_.ToString('x2') })
+
+    $slug = $Label -replace '[^A-Za-z0-9._-]', '-'
+    $slug = ($slug -replace '-+', '-').Trim('-')
+    if ($slug.Length -gt 40) { $slug = $slug.Substring(0, 40).Trim('-') }
+
+    if ([string]::IsNullOrWhiteSpace($slug)) { return $hash }
+    return "$slug-$hash"
+}
+
+function Test-LooksLikeTarget {
+    # Good enough to flag a line whose last token is clearly not a target.
+    # Deliberately permissive: nmap accepts far more than we want to model.
+    param([string]$Token)
+
+    if ([string]::IsNullOrWhiteSpace($Token)) { return $false }
+    if ($Token.StartsWith('-')) { return $false }
+    if ($Token -match '^\d{1,3}(\.\d{1,3}){3}(/\d{1,2})?$') { return $true }   # IPv4 / CIDR
+    if ($Token -match '^\d{1,3}(\.\d{1,3}){0,2}\.[\d,\-]+$')  { return $true } # 10.0.0.1-20
+    if ($Token -match '^[A-Za-z0-9]([A-Za-z0-9\-\.]*[A-Za-z0-9])?$') { return $true } # hostname
+    if ($Token -match '^[0-9a-fA-F:]+$' -and $Token.Contains(':')) { return $true }   # IPv6
+    return $false
+}
+
+function ConvertFrom-NmapCommandLine {
+    # Parse one line of a command list into a unit of work.
+    # Returns a hashtable even for rejected lines: the caller reports them
+    # rather than silently dropping work the consultant asked for.
+    param(
+        [string]$Line,
+        [int]$LineNumber = 0,
+        [string]$BaseDirectory = ".",
+        # Where to put output for a line that names no output file of its own
+        [string]$FallbackOutputDir = ""
+    )
+
+    $unit = @{
+        LineNumber = $LineNumber
+        Raw        = $Line
+        Command    = ""
+        Label      = ""
+        Target     = ""
+        OutputFlag = $null
+        OutputBase = $null
+        ResultFile = $null
+        ExecCommand = ""
+        Id         = ""
+        Errors     = @()
+        Warnings   = @()
+    }
+
+    # A trailing "#" comment is the label. Splitting on the first "#" is safe
+    # because nmap has no argument in which "#" is meaningful.
+    $text = $Line
+    $hashIndex = $text.IndexOf('#')
+    if ($hashIndex -ge 0) {
+        $unit.Label = $text.Substring($hashIndex + 1).Trim()
+        $text = $text.Substring(0, $hashIndex)
+    }
+    $text = $text.Trim()
+    $unit.Command = $text
+
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        $unit.Errors += "Empty command"
+        return $unit
+    }
+
+    # We exec argv directly with no shell, so a shell operator would silently
+    # reach nmap as a bogus argument instead of doing what the author meant.
+    if ($text -match '[;&|`<>]' -or $text -match '\$\(') {
+        $unit.Errors += "Shell metacharacters are not supported (the command is executed directly, without a shell)"
+        return $unit
+    }
+
+    $tokens = Split-NmapCommandLine -Command $text
+    if ($tokens.Count -eq 0) {
+        $unit.Errors += "Empty command"
+        return $unit
+    }
+
+    $first = $tokens[0]
+    $firstLeaf = ($first -split '[/\\]')[-1]
+    if ($firstLeaf -ne 'nmap' -and $firstLeaf -ne 'nmap.exe') {
+        $unit.Errors += "Line must start with nmap (found '$first')"
+        return $unit
+    }
+
+    $rest = @($tokens | Select-Object -Skip 1)
+
+    # Output flags. nmap refuses -oA together with another -oA or with
+    # -oN/-oX/-oG, so we must detect the author's choice and never add ours.
+    $outputFlags = @('-oA', '-oN', '-oX', '-oG', '-oS')
+    $found = @()
+    for ($i = 0; $i -lt $rest.Count; $i++) {
+        if ($outputFlags -contains $rest[$i]) {
+            if ($i + 1 -lt $rest.Count) {
+                $found += @{ Flag = $rest[$i]; Value = $rest[$i + 1] }
+            } else {
+                $unit.Errors += "$($rest[$i]) has no value"
+            }
+        }
+    }
+
+    if ($found.Count -gt 1) {
+        $flagNames = ($found | ForEach-Object { $_.Flag }) -join ', '
+        if (($found | Where-Object { $_.Flag -eq '-oA' })) {
+            $unit.Errors += "nmap rejects -oA combined with other output flags ($flagNames)"
+            return $unit
+        }
+        $unit.Warnings += "Several output flags ($flagNames); using $($found[0].Flag) to detect open ports"
+    }
+
+    if ($found.Count -ge 1) {
+        $unit.OutputFlag = $found[0].Flag
+        # Relative paths must be pinned here: a background job does not
+        # reliably inherit the working directory across PowerShell hosts.
+        $raw = $found[0].Value
+        $unit.OutputBase = if ([IO.Path]::IsPathRooted($raw)) {
+            [IO.Path]::GetFullPath($raw)
+        } else {
+            [IO.Path]::GetFullPath([IO.Path]::Combine($BaseDirectory, $raw))
+        }
+
+        $unit.ResultFile = switch ($unit.OutputFlag) {
+            '-oA' { "$($unit.OutputBase).nmap" }
+            default { $unit.OutputBase }
+        }
+
+        # The line keeps its relative path for display and identity, but what
+        # we execute carries the absolute one: a background job does not
+        # reliably inherit the working directory across PowerShell hosts, and
+        # nmap would otherwise write somewhere we never look.
+        $execTokens = @()
+        $replaceNext = $false
+        foreach ($tok in $tokens) {
+            if ($replaceNext) {
+                $execTokens += $unit.OutputBase
+                $replaceNext = $false
+                continue
+            }
+            $execTokens += $tok
+            if ($tok -eq $unit.OutputFlag) { $replaceNext = $true }
+        }
+        $unit.ExecCommand = ($execTokens -join ' ')
+
+        if ($unit.OutputFlag -eq '-oG') {
+            $unit.Warnings += "Grepable-only output: open-port detection is less reliable than with -oA"
+        }
+    }
+
+    # Target: the last token that is not a flag and not a flag's value. Cheap
+    # and correct for the "flags first, target last" convention; when it is
+    # wrong we only lose a display name, never correctness of the scan.
+    $last = $rest[-1]
+    if (Test-LooksLikeTarget -Token $last) {
+        $isValueOfFlag = $rest.Count -ge 2 -and $rest[-2].StartsWith('-')
+        if ($isValueOfFlag) {
+            $unit.Warnings += "Could not identify the target: last token '$last' looks like a value for $($rest[-2])"
+        } else {
+            $unit.Target = $last
+        }
+    } else {
+        $unit.Warnings += "Could not identify the target from the last token ('$last')"
+    }
+
+    if ($rest -contains '-iL' -or $rest -contains '-iR') {
+        $unit.Warnings += "Targets come from -iL/-iR, so this unit covers more than one host"
+    }
+
+    if ([string]::IsNullOrWhiteSpace($unit.Label)) {
+        $unit.Label = if ($unit.Target) { $unit.Target } else { "line$LineNumber" }
+    }
+
+    # Identity comes from the line as written, so it stays stable no matter
+    # where the output ends up.
+    $unit.Id = Get-CommandUnitId -Command $unit.Command -Label $unit.Label
+
+    if ([string]::IsNullOrWhiteSpace($unit.ExecCommand)) {
+        if ($FallbackOutputDir) {
+            # No output flag: give the line one, or nmap writes nothing to disk
+            # and there is no result to track, resume from, or test for open ports.
+            $unit.OutputBase = [IO.Path]::Combine($FallbackOutputDir, $unit.Id, "scan")
+            $unit.OutputFlag = '-oA'
+            $unit.ResultFile = "$($unit.OutputBase).nmap"
+            $unit.ExecCommand = "$($unit.Command) -oA $($unit.OutputBase)"
+        } else {
+            $unit.ExecCommand = $unit.Command
+        }
+    }
+    return $unit
+}
+
+function Test-NmapOutputMatchesCommand {
+    # nmap records its own argv in the first line of .nmap output. Comparing it
+    # is what makes "already scanned" mean "already scanned with this exact
+    # command", so editing a line re-runs it even though the previous version
+    # wrote to the same -oA path.
+    param(
+        [string]$ResultFile,
+        [string]$Command
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ResultFile) -or -not (Test-Path $ResultFile)) { return $false }
+
+    try {
+        $firstLine = Get-Content $ResultFile -TotalCount 1 -ErrorAction Stop
+    } catch { return $false }
+
+    if (-not $firstLine -or $firstLine -notmatch '\sas:\s+(.*)$') { return $false }
+    $recorded = $Matches[1].Trim()
+
+    # Drop the executable from both sides: the recorded one is a resolved path.
+    $stripExe = {
+        param($c)
+        $t = @(Split-NmapCommandLine -Command $c)
+        if ($t.Count -le 1) { return "" }
+        return (($t | Select-Object -Skip 1) -join ' ')
+    }
+
+    return ((& $stripExe $recorded) -eq (& $stripExe $Command))
+}
+
+function Read-CommandList {
+    # Turn the consultant's list into units of work, reporting every problem
+    # up front instead of failing halfway through a long run.
+    param(
+        [string[]]$Lines,
+        [string]$BaseDirectory = ".",
+        [string]$FallbackOutputDir = ""
+    )
+
+    $units = @()
+    $rejected = @()
+    $lineNumber = 0
+
+    foreach ($line in $Lines) {
+        $lineNumber++
+        $trimmed = $line.Trim()
+        if ([string]::IsNullOrWhiteSpace($trimmed)) { continue }
+        if ($trimmed.StartsWith('#')) { continue }   # whole-line comment
+
+        $unit = ConvertFrom-NmapCommandLine -Line $line -LineNumber $lineNumber -BaseDirectory $BaseDirectory -FallbackOutputDir $FallbackOutputDir
+        if ($unit.Errors.Count -gt 0) { $rejected += $unit } else { $units += $unit }
+    }
+
+    # Two lines writing to the same place would clobber each other, and a
+    # duplicate line is wasted scanning time. Both are worth saying out loud.
+    $seenId = @{}
+    $seenOutput = @{}
+    foreach ($u in $units) {
+        if ($seenId.ContainsKey($u.Id)) {
+            $u.Warnings += "Duplicate of line $($seenId[$u.Id])"
+        } else {
+            $seenId[$u.Id] = $u.LineNumber
+        }
+
+        if ($u.OutputBase) {
+            $key = $u.OutputBase.ToLowerInvariant()
+            if ($seenOutput.ContainsKey($key)) {
+                $u.Warnings += "Writes to the same output path as line $($seenOutput[$key])"
+            } else {
+                $seenOutput[$key] = $u.LineNumber
+            }
+        }
+    }
+
+    return @{
+        Units    = @($units)
+        Rejected = @($rejected)
+    }
+}
+
+#endregion
+
 function Get-InvocationHint {
     # How the user launches Scanyx on this platform, for copy-paste hints.
     # $IsLinux/$IsMacOS do not exist on Windows PowerShell 5.1 (they are $null there).
@@ -855,6 +1162,14 @@ function Update-HostState {
         if ($existingHost.scan_type) { $hostState.scan_type = $existingHost.scan_type }
         if ($existingHost.timing) { $hostState.timing = $existingHost.timing }
         if ($existingHost.scripts) { $hostState.scripts = $existingHost.scripts }
+        # Command-list mode: without these the unit would lose the very command
+        # it is supposed to run on its first state transition.
+        if ($existingHost.command) { $hostState.command = $existingHost.command }
+        if ($existingHost.exec_command) { $hostState.exec_command = $existingHost.exec_command }
+        if ($existingHost.label) { $hostState.label = $existingHost.label }
+        if ($existingHost.line_number) { $hostState.line_number = $existingHost.line_number }
+        if ($existingHost.result_file) { $hostState.result_file = $existingHost.result_file }
+        if ($existingHost.target) { $hostState.target = $existingHost.target }
     }
 
     # Add or update scan file
@@ -922,6 +1237,9 @@ function Test-HostHasOpenPorts {
         if ($content -match '<\?xml' -or $content -match '<nmaprun') {
             # XML format: <state state="open"/>
             return $content -match '<state\s+state="open"'
+        } elseif ($content -match '^# Nmap .* scan initiated' -and $content -match '\tPorts:') {
+            # Grepable format: "Ports: 53/open/tcp//domain///"
+            return $content -match '\d+/open/(tcp|udp)'
         } else {
             # Plain text .nmap format: "22/tcp   open  ssh"
             return $content -match "\d+/(tcp|udp)\s+open"
@@ -1445,7 +1763,7 @@ function Load-ScanConfiguration {
 
 # Global ScriptBlock for nmap scan jobs (reusable across retry and initial scans)
 $Global:NmapScanScriptBlock = {
-    param($TargetHost, $ScanCommand, $OutputPath, $FileName, $Attempts, $Unprivileged, $NmapPath)
+    param($TargetHost, $ScanCommand, $OutputPath, $FileName, $Attempts, $Unprivileged, $NmapPath, $Verbatim, $ResultFile)
 
     $startTime = Get-Date
 
@@ -1472,10 +1790,14 @@ $Global:NmapScanScriptBlock = {
         $nmapArgs += "--unprivileged"
     }
 
-    # Add output and target. Never quote here: each ArgumentList element is
-    # passed to the process verbatim, so quotes would end up inside the filename.
+    # Command-list mode: the author's line already carries its own output flag
+    # and target, and nmap refuses a second -oA, so add nothing.
     $outputFullPath = [IO.Path]::Combine($OutputPath, $FileName)
-    $nmapArgs += @("-oA", $outputFullPath, $TargetHost)
+    if (-not $Verbatim) {
+        # Never quote here: each argv element is passed to the process verbatim,
+        # so quotes would end up inside the filename.
+        $nmapArgs += @("-oA", $outputFullPath, $TargetHost)
+    }
 
     # Use the resolved nmap path: under sudo, secure_path hides Homebrew's bin
     $nmapExe = if ($NmapPath) { $NmapPath } else { "nmap" }
@@ -1508,7 +1830,8 @@ $Global:NmapScanScriptBlock = {
         }
 
         # Verify that nmap actually created output files
-        $nmapFileExists = Test-Path "$outputFullPath.nmap"
+        $expectedOutput = if ($Verbatim) { $ResultFile } else { "$outputFullPath.nmap" }
+        $nmapFileExists = if ($expectedOutput) { Test-Path $expectedOutput } else { $exitCode -eq 0 }
         $exitCodeOk = $exitCode -eq 0
 
         # Success only if exit code is 0 AND .nmap file exists
@@ -1557,10 +1880,12 @@ function Start-NmapScanJob {
         [string]$FileName,
         [int]$Attempts,
         [bool]$Unprivileged,
-        [string]$NmapPath = "nmap"
+        [string]$NmapPath = "nmap",
+        [bool]$Verbatim = $false,
+        [string]$ResultFile = ""
     )
 
-    return Start-Job -ScriptBlock $Global:NmapScanScriptBlock -ArgumentList $TargetHost, $ScanCommand, $OutputPath, $FileName, $Attempts, $Unprivileged, $NmapPath
+    return Start-Job -ScriptBlock $Global:NmapScanScriptBlock -ArgumentList $TargetHost, $ScanCommand, $OutputPath, $FileName, $Attempts, $Unprivileged, $NmapPath, $Verbatim, $ResultFile
 }
 
 function Test-SessionName {
@@ -2616,6 +2941,20 @@ Invoke-Scanyx -Hosts "192.168.1.0/24" -ScanType tcp-full -MaxConcurrent 10
         [Parameter(Mandatory = $false)]
         [switch]$Yes,
 
+        # A file of complete nmap command lines, one per line, written by the
+        # consultant. Scanyx runs them with its own tracking, retries, state
+        # and resume instead of replacing them with a profile.
+        [Parameter(Mandatory = $false, ParameterSetName = 'CommandList')]
+        [string]$CommandFile = "",
+
+        # The same, inline
+        [Parameter(Mandatory = $false, ParameterSetName = 'CommandList')]
+        [string[]]$Commands = @(),
+
+        # Parse the list and show each unit with its state, without scanning
+        [Parameter(Mandatory = $false, ParameterSetName = 'CommandList')]
+        [switch]$ListCommands,
+
         # Path to custom scan profiles configuration file
         [Parameter(Mandatory = $false)]
         [string]$ConfigFile = "",
@@ -2830,9 +3169,67 @@ if ($ResumeSession -and $ResumeSession -ne "") {
     Write-Host "[INFO] Session loaded successfully" -ForegroundColor Green
 }
 
+# ---------------------------------------------------------------------------
+# Command-list mode: the unit of work is a line the consultant already wrote,
+# not a target plus a profile. Everything downstream (state, resume, sessions,
+# retries, summary) is the same engine.
+# ---------------------------------------------------------------------------
+$isCommandMode = ($CommandFile -and $CommandFile -ne "") -or ($Commands.Count -gt 0)
+$commandUnits = @()
+
+if ($isCommandMode) {
+    $conflicting = @()
+    if ($ScanType -and $ScanType -ne "")   { $conflicting += "-ScanType" }
+    if ($Workflow -and $Workflow -ne "")   { $conflicting += "-Workflow" }
+    if ($HostFile -and $HostFile -ne "")   { $conflicting += "-HostFile" }
+    if ($Hosts.Count -gt 0)                { $conflicting += "-Hosts" }
+    if ($SensitiveFile -and $SensitiveFile -ne "") { $conflicting += "-SensitiveFile" }
+    if ($SensitiveHosts.Count -gt 0)       { $conflicting += "-SensitiveHosts" }
+    if ($conflicting.Count -gt 0) {
+        Write-Host "[ERROR] $($conflicting -join ', ') cannot be combined with -CommandFile/-Commands." -ForegroundColor DarkRed
+        Write-Host "        In command-list mode each line already carries its own target and flags." -ForegroundColor Yellow
+        return
+    }
+
+    $listLines = @()
+    if ($CommandFile -and $CommandFile -ne "") {
+        if (-not (Test-Path $CommandFile)) {
+            Write-Host "[ERROR] Command file not found: $CommandFile" -ForegroundColor DarkRed
+            return
+        }
+        $listLines += Get-Content $CommandFile
+    }
+    if ($Commands.Count -gt 0) { $listLines += $Commands }
+
+    # Relative -oA paths resolve against the invocation directory, exactly as
+    # they would running the list by hand. A background job does not reliably
+    # inherit the working directory, so this is pinned here rather than there.
+    $invocationDir = (Get-Location).Path
+    $commandFallbackDir = [IO.Path]::Combine($OutputDir, "commands")
+    $parsed = Read-CommandList -Lines $listLines -BaseDirectory $invocationDir -FallbackOutputDir $commandFallbackDir
+    $commandUnits = $parsed.Units
+
+    if ($parsed.Rejected.Count -gt 0) {
+        Write-Host "[ERROR] $($parsed.Rejected.Count) line(s) could not be used:" -ForegroundColor DarkRed
+        foreach ($bad in $parsed.Rejected) {
+            Write-Host "        line $($bad.LineNumber): $($bad.Errors -join '; ')" -ForegroundColor Yellow
+            Write-Host "          $($bad.Raw.Trim())" -ForegroundColor DarkGray
+        }
+        Write-Host ""
+        return
+    }
+
+    if ($commandUnits.Count -eq 0) {
+        Write-Host "[ERROR] The command list is empty." -ForegroundColor DarkRed
+        return
+    }
+
+    Write-Host "[INFO] Command list: $($commandUnits.Count) command(s)" -ForegroundColor Green
+}
+
 # Validate that either ScanType or Workflow is provided (mutually exclusive)
 # Skip this validation if resuming a session (will use session's config)
-if (-not $resumingSession) {
+if (-not $resumingSession -and -not $isCommandMode) {
 if ((-not $ScanType -or $ScanType -eq "") -and (-not $Workflow -or $Workflow -eq "")) {
     Write-Host "[ERROR] Either -ScanType or -Workflow parameter must be provided." -ForegroundColor DarkRed
     Write-Host "`nAvailable scan profiles:" -ForegroundColor Yellow
@@ -2852,7 +3249,8 @@ if ($ScanType -and $ScanType -ne "" -and $Workflow -and $Workflow -ne "") {
     return
 }
 
-# Validate ScanType or Workflow
+# Validate ScanType or Workflow. Command-list mode has no profile to validate:
+# every unit brings its own command.
 $isWorkflowMode = $false
 if ($Workflow -and $Workflow -ne "") {
     $isWorkflowMode = $true
@@ -2891,12 +3289,13 @@ if ($Workflow -and $Workflow -ne "") {
 
     Write-Host "[INFO] Using scan profile: $($scanProfiles[$ScanType].name)" -ForegroundColor Green
 }
-} # End of if (-not $resumingSession)
+} # End of if (-not $resumingSession -and -not $isCommandMode)
 
 # Privilege gate (Linux/macOS only - Windows keeps its previous behaviour).
 # nmap needs root for raw sockets, and every stock profile uses -sS or -sU plus -A.
 # Every workflow step is checked up front: aborting on step 3 after 40 minutes is useless.
-if ($IsLinux -or $IsMacOS) {
+# -ListCommands never runs nmap, so it must not demand root to show a listing.
+if (($IsLinux -or $IsMacOS) -and -not $ListCommands) {
     $profilesToCheck = @()
     if ($Workflow -and $Workflow -ne "" -and $scanWorkflows.ContainsKey($Workflow)) {
         $stepNum = 0
@@ -2906,13 +3305,21 @@ if ($IsLinux -or $IsMacOS) {
         }
     } elseif ($ScanType -and $ScanType -ne "" -and $scanProfiles.ContainsKey($ScanType)) {
         $profilesToCheck += @{ Label = "Profile '$ScanType'"; Profile = $ScanType }
+    } elseif ($isCommandMode) {
+        # Each unit carries its own command, so the gate inspects the lines
+        # themselves. Without this the consultant's -sU line would only fail
+        # once nmap was already running.
+        foreach ($unit in $commandUnits) {
+            $profilesToCheck += @{ Label = "Line $($unit.LineNumber) ('$($unit.Label)')"; Profile = $null; Unit = $unit }
+        }
     }
 
     if ($profilesToCheck.Count -gt 0 -and -not (Test-IsElevated)) {
         $blockingHits = @()
         $degradableHits = @()
         foreach ($entry in $profilesToCheck) {
-            $flags = Get-RootRequiredFlags -Command $scanProfiles[$entry.Profile].command
+            $entryCommand = if ($entry.Unit) { $entry.Unit.Command } else { $scanProfiles[$entry.Profile].command }
+            $flags = Get-RootRequiredFlags -Command $entryCommand
             if ($flags.Blocking.Count -gt 0) {
                 $blockingHits += @{ Label = $entry.Label; Flags = ($flags.Blocking -join ', ') }
             } elseif ($flags.Degradable.Count -gt 0) {
@@ -2920,7 +3327,9 @@ if ($IsLinux -or $IsMacOS) {
             }
         }
 
-        $relaunchTarget = if ($Workflow) { "-Workflow $Workflow" } else { "-ScanType $ScanType" }
+        $relaunchTarget = if ($isCommandMode) {
+            if ($CommandFile) { "-CommandFile $CommandFile" } else { "-Commands ..." }
+        } elseif ($Workflow) { "-Workflow $Workflow" } else { "-ScanType $ScanType" }
         $relaunch = "sudo $(Get-InvocationHint) $relaunchTarget"
 
         if ($blockingHits.Count -gt 0) {
@@ -2968,11 +3377,25 @@ if ($IsLinux -or $IsMacOS) {
             }
 
             if ($doDegrade) {
-                foreach ($profileName in @($profilesToCheck.Profile | Select-Object -Unique)) {
-                    $converted = ConvertTo-UnprivilegedCommand -Command $scanProfiles[$profileName].command
-                    if ($converted) {
-                        $scanProfiles[$profileName].command = $converted
-                        Write-Host "[INFO] $profileName -> $converted" -ForegroundColor DarkGray
+                if ($isCommandMode) {
+                    # Rewrite the unit in place. Its id is content-addressed, so
+                    # recompute it: a downgraded command is genuinely a different
+                    # scan and must not inherit the privileged run's results.
+                    foreach ($unit in $commandUnits) {
+                        $converted = ConvertTo-UnprivilegedCommand -Command $unit.Command
+                        if ($converted -and $converted -ne $unit.Command) {
+                            $unit.Command = $converted
+                            $unit.Id = Get-CommandUnitId -Command $converted -Label $unit.Label
+                            Write-Host "[INFO] line $($unit.LineNumber) -> $converted" -ForegroundColor DarkGray
+                        }
+                    }
+                } else {
+                    foreach ($profileName in @($profilesToCheck.Profile | Where-Object { $_ } | Select-Object -Unique)) {
+                        $converted = ConvertTo-UnprivilegedCommand -Command $scanProfiles[$profileName].command
+                        if ($converted) {
+                            $scanProfiles[$profileName].command = $converted
+                            Write-Host "[INFO] $profileName -> $converted" -ForegroundColor DarkGray
+                        }
                     }
                 }
                 $Unprivileged = $true
@@ -2982,9 +3405,9 @@ if ($IsLinux -or $IsMacOS) {
     }
 }
 
-# Validate that at least one host source is provided
-# Skip this validation if resuming a session
-if (-not $resumingSession) {
+# Validate that at least one host source is provided.
+# Command-list mode brings its own targets inside each line.
+if (-not $resumingSession -and -not $isCommandMode) {
 if ((-not $HostFile -or $HostFile -eq "") -and ($Hosts.Count -eq 0)) {
     Write-Host "[ERROR] Either -HostFile or -Hosts parameter must be provided." -ForegroundColor DarkRed
     return
@@ -3115,6 +3538,32 @@ if ($Hosts.Count -gt 0) {
     $totalEntriesProcessed += $Hosts.Count
 }
 
+# Command-list mode: the units are the work items. They are keyed by their
+# content-addressed id so the rest of the engine - state, resume, retries,
+# progress - treats them exactly like hosts.
+if ($isCommandMode) {
+    $commandUnitsById = @{}
+    foreach ($unit in $commandUnits) {
+        $commandUnitsById[$unit.Id] = $unit
+        $targetHostsData[$unit.Id] = @{
+            CIDRs    = @()
+            Type     = "Command"
+            Original = $unit.Command
+        }
+    }
+    $targetHosts = @($commandUnits | ForEach-Object { $_.Id })
+    Write-Log -Message "Command units: $($targetHosts.Count)" -Level "INFO" -LogFile $logFile
+
+    $withWarnings = @($commandUnits | Where-Object { $_.Warnings.Count -gt 0 })
+    foreach ($unit in $withWarnings) {
+        foreach ($w in $unit.Warnings) {
+            Write-Log -Message "Line $($unit.LineNumber) ($($unit.Label)): $w" -Level "WARNING" -LogFile $logFile
+        }
+    }
+}
+
+
+if (-not $isCommandMode) {
     $targetHosts = $targetHostsData.Keys
     Write-Log -Message "Total entries processed: $totalEntriesProcessed" -Level "INFO" -LogFile $logFile
     Write-Log -Message "Unique target hosts after expansion: $($targetHosts.Count)" -Level "INFO" -LogFile $logFile
@@ -3133,6 +3582,7 @@ if ($Hosts.Count -gt 0) {
     if ($totalExpanded -gt 5000) {
         Write-Log -Message "WARNING: Expanded CIDR ranges to $totalExpanded hosts. This may take a long time." -Level "WARNING" -LogFile $logFile
     }
+} # End of if (-not $isCommandMode)
 } else {
     # Resuming session: hosts are loaded from session state
     Write-Log -Message "Resuming session: hosts will be loaded from session state" -Level "INFO" -LogFile $logFile
@@ -3411,11 +3861,13 @@ if ($isWorkflowMode) {
     $workflowSteps = $workflowDef.steps
     Write-Log -Message "Starting workflow: $($workflowDef.name) with $($workflowSteps.Count) steps" -Level "INFO" -LogFile $logFile
 } else {
-    # Single scan: create a pseudo-workflow with one step
+    # Single scan and command-list mode: one pseudo-step. Command mode stays a
+    # single step on purpose, so the state file keeps the name scan-state.json
+    # that Get-SessionList and -ResumeSession look for.
     $workflowSteps = @(
         @{
-            profile = $ScanType
-            description = "Single scan"
+            profile = $(if ($isCommandMode) { "commands" } else { $ScanType })
+            description = $(if ($isCommandMode) { "Command list" } else { "Single scan" })
             condition = "always"
         }
     )
@@ -3431,6 +3883,77 @@ Write-Host ""
 Write-Host "╭─────────────────────────────────────────────────╮" -ForegroundColor Cyan
 Write-Host "│ SCAN CONFIGURATION                              │" -ForegroundColor Cyan
 Write-Host "╰─────────────────────────────────────────────────╯" -ForegroundColor Cyan
+
+if ($isCommandMode) {
+    # The list is the configuration: show every line as it will run, with the
+    # state it is resuming from, so an edited or half-finished list is obvious.
+    # $state does not exist yet (it is built inside the step loop), so read the
+    # session's state file straight from disk.
+    $preflightStatus = @{}
+    $preflightStateFile = [IO.Path]::Combine($OutputDir, ".sessions", $sessionId, "scan-state.json")
+    $preflightState = if ($resumingSession -and $resumedSessionData) {
+        $resumedSessionData.State
+    } elseif (Test-Path $preflightStateFile) {
+        Load-StateFile -StateFile $preflightStateFile
+    } else { $null }
+
+    if ($preflightState -and $preflightState.hosts) {
+        # Load-StateFile only converts the top level, so hosts is a PSCustomObject
+        $hostsNode = $preflightState.hosts
+        $keys = if ($hostsNode -is [System.Collections.Hashtable]) {
+            @($hostsNode.Keys)
+        } else {
+            @($hostsNode.PSObject.Properties.Name)
+        }
+        foreach ($k in $keys) {
+            $entry = if ($hostsNode -is [System.Collections.Hashtable]) { $hostsNode[$k] } else { $hostsNode.$k }
+            if ($entry -and $entry.status) { $preflightStatus[$k] = $entry.status }
+        }
+    }
+
+    $pendingCount = 0
+    $doneCount = 0
+    $failedCount0 = 0
+    foreach ($unit in $commandUnits) {
+        $st = if ($preflightStatus.ContainsKey($unit.Id)) { $preflightStatus[$unit.Id] } else { "pending" }
+        switch ($st) {
+            "completed" { $doneCount++ }
+            "failed"    { $failedCount0++ }
+            default     { $pendingCount++ }
+        }
+    }
+
+    Write-Host "📋 Commands   : " -NoNewline -ForegroundColor Cyan
+    Write-Host "$($commandUnits.Count) " -NoNewline -ForegroundColor White
+    Write-Host "($pendingCount pending, $doneCount done, $failedCount0 failed)" -ForegroundColor Gray
+    if ($CommandFile) {
+        Write-Host "   Source     : " -NoNewline -ForegroundColor Cyan
+        Write-Host "$CommandFile" -ForegroundColor White
+    }
+
+    $shownUnits = if ($commandUnits.Count -le 12) { $commandUnits } else { $commandUnits[0..11] }
+    foreach ($unit in $shownUnits) {
+        $st = if ($preflightStatus.ContainsKey($unit.Id)) { $preflightStatus[$unit.Id] } else { "pending" }
+        $mark, $markColor = switch ($st) {
+            "completed" { "[done]", "Green" }
+            "failed"    { "[fail]", "Red" }
+            "skipped"   { "[skip]", "DarkGray" }
+            default     { "[    ]", "DarkGray" }
+        }
+        Write-Host "   $mark " -NoNewline -ForegroundColor $markColor
+        Write-Host "$($unit.Label)" -ForegroundColor White
+        # The prefix is added here, so the wrapper must not indent as well.
+        foreach ($line in (Format-CommandForDisplay -Command $unit.Command -Width 70 -Indent "")) {
+            Write-Host "          $line" -ForegroundColor DarkGray
+        }
+        foreach ($w in $unit.Warnings) {
+            Write-Host "          ! $w" -ForegroundColor Yellow
+        }
+    }
+    if ($commandUnits.Count -gt 12) {
+        Write-Host "   ... and $($commandUnits.Count - 12) more" -ForegroundColor DarkGray
+    }
+} else {
 
 Write-Host "🎯 Targets    : " -NoNewline -ForegroundColor Cyan
 Write-Host "$($validHosts.Count) host(s)" -ForegroundColor White
@@ -3505,6 +4028,8 @@ if ($excludedHosts.Count -gt 0) {
     Write-Host "($exShown)" -ForegroundColor Gray
 }
 
+}
+
 Write-Host "📁 Output     : " -NoNewline -ForegroundColor Cyan
 Write-Host "$OutputDir$([IO.Path]::DirectorySeparatorChar)" -ForegroundColor White
 Write-Host "   Session    : " -NoNewline -ForegroundColor Cyan
@@ -3517,6 +4042,24 @@ if ($Unprivileged) {
     Write-Host "unprivileged (downgraded, no raw sockets)" -ForegroundColor Yellow
 }
 Write-Host ""
+
+# -ListCommands stops here: the block above is the listing, and the point is
+# to review a list without committing scan time to it.
+if ($isCommandMode -and $ListCommands) {
+    $stale = @()
+    $currentIds = @{}
+    foreach ($unit in $commandUnits) { $currentIds[$unit.Id] = $true }
+    foreach ($key in @($preflightStatus.Keys)) {
+        if (-not $currentIds.ContainsKey($key)) { $stale += $key }
+    }
+    if ($stale.Count -gt 0) {
+        Write-Host "🕗 Stale      : " -NoNewline -ForegroundColor Cyan
+        Write-Host "$($stale.Count) state entry(ies) from lines that were edited or removed" -ForegroundColor Yellow
+        Write-Host "                They are ignored; -Force clears them." -ForegroundColor DarkGray
+    }
+    Write-Host ""
+    return
+}
 
 # The wizard already asked; -Yes is an explicit opt-out; and with no terminal
 # there is nobody to ask, so run unattended rather than hang.
@@ -3637,6 +4180,31 @@ foreach ($currentHost in $validHosts) {
         $alternativeCIDRs = $hostData.CIDRs | Where-Object { $_ -ne $sourceCIDR }
     }
 
+    if ($isCommandMode) {
+        # The author's own -oA decides where nmap writes; Scanyx only adds a
+        # place for stdout/stderr when the line has no output flag of its own.
+        $unit = $commandUnitsById[$currentHost]
+        $outputFolder = if ($unit.OutputBase) {
+            [IO.Path]::GetDirectoryName($unit.OutputBase)
+        } else {
+            [IO.Path]::Combine($currentBaseDir, "commands", $unit.Id)
+        }
+
+        $state.hosts[$currentHost] = @{
+            status = "pending"
+            attempts = 0
+            last_update = ""
+            error = ""
+            scan_type = "command"
+            command = $unit.Command
+            exec_command = $unit.ExecCommand
+            label = $unit.Label
+            target = $unit.Target
+            line_number = $unit.LineNumber
+            result_file = $unit.ResultFile
+            output_folder = $outputFolder
+        }
+    } else {
     # Determine output folder
     $outputFolder = Get-OutputFolder -TargetHost $currentHost -SourceCIDR $sourceCIDR -BaseDir $currentBaseDir -WorkflowName $(if ($isWorkflowMode) { $Workflow } else { "" }) -WorkflowStep $workflowStepNumber -StepProfile $currentProfile
 
@@ -3652,6 +4220,7 @@ foreach ($currentHost in $validHosts) {
         source_cidr = $sourceCIDR
         alternative_cidrs = $alternativeCIDRs
         output_folder = $outputFolder
+    }
     }
 
     # Count hosts per CIDR for network progress tracking
@@ -3931,15 +4500,31 @@ if ($OverwriteMode -eq "Ask") {
         $hostMeta = $state.hosts[$targetHost]
         if ($hostMeta) {
             $hostFolder = $hostMeta.output_folder
-            $fileName = "$currentScanType"
-            if ($hostFolder -and (Test-Path "$([IO.Path]::Combine($hostFolder, $fileName)).nmap")) {
+            # In command-list mode the result file is the one the line's own
+            # output flag names, not <folder>/<profile>.nmap.
+            $probe = if ($hostMeta.result_file) {
+                $hostMeta.result_file
+            } elseif ($hostFolder) {
+                "$([IO.Path]::Combine($hostFolder, $(if ($isCommandMode) { $targetHost } else { "$currentScanType" }))).nmap"
+            } else { $null }
+            $probeIsCurrent = if ($isCommandMode) {
+                Test-NmapOutputMatchesCommand -ResultFile $probe -Command $(if ($hostMeta.exec_command) { $hostMeta.exec_command } else { $hostMeta.command })
+            } else {
+                $probe -and (Test-Path $probe)
+            }
+            if ($probeIsCurrent) {
                 $hostsWithExistingResults++
             }
         }
     }
 
-    if ($hostsWithExistingResults -gt 0) {
-        Write-Host "`n$hostsWithExistingResults host(s) have existing scan results." -ForegroundColor Yellow
+    if ($hostsWithExistingResults -gt 0 -and ($Yes -or [Console]::IsInputRedirected)) {
+        # Unattended: keep what is already on disk rather than silently
+        # redoing work the consultant may have paid for in scan time.
+        $OverwriteMode = "Skip"
+        Write-Log -Message "$hostsWithExistingResults item(s) already have results; skipping them (unattended)" -Level "INFO" -LogFile $logFile
+    } elseif ($hostsWithExistingResults -gt 0) {
+        Write-Host "`n$hostsWithExistingResults item(s) have existing scan results." -ForegroundColor Yellow
         $response = Read-Host "Do you want to overwrite all existing results? (y/N)"
         if ($response -eq "y" -or $response -eq "Y") {
             $OverwriteMode = "Overwrite"
@@ -4043,7 +4628,7 @@ foreach ($currentHost in $hostsToScan) {
 
             if ($scanSuccess) {
                 # Check if host has open ports and update counters
-                $nmapFile = "$([IO.Path]::Combine($jobData.HostFolder, $jobData.FileName)).nmap"
+                $nmapFile = if ($jobData.ResultFile) { $jobData.ResultFile } else { "$([IO.Path]::Combine($jobData.HostFolder, $jobData.FileName)).nmap" }
 
                 Update-HostState -State $state -TargetHost $jobHost -Status "completed" -Attempts $attempts -ScanFile $nmapFile
                 $completedCount++
@@ -4112,7 +4697,7 @@ foreach ($currentHost in $hostsToScan) {
                         Write-Log -Message "Retry command: $fullNmapCommand" -Level "VERBOSE" -LogFile $logFile
                     }
 
-                    $retryJob = Start-NmapScanJob -TargetHost $jobHost -ScanCommand $jobData.ScanCommand -OutputPath $jobData.HostFolder -FileName $jobData.FileName -Attempts $newAttempts -Unprivileged $Unprivileged -NmapPath $nmapExePath
+                    $retryJob = Start-NmapScanJob -TargetHost $jobHost -ScanCommand $jobData.ScanCommand -OutputPath $jobData.HostFolder -FileName $jobData.FileName -Attempts $newAttempts -Unprivileged $Unprivileged -NmapPath $nmapExePath -Verbatim $isCommandMode -ResultFile $jobData.ResultFile
 
                     $jobQueue[$jobHost] = @{
                         Job = $retryJob
@@ -4158,25 +4743,43 @@ foreach ($currentHost in $hostsToScan) {
     # Get host metadata from state
     $hostMeta = $state.hosts[$currentHost]
     $hostFolder = $hostMeta.output_folder
-    $fileName = "$currentScanType"
     $isSensitive = $hostMeta.sensitive
 
-    # Determine scan command (normal or sensitive)
-    $baseScanCommand = $scanProfiles[$currentScanType].command
-    if ($isSensitive) {
-        $currentScanCommand = Get-SensitiveScanCommand -BaseCommand $baseScanCommand -Timing $SensitiveTiming -Scripts $SensitiveScripts
+    if ($isCommandMode) {
+        # The unit already carries its command, its target and its own output
+        # flag: it runs verbatim, and nmap writes where the author said.
+        $currentScanCommand = if ($hostMeta.exec_command) { $hostMeta.exec_command } else { $hostMeta.command }
+        $fileName = $currentHost
+        $unitResultFile = $hostMeta.result_file
+        $existingResultFile = if ($unitResultFile) { $unitResultFile } else { "$([IO.Path]::Combine($hostFolder, $fileName)).nmap" }
     } else {
-        $currentScanCommand = $baseScanCommand
+        $fileName = "$currentScanType"
+        # Determine scan command (normal or sensitive)
+        $baseScanCommand = $scanProfiles[$currentScanType].command
+        if ($isSensitive) {
+            $currentScanCommand = Get-SensitiveScanCommand -BaseCommand $baseScanCommand -Timing $SensitiveTiming -Scripts $SensitiveScripts
+        } else {
+            $currentScanCommand = $baseScanCommand
+        }
+        $unitResultFile = ""
+        $existingResultFile = "$([IO.Path]::Combine($hostFolder, $fileName)).nmap"
     }
 
-    # Check if results already exist
+    # Check if results already exist. In command-list mode a file at the
+    # author's -oA path may well be from a previous version of that line, so
+    # the check is whether THIS command produced it.
     $skipHost = $false
-    if (Test-Path "$([IO.Path]::Combine($hostFolder, $fileName)).nmap") {
+    $resultsAreCurrent = if ($isCommandMode) {
+        Test-NmapOutputMatchesCommand -ResultFile $existingResultFile -Command $currentScanCommand
+    } else {
+        Test-Path $existingResultFile
+    }
+    if ($resultsAreCurrent) {
         # If host was in_progress, always overwrite incomplete results
         if ($hostMeta.status -eq "in_progress") {
             Write-Log -Message "Overwriting incomplete scan for $currentHost (was in_progress)" -Level "INFO" -LogFile $logFile
         } else {
-            $existingNmapFile = "$([IO.Path]::Combine($hostFolder, $fileName)).nmap"
+            $existingNmapFile = $existingResultFile
             switch ($OverwriteMode) {
                 "Skip" {
                     Write-Log -Message "Skipping $currentHost (results already exist)" -Level "INFO" -LogFile $logFile
@@ -4220,7 +4823,7 @@ foreach ($currentHost in $hostsToScan) {
         Write-Log -Message "Command: $fullNmapCommand" -Level "VERBOSE" -LogFile $logFile
     }
 
-    $job = Start-NmapScanJob -TargetHost $currentHost -ScanCommand $currentScanCommand -OutputPath $hostFolder -FileName $fileName -Attempts 1 -Unprivileged $Unprivileged -NmapPath $nmapExePath
+    $job = Start-NmapScanJob -TargetHost $currentHost -ScanCommand $currentScanCommand -OutputPath $hostFolder -FileName $fileName -Attempts 1 -Unprivileged $Unprivileged -NmapPath $nmapExePath -Verbatim $isCommandMode -ResultFile $unitResultFile
 
     $jobQueue[$currentHost] = @{
         Job = $job
@@ -4228,6 +4831,7 @@ foreach ($currentHost in $hostsToScan) {
         HostFolder = $hostFolder
         FileName = $fileName
         ScanCommand = $currentScanCommand
+        ResultFile = $unitResultFile
     }
     $jobStartTimes[$currentHost] = Get-Date
 
@@ -4265,7 +4869,7 @@ while ($jobQueue.Count -gt 0) {
 
         if ($scanSuccess) {
             # Check if host has open ports and update counters
-            $nmapFile = "$([IO.Path]::Combine($jobData.HostFolder, $jobData.FileName)).nmap"
+            $nmapFile = if ($jobData.ResultFile) { $jobData.ResultFile } else { "$([IO.Path]::Combine($jobData.HostFolder, $jobData.FileName)).nmap" }
 
             Update-HostState -State $state -TargetHost $jobHost -Status "completed" -Attempts $attempts -ScanFile $nmapFile
             $completedCount++
@@ -4324,7 +4928,7 @@ while ($jobQueue.Count -gt 0) {
                     Write-Log -Message "Retry command: $fullNmapCommand" -Level "VERBOSE" -LogFile $logFile
                 }
 
-                $retryJob = Start-NmapScanJob -TargetHost $jobHost -ScanCommand $jobData.ScanCommand -OutputPath $jobData.HostFolder -FileName $jobData.FileName -Attempts $newAttempts -Unprivileged $Unprivileged -NmapPath $nmapExePath
+                $retryJob = Start-NmapScanJob -TargetHost $jobHost -ScanCommand $jobData.ScanCommand -OutputPath $jobData.HostFolder -FileName $jobData.FileName -Attempts $newAttempts -Unprivileged $Unprivileged -NmapPath $nmapExePath -Verbatim $isCommandMode -ResultFile $jobData.ResultFile
 
                 $jobQueue[$jobHost] = @{
                     Job = $retryJob

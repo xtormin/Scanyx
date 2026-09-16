@@ -280,6 +280,58 @@ scanyx -HostFile hosts.txt -ScanType tcp-1000 -Force
 scanyx -Wizard
 ```
 
+## Modo lista de comandos
+
+Cuando ya tienes la lista escrita a tu gusto —un comando nmap por host, con sus
+puertos y sus flags decididos uno a uno— no hace falta traducirla a perfiles.
+Scanyx la ejecuta tal cual y le pone encima su motor: concurrencia, reintentos,
+log, estado en disco, sesiones y reanudación.
+
+Crea el fichero, un comando por línea. `#` es comentario, y un comentario al
+final de la línea es la etiqueta que verás en el progreso y en el resumen:
+
+```
+# Controladores de dominio
+nmap -sV -T3 -oA nmap/10.30.0.10 -p 53,88,389,445,636 10.30.0.10   # DC01
+nmap -sV -T3 -oA nmap/10.30.0.11 -p 135,445,1433,3389 10.30.0.11   # SQL01
+
+# Perímetro
+nmap -sV -T3 -oA nmap/192.168.100.10 -p 80,443 192.168.100.10      # WEB01
+```
+
+```powershell
+# Revisar la lista sin ejecutar nada: qué se va a lanzar y qué estado tiene
+scanyx -CommandFile comandos.txt -ListCommands
+
+# Ejecutarla con nombre de sesión, para poder reanudarla después
+scanyx -CommandFile comandos.txt -SessionName cliente-2025
+
+# Reanudar: solo corre lo que quedó pendiente o falló
+scanyx -CommandFile comandos.txt -SessionName cliente-2025 -Resume
+```
+
+**Dónde se guardan los resultados.** Donde diga el `-oA` de cada línea, igual
+que si ejecutaras la lista a mano; las rutas relativas se resuelven contra el
+directorio desde el que lanzas Scanyx. `-OutputDir` se usa solo para la
+contabilidad de Scanyx (`.sessions/`: estado, logs y resultados). Si una línea
+no lleva ningún flag de salida, Scanyx le añade un `-oA` dentro de `-OutputDir`.
+
+**Editar la lista entre ejecuciones.** Cada comando se identifica por su
+contenido, así que puedes reordenar, añadir y borrar líneas sin perder el
+progreso de las que no tocaste. Si modificas una línea, pasa a ser un trabajo
+nuevo y se vuelve a ejecutar aunque el fichero de salida de la versión anterior
+siga ahí: Scanyx compara el comando que nmap dejó grabado en el `.nmap`.
+
+**Lo que se rechaza.** Una línea que no empiece por `nmap`, que lleve
+metacaracteres de shell (`;`, `&&`, `|`, backticks, `$(...)`, redirecciones) o
+que combine `-oA` con `-oN`/`-oX`/`-oG`, que es algo que el propio nmap no
+acepta. Los comandos se ejecutan pasando argumentos directamente al proceso,
+sin shell de por medio.
+
+**Privilegios.** La lista se revisa entera antes de empezar: si alguna línea
+necesita root (`-sS`, `-sU`, `-A`…) Scanyx lo dice de antemano en vez de fallar
+a mitad del recorrido.
+
 ## Carga Remota y ConfigFile desde URL
 
 ### Carga con WebClient 

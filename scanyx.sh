@@ -62,6 +62,13 @@ Everything else is forwarded verbatim to Invoke-Scanyx. Examples:
   sudo ./scanyx.sh -HostFile hosts.txt -Workflow full-discovery
   ./scanyx.sh -Wizard
 
+Command-list mode runs a file of complete nmap commands, one per line, with
+Scanyx's tracking, retries, state and resume on top:
+
+  ./scanyx.sh -CommandFile commands.txt -ListCommands   # review, run nothing
+  sudo ./scanyx.sh -CommandFile commands.txt -SessionName engagement
+  sudo ./scanyx.sh -CommandFile commands.txt -SessionName engagement -Resume
+
 The stock profiles use -sS / -sU / -A, which require root on Unix.
 Without root, Scanyx offers to downgrade the scan or abort.
 
