@@ -875,7 +875,8 @@ function Show-ProgressBar {
         [hashtable]$HostStateInfo = @{},
         [hashtable]$ActiveJobs = @{},
         [DateTime]$ScanStartTime = [DateTime]::MinValue,
-        [array]$CompletedDurations = @()
+        [array]$CompletedDurations = @(),
+        [int]$Concurrency = 1
     )
 
     $percent = if ($Total -gt 0) { [math]::Min([math]::Round(($Completed / $Total) * 100, 1), 100) } else { 0 }
@@ -924,7 +925,10 @@ function Show-ProgressBar {
         if ($CompletedDurations.Count -ge 10 -and $Total -gt $Completed) {
             $avgDuration = ($CompletedDurations | Measure-Object -Average).Average
             $remainingHosts = $Total - $Completed
-            $estimatedSeconds = $remainingHosts * $avgDuration
+            # Hosts are scanned in parallel, so the remaining wall-clock time is
+            # the serial estimate divided by how many run at once.
+            $parallel = [math]::Max(1, [math]::Min($Concurrency, $remainingHosts))
+            $estimatedSeconds = ($remainingHosts * $avgDuration) / $parallel
             $eta = [TimeSpan]::FromSeconds($estimatedSeconds)
             $etaStr = " / ~$(Format-TimeSpan -TimeSpan $eta) ETA"
         }
@@ -3854,9 +3858,9 @@ foreach ($currentHost in $hostsToScan) {
         # Update progress bar every ~60 seconds (120 iterations * 500ms)
         if ($progressUpdateCounter % 120 -eq 0) {
             if ($isWorkflowMode) {
-                Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost "" -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -AliveHosts $aliveHostsCount -HostStateInfo $state.hosts -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations
+                Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost "" -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -AliveHosts $aliveHostsCount -HostStateInfo $state.hosts -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent
             } else {
-                Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost "" -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -HostStateInfo $state.hosts
+                Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost "" -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -HostStateInfo $state.hosts
             }
         }
 
@@ -3976,9 +3980,9 @@ foreach ($currentHost in $hostsToScan) {
             # Save state and update progress
             Save-StateFile -StateFile $stateFile -State $state
             if ($isWorkflowMode) {
-                Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost $jobHost -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -AliveHosts $aliveHostsCount -HostStateInfo $state.hosts -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations
+                Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost $jobHost -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -AliveHosts $aliveHostsCount -HostStateInfo $state.hosts -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent
             } else {
-                Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost $jobHost -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -HostStateInfo $state.hosts
+                Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost $jobHost -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -HostStateInfo $state.hosts
             }
 
             # Remove from queue
@@ -4065,14 +4069,14 @@ foreach ($currentHost in $hostsToScan) {
         Attempts = 1
         HostFolder = $hostFolder
         FileName = $fileName
-        ScanCommand = $scanCommand
+        ScanCommand = $currentScanCommand
     }
     $jobStartTimes[$currentHost] = Get-Date
 
     if ($isWorkflowMode) {
-        Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost $currentHost -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -AliveHosts $aliveHostsCount -HostStateInfo $state.hosts -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations
+        Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost $currentHost -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -AliveHosts $aliveHostsCount -HostStateInfo $state.hosts -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent
     } else {
-        Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost $currentHost -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -HostStateInfo $state.hosts
+        Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost $currentHost -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -HostStateInfo $state.hosts
     }
 }
 
@@ -4085,9 +4089,9 @@ while ($jobQueue.Count -gt 0) {
     # Update progress bar every ~60 seconds (120 iterations * 500ms)
     if ($progressUpdateCounter % 120 -eq 0) {
         if ($isWorkflowMode) {
-            Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost "" -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -AliveHosts $aliveHostsCount -HostStateInfo $state.hosts -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations
+            Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost "" -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -AliveHosts $aliveHostsCount -HostStateInfo $state.hosts -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent
         } else {
-            Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost "" -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -HostStateInfo $state.hosts
+            Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost "" -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -HostStateInfo $state.hosts
         }
     }
 
@@ -4192,9 +4196,9 @@ while ($jobQueue.Count -gt 0) {
 
         Save-StateFile -StateFile $stateFile -State $state
         if ($isWorkflowMode) {
-            Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost $jobHost -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -AliveHosts $aliveHostsCount -HostStateInfo $state.hosts -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations
+            Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost $jobHost -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -AliveHosts $aliveHostsCount -HostStateInfo $state.hosts -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent
         } else {
-            Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost $jobHost -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -HostStateInfo $state.hosts
+            Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost $jobHost -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -HostStateInfo $state.hosts
         }
 
         $jobQueue.Remove($jobHost)
