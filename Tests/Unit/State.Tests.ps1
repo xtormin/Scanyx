@@ -282,3 +282,74 @@ Describe "Cross-platform paths" -Tag "Unit", "State", "CrossPlatform" {
         }
     }
 }
+
+Describe "Update-HostState liveness fields" -Tag "Unit", "State", "Liveness" {
+
+    It "Stores the verdict, its reason and the open-port count" {
+        $state = @{ hosts = @{}; completed = 0; failed = 0; pending = 0 }
+        Update-HostState -State $state -TargetHost "10.0.0.1" -Status "completed" -ScanFile "/tmp/a.nmap" `
+                         -Liveness "alive" -LivenessReason "no open ports; 31 closed" -OpenPortCount 0
+
+        $state.hosts["10.0.0.1"].liveness | Should -Be "alive"
+        $state.hosts["10.0.0.1"].liveness_reason | Should -Be "no open ports; 31 closed"
+        $state.hosts["10.0.0.1"].open_port_count | Should -Be 0
+    }
+
+    It "Preserves the verdict when a later call only changes status" {
+        # A failed retry must not erase a verdict earned on the previous attempt.
+        $state = @{ hosts = @{}; completed = 0; failed = 0; pending = 0 }
+        Update-HostState -State $state -TargetHost "10.0.0.2" -Status "completed" -ScanFile "/tmp/b.nmap" `
+                         -Liveness "open" -LivenessReason "2 open" -OpenPortCount 2
+        Update-HostState -State $state -TargetHost "10.0.0.2" -Status "failed" -Error "timeout"
+
+        $state.hosts["10.0.0.2"].status | Should -Be "failed"
+        $state.hosts["10.0.0.2"].liveness | Should -Be "open"
+        $state.hosts["10.0.0.2"].open_port_count | Should -Be 2
+    }
+
+    It "Lets an explicit verdict override the preserved one" {
+        $state = @{ hosts = @{}; completed = 0; failed = 0; pending = 0 }
+        Update-HostState -State $state -TargetHost "10.0.0.3" -Status "completed" -Liveness "filtered"
+        Update-HostState -State $state -TargetHost "10.0.0.3" -Status "completed" -Liveness "open" -OpenPortCount 1
+
+        $state.hosts["10.0.0.3"].liveness | Should -Be "open"
+    }
+
+    It "Preserves the command-list output flag" {
+        $state = @{ hosts = @{ "t1" = @{ output_flag = "-oG"; status = "pending" } }; completed = 0; failed = 0; pending = 0 }
+        Update-HostState -State $state -TargetHost "t1" -Status "completed"
+        $state.hosts["t1"].output_flag | Should -Be "-oG"
+    }
+
+    It "Ignores liveness in the flat mode the tests use, without throwing" {
+        $flat = @{}
+        { Update-HostState -State $flat -Host "10.0.0.4" -NewState "completed" -Liveness "open" } | Should -Not -Throw
+        $flat["10.0.0.4"] | Should -Be "completed"
+    }
+
+    It "Round-trips the verdict through save and load" {
+        $stateFile = Join-Path $TestDrive "liveness-state.json"
+        $state = @{ hosts = @{}; completed = 0; failed = 0; pending = 0 }
+        Update-HostState -State $state -TargetHost "10.0.0.5" -Status "completed" -ScanFile "/tmp/c.nmap" `
+                         -Liveness "unreachable" -LivenessReason "host-unreach" -OpenPortCount 0
+        Save-StateFile -StateFile $stateFile -State $state
+
+        $loaded = Load-StateFile -StateFile $stateFile
+        $loaded.hosts."10.0.0.5".liveness | Should -Be "unreachable"
+        $loaded.hosts."10.0.0.5".liveness_reason | Should -Be "host-unreach"
+        $loaded.hosts."10.0.0.5".open_port_count | Should -Be 0
+    }
+
+    It "Reads a state file written before liveness existed without throwing" {
+        $stateFile = Join-Path $TestDrive "legacy-state.json"
+        @{
+            hosts = @{ "10.0.0.6" = @{ status = "completed"; attempts = 1; scan_file = "/tmp/gone.nmap" } }
+            completed = 1; failed = 0; pending = 0
+        } | ConvertTo-Json -Depth 10 | Set-Content $stateFile
+
+        $loaded = Load-StateFile -StateFile $stateFile
+        { Get-PersistedLiveness -HostState $loaded.hosts."10.0.0.6" } | Should -Not -Throw
+        # No verdict and no readable output: still eligible for a retry, as before.
+        Test-HostNeedsRescan -HostState $loaded.hosts."10.0.0.6" -Mode 'NoResponse' | Should -BeTrue
+    }
+}

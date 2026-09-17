@@ -330,9 +330,35 @@ scanyx -HostFile hosts.txt -ScanType tcp-1000 -Resume
 # Continuar y reintentar fallidos
 scanyx -HostFile hosts.txt -ScanType tcp-1000 -ResumeRetryFailed
 
+# Reintentar los que no dieron ninguna senal de vida
+scanyx -HostFile hosts.txt -ScanType tcp-1000 -RetryDead
+
 # Empezar desde cero (ignora estado previo)
 scanyx -HostFile hosts.txt -ScanType tcp-1000 -Force
 ```
+
+### Vivo, muerto, o simplemente sin respuesta
+
+Un host no se considera vivo por tener puertos abiertos, sino por **haber
+respondido**. Scanyx lee el `.xml` que nmap ya escribe y clasifica cada host en
+uno de cinco veredictos, que quedan guardados en `scan-state.json` y en
+`scan-results.json`:
+
+| Veredicto | Que significa | Evidencia |
+|---|---|---|
+| `open` | Tiene superficie de ataque | al menos un puerto `open` |
+| `alive` | Vivo y blindado: contesto, pero no ofrece nada | RST / `conn-refused` / `port-unreach`, o `srtt` |
+| `filtered` | Sondeado y sin una sola respuesta: **no se sabe** si esta vivo | todo `no-response` |
+| `unreachable` | Contesto un router, no el objetivo | ICMP `host-unreach` / `net-unreach` / `admin-prohibited` |
+| `unknown` | No hay evidencia: salida ausente, ilegible, o escaneo agotado por `--host-timeout` | - |
+
+No existe un veredicto `down`: con `-Pn` no se puede ganar. Haria falta un
+pre-pase de descubrimiento (`nmap -sn`), donde en LAN el ARP si es definitivo.
+
+`-RetryDead` reintenta solo `filtered`, `unreachable` y `unknown`. No reintenta
+un host que contesto con todos los puertos cerrados, porque el segundo escaneo
+daria exactamente lo mismo. Para el comportamiento anterior (reintentar todo lo
+que no tenga puertos abiertos) esta `-RetryNoOpenPorts`.
 
 ## Modo Wizard (Interactivo)
 ```powershell

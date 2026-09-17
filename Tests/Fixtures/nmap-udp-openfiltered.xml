@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE nmaprun>
+<nmaprun scanner="nmap" args="nmap -Pn -sU -p 53,161,500 192.0.2.1" start="1789653846" startstr="Thu Sep 17 16:04:06 2026" version="7.991" xmloutputversion="1.05">
+<scaninfo type="udp" protocol="udp" numservices="3"/>
+<verbose level="0"/>
+<debugging level="0"/>
+<host starttime="1789653846" endtime="1789653849"><status state="up" reason="user-set" reason_ttl="0"/>
+<address addr="192.0.2.1" addrtype="ipv4"/>
+<ports><port protocol="udp" portid="53"><state state="open|filtered" reason="no-response" reason_ttl="0"/><service name="domain" method="table" conf="3"/></port>
+<port protocol="udp" portid="161"><state state="open|filtered" reason="no-response" reason_ttl="0"/><service name="snmp" method="table" conf="3"/></port>
+<port protocol="udp" portid="500"><state state="open|filtered" reason="no-response" reason_ttl="0"/><service name="isakmp" method="table" conf="3"/></port>
+</ports>
+</host>
+<runstats><finished time="1789653846" timestr="Thu Sep 17 16:04:06 2026" summary="Nmap done" elapsed="3.02" exit="success"/><hosts up="1" down="0" total="1"/>
+</runstats>
+</nmaprun>

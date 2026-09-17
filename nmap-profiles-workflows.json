@@ -26,17 +26,17 @@
         "tcp-100":  {
             "description":  "Fast TCP scan of top 100 ports without scripts",
             "name":  "TCP Top 100 Ports",
-            "command":  "nmap -v -T4 -Pn -open -sS --script=default,vuln -A --host-timeout 10m --top-ports 100"
+            "command":  "nmap -v -T4 -Pn -sS --script=default,vuln -A --host-timeout 10m --top-ports 100"
         },
         "tcp-1000":  {
             "description":  "Fast TCP scan of top 1000 ports with scripts and version detection",
             "name":  "TCP Top 1000 Ports",
-            "command":  "nmap -v -T4 -Pn -open -sS --script=default,vuln -A --host-timeout 60m --top-ports 1000"
+            "command":  "nmap -v -T4 -Pn -sS --script=default,vuln -A --host-timeout 60m --top-ports 1000"
         },
         "tcp-full":  {
             "description":  "Complete TCP scan of all 65535 ports",
             "name":  "TCP Full Port Scan",
-            "command":  "nmap -v -T4 -Pn -open -sS --script=default,vuln -A --host-timeout 60m -p-"
+            "command":  "nmap -v -T4 -Pn -sS --script=default,vuln -A --host-timeout 60m -p-"
         },
         "udp-common":  {
             "description":  "UDP scan of most common ports",

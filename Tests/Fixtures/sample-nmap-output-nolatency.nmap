@@ -1,0 +1,9 @@
+# Nmap 7.991 scan initiated Thu Sep 17 15:53:25 2026 as: nmap -Pn -sT -p 80,443 --host-timeout 15s -oN sample-nmap-output-nolatency.nmap 192.0.2.1
+Nmap scan report for 192.0.2.1
+Host is up.
+
+PORT    STATE    SERVICE
+80/tcp  filtered http
+443/tcp filtered https
+
+# Nmap done at Thu Sep 17 15:53:28 2026 -- 1 IP address (1 host up) scanned in 3.54 seconds

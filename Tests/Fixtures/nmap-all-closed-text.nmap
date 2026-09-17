@@ -1,0 +1,7 @@
+# Nmap 7.991 scan initiated Thu Sep 17 16:04:06 2026 as: nmap -Pn -sT -p 9,13,37,1999,4444,4445-4470 -oN nmap-all-closed.nmap 127.0.0.1
+Nmap scan report for localhost (127.0.0.1)
+Host is up (0.00011s latency).
+All 31 scanned ports on localhost (127.0.0.1) are in ignored states.
+Not shown: 31 closed tcp ports (conn-refused)
+
+# Nmap done at Thu Sep 17 16:04:06 2026 -- 1 IP address (1 host up) scanned in 0.02 seconds

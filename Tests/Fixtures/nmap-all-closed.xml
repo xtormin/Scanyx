@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE nmaprun>
+<?xml-stylesheet href="file:///opt/homebrew/bin/../share/nmap/nmap.xsl" type="text/xsl"?>
+<!-- Nmap 7.991 scan initiated Thu Sep 17 16:04:06 2026 as: nmap -Pn -sT -p 9,13,37,1999,4444,4445-4470 -oX nmap-all-closed.xml 127.0.0.1 -->
+<nmaprun scanner="nmap" args="nmap -Pn -sT -p 9,13,37,1999,4444,4445-4470 -oX nmap-all-closed.xml 127.0.0.1" start="1789653846" startstr="Thu Sep 17 16:04:06 2026" version="7.991" xmloutputversion="1.05">
+<scaninfo type="connect" protocol="tcp" numservices="31" services="9,13,37,1999,4444-4470"/>
+<verbose level="0"/>
+<debugging level="0"/>
+<host starttime="1789653846" endtime="1789653846"><status state="up" reason="user-set" reason_ttl="0"/>
+<address addr="127.0.0.1" addrtype="ipv4"/>
+<hostnames>
+<hostname name="localhost" type="PTR"/>
+</hostnames>
+<ports><extraports state="closed" count="31">
+<extrareasons reason="conn-refused" count="31" proto="tcp" ports="9,13,37,1999,4444-4470"/>
+</extraports>
+</ports>
+<times srtt="137" rttvar="69" to="100000"/>
+</host>
+<runstats><finished time="1789653846" timestr="Thu Sep 17 16:04:06 2026" summary="Nmap done at Thu Sep 17 16:04:06 2026; 1 IP address (1 host up) scanned in 0.02 seconds" elapsed="0.02" exit="success"/><hosts up="1" down="0" total="1"/>
+</runstats>
+</nmaprun>

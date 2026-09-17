@@ -1,0 +1,10 @@
+# Nmap 7.991 scan initiated Thu Sep 17 16:04:06 2026 as: nmap -Pn -sU -sV -p 53,161,500 192.0.2.1
+Nmap scan report for 192.0.2.1
+Host is up.
+
+PORT    STATE         SERVICE
+53/udp  open|filtered domain
+161/udp open|filtered snmp
+500/udp open|filtered isakmp
+
+# Nmap done at Thu Sep 17 16:04:09 2026 -- 1 IP address (1 host up) scanned in 3.02 seconds

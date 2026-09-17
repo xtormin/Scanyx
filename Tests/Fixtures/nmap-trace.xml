@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE nmaprun>
+<nmaprun scanner="nmap" args="nmap -Pn -A -p 80 192.168.1.60" start="1789653846" startstr="Thu Sep 17 16:04:06 2026" version="7.991" xmloutputversion="1.05">
+<scaninfo type="syn" protocol="tcp" numservices="3"/>
+<verbose level="0"/>
+<debugging level="0"/>
+<host starttime="1789653846" endtime="1789653849"><status state="up" reason="user-set" reason_ttl="0"/>
+<address addr="192.168.1.60" addrtype="ipv4"/>
+<ports><port protocol="tcp" portid="80"><state state="filtered" reason="no-response" reason_ttl="0"/><service name="http" method="table" conf="3"/></port>
+</ports>
+<trace port="80" proto="tcp">
+<hop ttl="1" ipaddr="192.168.1.1" rtt="1.20" host="gateway"/>
+<hop ttl="2" ipaddr="192.168.1.60" rtt="3.40"/>
+</trace>
+</host>
+<runstats><finished time="1789653846" timestr="Thu Sep 17 16:04:06 2026" summary="Nmap done" elapsed="3.02" exit="success"/><hosts up="1" down="0" total="1"/>
+</runstats>
+</nmaprun>

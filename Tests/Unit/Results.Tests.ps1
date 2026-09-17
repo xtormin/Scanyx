@@ -61,6 +61,13 @@ Describe "Test-HostHasOpenPorts" -Tag "Unit", "Results" {
             $xmlWithClosedPorts | Out-File $testXmlFile
         }
 
+        It "Classifies closed ports with no reason attributes as alive" {
+            # No reason="" anywhere in this fixture: the parser must read the
+            # port state alone and still conclude the host answered.
+            $v = Get-HostLivenessVerdict -ResultFile $testXmlFile
+            $v.Verdict | Should -Be 'alive'
+        }
+
         It "Returns false for closed/filtered ports" {
             $result = Test-HostHasOpenPorts -XmlFile $testXmlFile
             $result | Should -Be $false
@@ -85,6 +92,14 @@ Describe "Test-HostHasOpenPorts" -Tag "Unit", "Results" {
         It "Returns false for host down" {
             $result = Test-HostHasOpenPorts -XmlFile $testXmlFile
             $result | Should -Be $false
+        }
+
+        It "Classifies a host with no ports section as unknown, not dead" {
+            # <status state="down"/> with no <ports> is not evidence that the
+            # host is off -- it is the absence of evidence, which is why the
+            # verdict is unknown and the host stays eligible for a retry.
+            $v = Get-HostLivenessVerdict -ResultFile $testXmlFile
+            $v.Verdict | Should -Be 'unknown'
         }
     }
 
