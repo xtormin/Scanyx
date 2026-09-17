@@ -246,6 +246,24 @@ Describe "Resolve-HostEntry" -Tag "Unit", "CIDR" {
             $result.Hosts[0] | Should -Be "server.example.com"
             $result.Type | Should -Be "Hostname"
         }
+
+        It "Leaves ResolvedIPs empty when resolution is off" {
+            $result = Resolve-HostEntry "localhost"
+            $result.ResolvedIPs.Count | Should -Be 0
+        }
+
+        It "Keeps the hostname as the only host when resolution is on" {
+            # Regression: resolved addresses used to be appended to .Hosts, which
+            # turned one target into one scan per A record.
+            $result = Resolve-HostEntry -Line "localhost" -ResolveHostname $true
+            $result.Hosts.Count | Should -Be 1
+            $result.Hosts[0] | Should -Be "localhost"
+        }
+
+        It "Reports resolved addresses in ResolvedIPs" {
+            $result = Resolve-HostEntry -Line "localhost" -ResolveHostname $true
+            $result.ResolvedIPs | Should -Contain "127.0.0.1"
+        }
     }
 
     Context "Comments and invalid entries" {

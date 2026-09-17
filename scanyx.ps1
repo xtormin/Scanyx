@@ -34,7 +34,10 @@ Supports the same formats as ExcludeFile (IPs, CIDR, hostnames).
 Can be combined with -ExcludeFile to exclude hosts from both sources.
 
 .PARAMETER ResolveHostnames
-Attempt to resolve hostnames to IPs for exclusion matching. May be slow for large lists.
+Attempt to resolve hostnames to IPs so that exclusions match a host written as a
+name against a target written as an IP, and vice versa. Affects exclusion matching
+only: targets and sensitive hosts are still scanned exactly as written, never once
+per resolved address. May be slow for large lists.
 
 .PARAMETER SensitiveFile
 Optional path to a text file containing sensitive hosts to scan with reduced timing/scripts.
@@ -864,6 +867,7 @@ function Resolve-HostEntry {
         return @{
             Type = "Comment"
             Hosts = @()
+            ResolvedIPs = @()
             Original = $Line
         }
     }
@@ -877,6 +881,7 @@ function Resolve-HostEntry {
         return @{
             Type = "CIDR"
             Hosts = $expandedHosts
+            ResolvedIPs = @()
             Original = $Line
             SourceCIDR = $Line
         }
@@ -888,6 +893,7 @@ function Resolve-HostEntry {
         return @{
             Type = "IP"
             Hosts = ,$Line
+            ResolvedIPs = @()
             Original = $Line
             SourceCIDR = $null
         }
@@ -898,13 +904,20 @@ function Resolve-HostEntry {
     if ($Line -match $hostnamePattern) {
         $hosts = ,$Line
 
+        # IPs this hostname resolves to, kept OUT of .Hosts on purpose.
+        # For a target list the hostname itself is the host to scan, so appending
+        # its addresses here would scan the same machine once per A record.
+        # Only exclusion matching needs every spelling of a host, and that caller
+        # concatenates .Hosts + .ResolvedIPs itself.
+        $resolvedHostIPs = @()
+
         # Optionally resolve to IP
         if ($ResolveHostname) {
             try {
                 $resolved = [System.Net.Dns]::GetHostAddresses($Line)
                 $resolvedIPs = $resolved | Where-Object { $_.AddressFamily -eq 'InterNetwork' } | ForEach-Object { $_.IPAddressToString }
                 if ($resolvedIPs.Count -gt 0) {
-                    $hosts += $resolvedIPs
+                    $resolvedHostIPs = @($resolvedIPs)
                     if ($LogFile) {
                         Write-Log -Message "Resolved $Line to $($resolvedIPs -join ', ')" -Level "INFO" -LogFile $LogFile
                     }
@@ -919,6 +932,7 @@ function Resolve-HostEntry {
         return @{
             Type = "Hostname"
             Hosts = $hosts
+            ResolvedIPs = $resolvedHostIPs
             Original = $Line
             SourceCIDR = $null
         }
@@ -928,6 +942,7 @@ function Resolve-HostEntry {
     return @{
         Type = "Invalid"
         Hosts = @()
+        ResolvedIPs = @()
         Original = $Line
         SourceCIDR = $null
     }
@@ -3710,7 +3725,10 @@ if ($ExcludeFile -and $ExcludeFile -ne "") {
             if ($entry.Type -eq "Invalid") {
                 Write-Log -Message "Invalid exclusion entry: $($entry.Original)" -Level "WARNING" -LogFile $logFile
             } elseif ($entry.Type -ne "Comment") {
+                # Exclusions match by exact key, so register every spelling of the
+                # host: the name as written and whatever it resolves to.
                 $excludedHosts += $entry.Hosts
+                $excludedHosts += $entry.ResolvedIPs
             }
         }
     } else {
@@ -3727,7 +3745,9 @@ if ($ExcludeHosts.Count -gt 0) {
         if ($entry.Type -eq "Invalid") {
             Write-Log -Message "Invalid exclusion entry: $($entry.Original)" -Level "WARNING" -LogFile $logFile
         } elseif ($entry.Type -ne "Comment") {
+            # Same as above: name and resolved addresses are both valid keys.
             $excludedHosts += $entry.Hosts
+            $excludedHosts += $entry.ResolvedIPs
         }
     }
 }
