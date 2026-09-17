@@ -18,6 +18,7 @@
 - ✅ **Workflows secuenciales** - Encadena múltiples perfiles de escaneo
 - ✅ **Gestión de sesiones** - Crea, lista y reanuda sesiones con nombres personalizados
 - ✅ **Persistencia de estado** - Reanuda escaneos interrumpidos
+- ✅ **Ventana horaria** - Arranca y para a las horas acordadas, y deja lo que falte pendiente
 - ✅ **Hosts sensibles** - Timing y scripts personalizados para hosts críticos
 - ✅ **Exclusiones inteligentes** - CIDR, IPs individuales, hostnames
 - ✅ **Carga remota** - Ejecuta desde URL sin descargar archivos
@@ -134,6 +135,63 @@ scanyx `
     -VerboseMode
 ```
 
+## Ventana horaria: empezar y parar a una hora
+
+`-StartAt` y `-StopAt` acotan el escaneo a la ventana acordada con el cliente.
+
+```powershell
+# Escanea hasta las 06:00 y para
+scanyx `
+    -HostFile "networks.txt" `
+    -ScanType "tcp-full" `
+    -SessionName "ventana-noche" `
+    -StopAt "06:00"
+```
+
+```bash
+# Ventana completa: empieza a las 22:00 y para a las 06:00
+sudo ./scanyx.sh -HostFile networks.txt -ScanType tcp-full -SessionName ventana-noche -StartAt 22:00 -StopAt 06:00
+
+# Margen relativo en vez de hora
+sudo ./scanyx.sh -HostFile networks.txt -ScanType tcp-full -SessionName ventana-noche -StopAt +90m
+```
+
+Formatos admitidos (los mismos para `-StartAt` y `-StopAt`):
+
+| Valor | Significado |
+|---|---|
+| `23:30`, `23:30:00` | Hora de hoy. Si ya ha pasado, esa hora de mañana |
+| `2026-09-18 06:00`, `2026-09-18T06:00` | Fecha y hora explícitas |
+| `+90m`, `2h`, `1h30m`, `1d2h`, `45s` | Margen a partir de ahora |
+
+Una hora suelta (`22:00`) siempre es la próxima vez que llega esa hora, así que `-StartAt 22:00 -StopAt 06:00` lanzado por la tarde cubre la noche entera. Si la ventana no encaja (la parada cae antes que el arranque), Scanyx lo dice antes de esperar nada.
+
+Qué hace al llegar la hora de parada:
+
+- No lanza ningún escaneo más.
+- Con `-StopMode Hard` (por defecto) corta también los que siguen en marcha: después de esa hora no sale tráfico de la máquina. Con `-StopMode Drain` deja terminar los que ya estaban corriendo y solo impide que empiecen nuevos.
+- Los escaneos cortados quedan como incompletos, no como fallidos: al reanudar se repiten enteros y se sobrescribe su salida parcial.
+- Si era un workflow, los pasos que quedaban no se inician.
+- Imprime el resumen, lo que queda pendiente y el comando para reanudar la sesión.
+
+Avisa por consola y en `scan.log` cuando faltan 30, 10 y 1 minuto para la parada.
+
+### Sobre `-StartAt`: no hace falta cron
+
+La espera la hace el propio proceso de Scanyx, no `cron`, `launchd` ni `at`. Eso significa que **la sesión tiene que seguir viva** hasta que llegue la hora: nada de cerrar la terminal, y la máquina no puede suspenderse. Para una espera larga:
+
+```bash
+# Linux/macOS: sesión que sobrevive a cerrar la terminal
+tmux new -s scanyx 'sudo ./scanyx.sh -HostFile networks.txt -ScanType tcp-full -SessionName ventana -StartAt 22:00 -StopAt 06:00 -Yes'
+
+# macOS: además, impedir que el equipo se duerma
+sudo caffeinate -i ./scanyx.sh -HostFile networks.txt -ScanType tcp-full -SessionName ventana -StartAt 22:00 -StopAt 06:00 -Yes
+```
+
+Todo lo que Scanyx necesita preguntar (confirmación previa, qué hacer con una sesión anterior, si sobrescribir resultados) lo pregunta **antes** de empezar a esperar, así que la ventana no se abre sobre una pregunta sin responder. Con `-Yes` no pregunta nada. Ctrl+C durante la espera cancela sin haber escaneado nada.
+
+La hora actual, la de parada y lo que falta para ella se ven en la configuración previa y en la barra de progreso. El comando de reanudación se imprime al principio y al final (también con Ctrl+C) y queda guardado en `<salida>/.sessions/<sesión>/resume.txt`.
+
 ## Reanudar sesión
 
 ```powershell
@@ -144,6 +202,8 @@ scanyx `
     -Resume
     -VerboseMode
 ```
+
+Es el comando que Scanyx imprime al final de cada ejecución, listo para copiar y pegar.
 
 ---
 

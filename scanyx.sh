@@ -62,6 +62,16 @@ Everything else is forwarded verbatim to Invoke-Scanyx. Examples:
   sudo ./scanyx.sh -HostFile hosts.txt -Workflow full-discovery
   ./scanyx.sh -Wizard
 
+Scan inside an agreed window and leave the rest pending for a later resume:
+
+  sudo ./scanyx.sh -HostFile hosts.txt -ScanType tcp-full -SessionName window -StopAt 06:00
+  sudo ./scanyx.sh -HostFile hosts.txt -ScanType tcp-full -SessionName window -StopAt +90m
+  sudo ./scanyx.sh -HostFile hosts.txt -ScanType tcp-full -SessionName window -StartAt 22:00 -StopAt 06:00
+
+-StopMode Drain lets the scans already running finish instead of stopping them.
+-StartAt waits in this process, so keep the session alive (tmux, nohup) and the
+machine awake; the resume line is saved in <output>/.sessions/<name>/resume.txt.
+
 Command-list mode runs a file of complete nmap commands, one per line, with
 Scanyx's tracking, retries, state and resume on top:
 

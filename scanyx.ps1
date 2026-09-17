@@ -86,6 +86,24 @@ Continue scanning pending hosts AND retry failed hosts.
 .PARAMETER RetryFailed
 Only retry hosts that previously failed (skips pending and completed).
 
+.PARAMETER ResumeRetryDead
+Continue scanning pending hosts AND retry the ones that showed no evidence of a
+response (verdict filtered, unreachable or unknown). Hosts that answered -- even
+with every port closed -- are not retried, because a second scan would reproduce
+the same answer. Use -ResumeRetryNoOpenPorts for the previous meaning.
+
+.PARAMETER RetryDead
+Only retry hosts that showed no evidence of a response (skips pending, failed,
+and anything that answered). See -ResumeRetryDead for the change in meaning.
+
+.PARAMETER ResumeRetryNoOpenPorts
+Continue scanning pending hosts AND retry every completed host without an open
+port, including the ones that answered on every closed port. This is what
+-ResumeRetryDead meant before liveness was classified by evidence.
+
+.PARAMETER RetryNoOpenPorts
+Only retry completed hosts without an open port. The pre-liveness -RetryDead.
+
 .PARAMETER Force
 Ignore previous state and start fresh scan (archives old state files).
 
@@ -98,6 +116,26 @@ Automatically replaces -sS with -sT for compatibility.
 Optional path to custom scan profiles configuration JSON file.
 Default: nmap-profiles-workflows.json in script directory.
 Allows using different configurations for different projects or scan scenarios.
+
+.PARAMETER StopAt
+Schedule a time at which the scan stops, for engagement windows that must be respected.
+Accepts a clock time ("23:30", "23:30:00"), a date and time ("2026-09-18 06:00",
+"2026-09-18T06:00"), or a relative span ("+90m", "2h", "1h30m", "1d2h").
+A clock time that has already passed today is taken as that hour tomorrow.
+When the time arrives, Scanyx launches no further scans, stops the ones still running,
+leaves them pending and prints the command to resume the session later.
+
+.PARAMETER StopMode
+What happens to the scans still running when -StopAt arrives.
+- Hard: stop them as well, so no traffic leaves the machine after that time (default)
+- Drain: launch nothing new, but let the ones already running finish
+Only meaningful together with -StopAt.
+
+.PARAMETER StartAt
+Hold the scan until a scheduled time, in the same formats as -StopAt.
+Scanyx waits in this process: no cron, launchd or at(1) is involved, so the session
+has to stay alive (tmux/nohup, and a machine that does not go to sleep).
+Everything it needs to ask is asked before the wait begins.
 
 .PARAMETER VerboseMode
 Enable verbose mode to display the full nmap command being executed for each host and show the complete nmap output after each scan completes.
@@ -138,6 +176,15 @@ Scan with very slow timing (T1) and no NSE scripts for critical/sensitive hosts.
 .EXAMPLE
 .\scanyx.ps1 -HostFile .\hosts.txt -ScanType tcp-1000 -VerboseMode
 Execute a scan with verbose mode enabled to see the exact nmap commands being run.
+
+.EXAMPLE
+.\scanyx.ps1 -HostFile .\hosts.txt -ScanType tcp-full -SessionName night-window -StopAt 06:00
+Scan until 06:00 and then stop, leaving whatever is left pending for a later resume.
+
+.EXAMPLE
+.\scanyx.ps1 -HostFile .\hosts.txt -ScanType tcp-full -SessionName night-window -StartAt 22:00 -StopAt 06:00 -StopMode Drain
+Wait until 22:00, scan the agreed window, and at 06:00 launch nothing new while
+letting the scans already running finish.
 
 .EXAMPLE
 .\scanyx.ps1 -Hosts "192.168.1.0/24","10.0.0.50" -ScanType tcp-1000
@@ -264,6 +311,264 @@ function Format-Duration {
         return "{0}m {1:D2}s" -f [math]::Floor($TimeSpan.TotalMinutes), $TimeSpan.Seconds
     }
     return "{0}s" -f [math]::Floor($TimeSpan.TotalSeconds)
+}
+
+function Resolve-StopTime {
+    # A scheduled stop is a promise about the engagement window: nothing of ours
+    # touches the client's network after that hour. Parse it with explicit
+    # formats instead of the current culture (see ConvertTo-ScanyxDateTime), and
+    # never hand back a moment that has already gone by.
+    #
+    # Accepts: "23:30", "23:30:00", "2026-09-18 06:00", "2026-09-18T06:00",
+    #          and relative spans such as "+90m", "2h", "1h30m", "1d2h".
+    # A bare clock time that already passed today means that hour tomorrow.
+    param(
+        [string]$Value,
+        [DateTime]$Now = [DateTime]::MinValue
+    )
+
+    if ($Now -eq [DateTime]::MinValue) { $Now = Get-Date }
+
+    $result = @{ Ok = $true; Time = $null; Error = "" }
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $result }
+
+    $raw = $Value.Trim()
+
+    # Relative span. The lookahead keeps a bare number ("30") out of here, so it
+    # falls through and is reported instead of silently meaning something.
+    if ($raw -match '^\+?(?=\d)(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$') {
+        $days    = if ($Matches[1]) { [int]$Matches[1] } else { 0 }
+        $hours   = if ($Matches[2]) { [int]$Matches[2] } else { 0 }
+        $minutes = if ($Matches[3]) { [int]$Matches[3] } else { 0 }
+        $seconds = if ($Matches[4]) { [int]$Matches[4] } else { 0 }
+
+        $span = New-TimeSpan -Days $days -Hours $hours -Minutes $minutes -Seconds $seconds
+        if ($span.TotalSeconds -le 0) {
+            $result.Ok = $false
+            $result.Error = "A relative stop time must be greater than zero: '$Value'"
+            return $result
+        }
+        $result.Time = $Now.Add($span)
+        return $result
+    }
+
+    $invariant = [System.Globalization.CultureInfo]::InvariantCulture
+    $styles    = [System.Globalization.DateTimeStyles]::None
+    $parsed    = [datetime]::MinValue
+
+    [string[]]$clockFormats = @('HH:mm', 'H:mm', 'HH:mm:ss', 'H:mm:ss')
+    if ([datetime]::TryParseExact($raw, $clockFormats, $invariant, $styles, [ref]$parsed)) {
+        $target = $Now.Date.AddHours($parsed.Hour).AddMinutes($parsed.Minute).AddSeconds($parsed.Second)
+        # 02:00 asked for at 23:00 means the small hours of tomorrow, not a
+        # deadline that fired eleven hours ago.
+        if ($target -le $Now) { $target = $target.AddDays(1) }
+        $result.Time = $target
+        return $result
+    }
+
+    [string[]]$dateFormats = @('yyyy-MM-dd HH:mm', 'yyyy-MM-dd HH:mm:ss',
+                     'yyyy-MM-ddTHH:mm', 'yyyy-MM-ddTHH:mm:ss',
+                     'yyyy/MM/dd HH:mm', 'dd/MM/yyyy HH:mm')
+    if ([datetime]::TryParseExact($raw, $dateFormats, $invariant, $styles, [ref]$parsed)) {
+        if ($parsed -le $Now) {
+            $result.Ok = $false
+            $result.Error = "The stop time $($parsed.ToString('yyyy-MM-dd HH:mm:ss')) is already in the past."
+            return $result
+        }
+        $result.Time = $parsed
+        return $result
+    }
+
+    $result.Ok = $false
+    $result.Error = "Could not read '$Value' as a stop time."
+    return $result
+}
+
+function Get-TimeRemainingText {
+    # How long is left before a scheduled stop, in the same units as everything
+    # else Scanyx prints.
+    param(
+        [DateTime]$Target,
+        [DateTime]$Now = [DateTime]::MinValue
+    )
+
+    if ($Now -eq [DateTime]::MinValue) { $Now = Get-Date }
+
+    $left = $Target - $Now
+    if ($left.TotalSeconds -le 0) { return "due now" }
+    return Format-Duration -TimeSpan $left
+}
+
+function Get-ResumeCommand {
+    # The exact line that picks this session up again. Printed before the scan
+    # starts as well as after it ends, because the run that most needs it is the
+    # one that was cut short - by a scheduled stop, by Ctrl+C, or by the ride home.
+    param(
+        [string]$SessionId,
+        [string]$OutputDir = "",
+        [bool]$Elevated = $false
+    )
+
+    $prefix = if ($Elevated -and ($IsLinux -or $IsMacOS)) { "sudo " } else { "" }
+    $command = "$prefix$(Get-InvocationHint) -ResumeSession `"$SessionId`""
+    if ($OutputDir -and $OutputDir -ne "") {
+        $command += " -OutputDir `"$OutputDir`""
+    }
+    return "$command -Resume"
+}
+
+# How long before a scheduled stop the run says so, in minutes. Descending.
+$Global:ScanyxStopWarnings = @(30, 10, 1)
+
+function Get-DueStopWarnings {
+    # Which of the warning thresholds have just come due. Thresholds already
+    # behind us when the run starts come back together, so a scan launched eight
+    # minutes before the deadline announces itself once instead of three times.
+    param(
+        [DateTime]$StopTime,
+        [hashtable]$Fired = @{},
+        [DateTime]$Now = [DateTime]::MinValue,
+        [int[]]$Thresholds = $null
+    )
+
+    if ($Now -eq [DateTime]::MinValue) { $Now = Get-Date }
+    if ($null -eq $Thresholds) { $Thresholds = $Global:ScanyxStopWarnings }
+
+    $minutesLeft = ($StopTime - $Now).TotalMinutes
+    if ($minutesLeft -le 0) { return @() }
+
+    $due = @()
+    foreach ($threshold in $Thresholds) {
+        if ($minutesLeft -le $threshold -and -not $Fired.ContainsKey($threshold)) {
+            $due += $threshold
+        }
+    }
+    return @($due | Sort-Object -Descending)
+}
+
+function Show-StopWarning {
+    # Announce an approaching stop once per threshold. $Fired is a hashtable and
+    # therefore shared with the caller by reference: what is said here is not
+    # said again by the next loop.
+    param(
+        $StopTime,
+        [hashtable]$Fired,
+        [string]$StopMode = "Hard",
+        [string]$LogFile = ""
+    )
+
+    if (-not $StopTime) { return }
+
+    $due = @(Get-DueStopWarnings -StopTime $StopTime -Fired $Fired)
+    if ($due.Count -eq 0) { return }
+    foreach ($threshold in $due) { $Fired[$threshold] = $true }
+
+    $left = Get-TimeRemainingText -Target $StopTime
+    $consequence = if ($StopMode -eq "Drain") {
+        "nothing new will be launched after it; the scans already running will finish"
+    } else {
+        "the run stops then, the scans still running included"
+    }
+
+    Write-Host ""
+    Write-Host "[WARNING] Scheduled stop in $left (at $($StopTime.ToString('HH:mm:ss'))) - $consequence" -ForegroundColor Yellow
+    if ($LogFile) {
+        Write-Log -Message "Scheduled stop in $left (at $($StopTime.ToString('yyyy-MM-dd HH:mm:ss')))" -Level "WARNING" -LogFile $LogFile
+    }
+}
+
+function Write-ResumeFile {
+    # The resume line, on disk next to the session it resumes. Terminal
+    # scrollback is lost, reused or scrolled past; the session directory is the
+    # thing the consultant still has tomorrow morning.
+    param(
+        [string]$SessionDir,
+        [string]$ResumeCommand,
+        [string]$SessionId,
+        [string]$Status = "in_progress"
+    )
+
+    if ([string]::IsNullOrWhiteSpace($SessionDir) -or [string]::IsNullOrWhiteSpace($ResumeCommand)) {
+        return ""
+    }
+
+    $path = [IO.Path]::Combine($SessionDir, "resume.txt")
+    $lines = @(
+        "# Scanyx - resume this session",
+        "# Session : $SessionId",
+        "# Status  : $Status",
+        "# Written : $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))",
+        "#",
+        "# Run it from the Scanyx directory (the one holding scanyx.sh / scanyx.ps1).",
+        "",
+        $ResumeCommand,
+        ""
+    )
+
+    try {
+        Set-Content -Path $path -Value $lines -Encoding UTF8 -ErrorAction Stop
+        return $path
+    } catch {
+        Write-Warning "Failed to write the resume file: $_"
+        return ""
+    }
+}
+
+function Wait-ForScheduledStart {
+    # Hold until the window opens. This is the whole scheduler: no cron, no
+    # launchd, no at(1) - which also means the process has to stay alive, so say
+    # so rather than let someone close the laptop and find nothing ran.
+    param(
+        [DateTime]$StartTime,
+        $StopTime = $null,
+        [int]$RefreshSeconds = 5,
+        [string]$LogFile = ""
+    )
+
+    $now = Get-Date
+    if ($StartTime -le $now) { return $now }
+
+    $wait = $StartTime - $now
+    Write-Host ""
+    Write-Host "⏳ Waiting for the scheduled start" -ForegroundColor Cyan
+    Write-Host "   Start at : " -NoNewline -ForegroundColor Cyan
+    Write-Host "$($StartTime.ToString('yyyy-MM-dd HH:mm:ss')) " -NoNewline -ForegroundColor Yellow
+    Write-Host "(in $(Format-Duration -TimeSpan $wait))" -ForegroundColor Gray
+    if ($StopTime) {
+        Write-Host "   Stop at  : " -NoNewline -ForegroundColor Cyan
+        Write-Host "$($StopTime.ToString('yyyy-MM-dd HH:mm:ss')) " -NoNewline -ForegroundColor Yellow
+        Write-Host "(window: $(Format-Duration -TimeSpan ($StopTime - $StartTime)))" -ForegroundColor Gray
+    }
+    Write-Host "   This process does the waiting itself: leave it running." -ForegroundColor DarkGray
+    if ($IsLinux -or $IsMacOS) {
+        Write-Host "   For a long wait use tmux/screen or nohup, and keep the machine awake" -ForegroundColor DarkGray
+        Write-Host "   (macOS: caffeinate -i ./scanyx.sh ...)." -ForegroundColor DarkGray
+    } else {
+        Write-Host "   For a long wait keep the window open and the machine awake." -ForegroundColor DarkGray
+    }
+    Write-Host "   Ctrl+C cancels; nothing has been scanned yet." -ForegroundColor DarkGray
+    if ($LogFile) {
+        Write-Log -Message "Waiting for the scheduled start at $($StartTime.ToString('yyyy-MM-dd HH:mm:ss')) ($(Format-Duration -TimeSpan $wait) from now)" -Level "INFO" -LogFile $LogFile
+    }
+
+    while ((Get-Date) -lt $StartTime) {
+        $left = $StartTime - (Get-Date)
+        $line = "   Starting in $(Format-Duration -TimeSpan $left)   (now $((Get-Date).ToString('HH:mm:ss')))"
+        # One line, rewritten in place: an overnight wait must not leave a
+        # thousand countdown lines above the scan itself.
+        Write-Host "`r$($line.PadRight(70))" -NoNewline -ForegroundColor DarkGray
+        $sleep = [math]::Min($RefreshSeconds, [math]::Max(1, [int][math]::Ceiling($left.TotalSeconds)))
+        Start-Sleep -Seconds $sleep
+    }
+
+    Write-Host "`r$(' ' * 70)`r" -NoNewline
+    $started = Get-Date
+    Write-Host "   Started at $($started.ToString('yyyy-MM-dd HH:mm:ss'))" -ForegroundColor Green
+    Write-Host ""
+    if ($LogFile) {
+        Write-Log -Message "Scheduled start reached: scanning begins now" -Level "INFO" -LogFile $LogFile
+    }
+    return $started
 }
 
 function Get-SensitiveScanCommand {
@@ -1146,7 +1451,10 @@ function Update-HostState {
         [string]$NewState,
         [int]$Attempts = 0,
         [string]$Error = "",
-        [string]$ScanFile = ""
+        [string]$ScanFile = "",
+        [string]$Liveness = "",
+        [string]$LivenessReason = "",
+        [int]$OpenPortCount = -1
     )
 
     # Support both -TargetHost and -Host (for tests)
@@ -1185,7 +1493,17 @@ function Update-HostState {
         if ($existingHost.line_number) { $hostState.line_number = $existingHost.line_number }
         if ($existingHost.result_file) { $hostState.result_file = $existingHost.result_file }
         if ($existingHost.target) { $hostState.target = $existingHost.target }
+        # A failed retry must not erase a verdict earned on the previous attempt.
+        if ($existingHost.liveness) { $hostState.liveness = $existingHost.liveness }
+        if ($existingHost.liveness_reason) { $hostState.liveness_reason = $existingHost.liveness_reason }
+        if ($null -ne $existingHost.open_port_count) { $hostState.open_port_count = $existingHost.open_port_count }
+        if ($existingHost.output_flag) { $hostState.output_flag = $existingHost.output_flag }
     }
+
+    # Explicit values win over whatever was preserved above.
+    if ($Liveness) { $hostState.liveness = $Liveness }
+    if ($LivenessReason) { $hostState.liveness_reason = $LivenessReason }
+    if ($OpenPortCount -ge 0) { $hostState.open_port_count = $OpenPortCount }
 
     # Add or update scan file
     if ($ScanFile -ne "") {
@@ -1309,35 +1627,502 @@ function Export-ScanResults {
     }
 }
 
-function Test-HostHasOpenPorts {
-    param([string]$XmlFile)
+# ---------------------------------------------------------------------------
+# Host liveness classification
+#
+# Every profile carries -Pn, so nmap's own host status is always
+# `state="up" reason="user-set"` and says nothing. The evidence that separates
+# "powered off", "alive with every port closed" and "firewall drops everything"
+# lives in the per-port `reason` attributes and in the <extraports> summary.
+#
+# Those survive `--open` only while a host has at least one open port. With zero
+# open ports `--open` drops the entire <host> element -- which is precisely the
+# "alive, every port closed" case -- so the TCP profiles no longer pass it. It
+# costs almost nothing: on a full -p- scan nmap collapses the 65500 closed ports
+# into one <extraports count="65500"> element.
+#
+#   open        at least one port strictly open
+#   alive       no open port, but the target's own stack answered
+#   filtered    probed, every answer was no-response: no evidence either way
+#   unreachable only third-party ICMP (a router said no)
+#   unknown     no usable evidence at all (missing/unreadable output)
+#
+# There is deliberately no `down`: under -Pn it cannot be earned. It belongs to
+# the host-discovery pre-pass.
+# ---------------------------------------------------------------------------
 
-    # Validate that XmlFile is not empty or null
-    if ([string]::IsNullOrWhiteSpace($XmlFile)) {
-        return $false
+function Get-NormalizedNmapReason {
+    param([string]$Reason)
+
+    if ([string]::IsNullOrWhiteSpace($Reason)) { return "" }
+    $r = $Reason.Trim().ToLowerInvariant()
+
+    # <extrareasons> pluralises in some nmap versions ("resets", "no-responses",
+    # "port-unreaches"). Capture before the second -match: it overwrites $Matches.
+    if ($r -match '^(.*[^s])es$') {
+        $stem = $Matches[1]
+        if ($stem -match '(ch|sh|ss|x|z)$') { return $stem }
+    }
+    if ($r -match '^(.+?[^s])s$') { return $Matches[1] }
+    return $r
+}
+
+function Get-NmapXmlPath {
+    param(
+        [string]$ResultFile,
+        [string]$OutputFlag = ""
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ResultFile)) { return "" }
+
+    # Command-list mode: the author's own output flag decides whether an XML
+    # file can exist at all. -oN/-oG/-oS produce none, so there is nothing to look for.
+    switch ($OutputFlag) {
+        "-oX" { if (Test-Path -LiteralPath $ResultFile) { return $ResultFile } else { return "" } }
+        "-oN" { return "" }
+        "-oG" { return "" }
+        "-oS" { return "" }
     }
 
-    if (-not (Test-Path $XmlFile)) {
-        return $false
+    $candidate = switch ([IO.Path]::GetExtension($ResultFile).ToLowerInvariant()) {
+        ".xml"   { $ResultFile }
+        ".nmap"  { [IO.Path]::ChangeExtension($ResultFile, ".xml") }
+        ".gnmap" { [IO.Path]::ChangeExtension($ResultFile, ".xml") }
+        default  { "$ResultFile.xml" }
     }
+
+    if ($candidate -and (Test-Path -LiteralPath $candidate)) { return $candidate }
+    return ""
+}
+
+function ConvertFrom-NmapXmlHost {
+    # Pure extraction: no verdict logic, no I/O. With an empty $TargetHost this
+    # aggregates every <host> in the document, which is what a -iL command-list
+    # line produces.
+    param(
+        [xml]$Xml,
+        [string]$TargetHost = ""
+    )
+
+    $facts = @{
+        OpenCount     = 0
+        ClosedCount   = 0
+        FilteredCount = 0
+        PortElements  = 0
+        Reasons       = @{}
+        HasClosedPort = $false
+        Srtt          = $null
+        StatusReason  = ""
+        TraceLastHop  = ""
+        HostAddress   = ""
+        FirstOpen     = $null
+        HostCount     = 0
+        TimedOut      = $false
+    }
+
+    if (-not $Xml -or -not $Xml.nmaprun) { return $facts }
+
+    $hostNodes = @($Xml.nmaprun.host) | Where-Object { $_ }
+    if ($TargetHost) {
+        $matched = @($hostNodes | Where-Object {
+            $_.address -and (@($_.address) | Where-Object { $_.addr -eq $TargetHost })
+        })
+        # A hostname target never matches an <address addr="">; falling back to
+        # every host beats reporting "no evidence" for a scan that has plenty.
+        if ($matched.Count -gt 0) { $hostNodes = $matched }
+    }
+
+    $addReason = {
+        param($Name, $Count)
+        $r = Get-NormalizedNmapReason $Name
+        if (-not $r) { return }
+        if (-not $facts.Reasons.ContainsKey($r)) { $facts.Reasons[$r] = 0 }
+        $facts.Reasons[$r] += [math]::Max([int]$Count, 1)
+    }
+
+    foreach ($h in $hostNodes) {
+        $facts.HostCount++
+
+        if ($h.status -and $h.status.reason) { $facts.StatusReason = [string]$h.status.reason }
+        # --host-timeout fired: nmap gave up before probing, so an absent port
+        # table means "we never looked", not "nothing answered".
+        if ([string]$h.timedout -eq 'true') { $facts.TimedOut = $true }
+
+        if (-not $facts.HostAddress -and $h.address) {
+            $ipv4 = @($h.address) | Where-Object { $_.addrtype -eq 'ipv4' } | Select-Object -First 1
+            if ($ipv4) { $facts.HostAddress = [string]$ipv4.addr }
+        }
+
+        # <times srtt> exists only when the target actually answered something.
+        if ($h.times -and $h.times.srtt) {
+            $srtt = 0.0
+            if ([double]::TryParse([string]$h.times.srtt, [ref]$srtt) -and $srtt -gt 0) { $facts.Srtt = $srtt }
+        }
+
+        if ($h.trace -and $h.trace.hop) {
+            $hops = @($h.trace.hop)
+            $last = $hops[$hops.Count - 1]
+            if ($last -and $last.ipaddr) { $facts.TraceLastHop = [string]$last.ipaddr }
+        }
+
+        if (-not $h.ports) { continue }
+
+        foreach ($p in @($h.ports.port)) {
+            if (-not $p -or -not $p.state) { continue }
+            $facts.PortElements++
+            $state = [string]$p.state.state
+            & $addReason ([string]$p.state.reason) 1
+
+            switch ($state) {
+                'open' {
+                    $facts.OpenCount++
+                    if (-not $facts.FirstOpen) {
+                        $facts.FirstOpen = @{
+                            port   = [string]$p.portid
+                            proto  = [string]$p.protocol
+                            reason = [string]$p.state.reason
+                        }
+                    }
+                }
+                'closed'     { $facts.ClosedCount++; $facts.HasClosedPort = $true }
+                'unfiltered' { $facts.HasClosedPort = $true }
+                # filtered, open|filtered, closed|filtered
+                default      { $facts.FilteredCount++ }
+            }
+        }
+
+        # Under --open the individual closed ports are gone but this summary
+        # survives, and it is what proves the host answered.
+        foreach ($ep in @($h.ports.extraports)) {
+            if (-not $ep) { continue }
+            $count = 0
+            [void][int]::TryParse([string]$ep.count, [ref]$count)
+            $facts.PortElements += $count
+
+            switch ([string]$ep.state) {
+                'closed'     { $facts.ClosedCount += $count; if ($count -gt 0) { $facts.HasClosedPort = $true } }
+                'unfiltered' { if ($count -gt 0) { $facts.HasClosedPort = $true } }
+                default      { $facts.FilteredCount += $count }
+            }
+
+            foreach ($er in @($ep.extrareasons)) {
+                if (-not $er -or -not $er.reason) { continue }
+                $rc = 0
+                [void][int]::TryParse([string]$er.count, [ref]$rc)
+                & $addReason ([string]$er.reason) $rc
+            }
+        }
+    }
+
+    return $facts
+}
+
+function Resolve-LivenessVerdict {
+    # The precedence table, first match wins. Pure: hashtable in, verdict out,
+    # so the table can be tested cell by cell without an XML file per case.
+    param(
+        [hashtable]$Facts,
+        [string]$TargetHost = ""
+    )
+
+    # The target's own stack answered.
+    $aliveReasons = @(
+        'syn-ack', 'reset', 'conn-refused', 'port-unreach', 'udp-response',
+        'proto-response', 'echo-reply', 'syn', 'arp-response', 'localhost-response'
+    )
+    # Someone else answered for it. port-unreach (ICMP 3/3) is the target;
+    # host-unreach and net-unreach (3/1, 3/0) are a router -- that split is the
+    # whole point of the classification.
+    $networkReasons = @(
+        'host-unreach', 'net-unreach', 'proto-unreach', 'admin-prohibited',
+        'host-prohibited', 'net-prohibited', 'tcp-response-from-other-host'
+    )
+
+    if (-not $Facts) { return @{ Verdict = 'unknown'; Evidence = 'no scan data' } }
+
+    $reasonKeys  = @()
+    if ($Facts.Reasons) { $reasonKeys = @($Facts.Reasons.Keys) }
+    $aliveHits   = @($reasonKeys | Where-Object { $aliveReasons -contains $_ })
+    $networkHits = @($reasonKeys | Where-Object { $networkReasons -contains $_ })
+
+    # 1. open
+    if ([int]$Facts.OpenCount -gt 0) {
+        $why = "$($Facts.OpenCount) open"
+        if ($Facts.FirstOpen) {
+            $why += " ($($Facts.FirstOpen.port)/$($Facts.FirstOpen.proto)"
+            if ($Facts.FirstOpen.reason) { $why += " $($Facts.FirstOpen.reason)" }
+            $why += ")"
+        }
+        if ([int]$Facts.ClosedCount -gt 0)   { $why += "; $($Facts.ClosedCount) closed" }
+        if ([int]$Facts.FilteredCount -gt 0) { $why += "; $($Facts.FilteredCount) filtered" }
+        return @{ Verdict = 'open'; Evidence = $why }
+    }
+
+    # 2. alive -- any evidence the target itself responded
+    $aliveWhy = @()
+    if ($Facts.HasClosedPort -and [int]$Facts.ClosedCount -gt 0) { $aliveWhy += "$($Facts.ClosedCount) closed" }
+    if ($aliveHits.Count -gt 0) { $aliveWhy += ($aliveHits -join ', ') }
+    if ($null -ne $Facts.Srtt)  {
+        # Persisted field: keep it locale-independent so the JSON does not change
+        # shape with the operator's culture.
+        $aliveWhy += ("srtt " + ([math]::Round($Facts.Srtt / 1000, 2)).ToString([cultureinfo]::InvariantCulture) + " ms")
+    }
+
+    $traceTarget = if ($TargetHost) { $TargetHost } else { [string]$Facts.HostAddress }
+    if ($Facts.TraceLastHop -and $traceTarget -and $Facts.TraceLastHop -eq $traceTarget) {
+        $aliveWhy += "traceroute reached target"
+    }
+
+    $statusReason = Get-NormalizedNmapReason ([string]$Facts.StatusReason)
+    if ($statusReason -and $statusReason -notin @('user-set', 'no-response')) {
+        $aliveWhy += "host status: $statusReason"
+    }
+
+    if ($aliveWhy.Count -gt 0) {
+        return @{ Verdict = 'alive'; Evidence = "no open ports; " + ($aliveWhy -join '; ') }
+    }
+
+    # 3. unreachable -- only a third party answered
+    if ($networkHits.Count -gt 0) {
+        $why = $networkHits -join ', '
+        if ($networkHits -contains 'admin-prohibited') { $why += " (source ambiguous)" }
+        return @{ Verdict = 'unreachable'; Evidence = $why }
+    }
+
+    # 4. filtered -- probed, nothing came back
+    if ([int]$Facts.PortElements -gt 0) {
+        if ($Facts.TimedOut) {
+            return @{ Verdict = 'unknown'; Evidence = "scan timed out after $($Facts.PortElements) port(s), none answered" }
+        }
+        return @{ Verdict = 'filtered'; Evidence = "$($Facts.FilteredCount) filtered, no response" }
+    }
+
+    # 5. unknown
+    if ($Facts.TimedOut) {
+        return @{ Verdict = 'unknown'; Evidence = 'scan timed out before any port was probed' }
+    }
+    return @{ Verdict = 'unknown'; Evidence = 'no usable evidence' }
+}
+
+function Get-LivenessVerdictFromText {
+    # Fallback for .nmap / .gnmap when there is no usable XML.
+    param([string]$Content)
+
+    $empty = @{ Verdict = 'unknown'; Evidence = 'empty output'; OpenCount = 0; ClosedCount = 0; FilteredCount = 0 }
+    if ([string]::IsNullOrWhiteSpace($Content)) { return $empty }
+
+    $isGrepable = ($Content -match '(?m)^# Nmap .* scan initiated') -and ($Content -match '\tPorts:')
+
+    if ($isGrepable) {
+        $open     = ([regex]::Matches($Content, '\d+/open/(tcp|udp)')).Count
+        $closed   = ([regex]::Matches($Content, '\d+/closed/(tcp|udp)')).Count
+        $filtered = ([regex]::Matches($Content, '\d+/(open\|)?filtered/(tcp|udp)')).Count
+    } else {
+        # The trailing \s is what keeps "53/udp open|filtered domain" out: a bare
+        # `open` prefix used to be counted as an open port, so an unresponsive
+        # UDP host was reported alive.
+        $open     = ([regex]::Matches($Content, '(?m)^\s*\d+/(tcp|udp)\s+open(\s|$)')).Count
+        $closed   = ([regex]::Matches($Content, '(?m)^\s*\d+/(tcp|udp)\s+closed(\s|$)')).Count
+        $filtered = ([regex]::Matches($Content, '(?m)^\s*\d+/(tcp|udp)\s+(open\|)?filtered(\s|$)')).Count
+
+        $notShownClosed = [regex]::Match($Content, '(?i)Not shown:\s*(\d+)\s+closed')
+        if ($notShownClosed.Success) { $closed += [int]$notShownClosed.Groups[1].Value }
+
+        $notShownFiltered = [regex]::Match($Content, '(?i)Not shown:\s*(\d+)\s+filtered')
+        if ($notShownFiltered.Success) { $filtered += [int]$notShownFiltered.Groups[1].Value }
+    }
+
+    $counts = @{ OpenCount = $open; ClosedCount = $closed; FilteredCount = $filtered }
+
+    if ($open -gt 0) {
+        return $counts + @{ Verdict = 'open'; Evidence = "$open open (text output)" }
+    }
+    if ($closed -gt 0) {
+        return $counts + @{ Verdict = 'alive'; Evidence = "no open ports; $closed closed (text output)" }
+    }
+    # "Host is up (0.0012s latency)." -- the parenthetical only appears when the
+    # target answered. Under -Pn an unresponsive host prints a bare "Host is up."
+    if ($Content -match '(?i)Host is up\s*\(') {
+        return $counts + @{ Verdict = 'alive'; Evidence = 'no open ports; host answered (latency reported)' }
+    }
+    if ($Content -match '(?i)(host-unreach|net-unreach|admin-prohibited|Host seems down)') {
+        return $counts + @{ Verdict = 'unreachable'; Evidence = 'network-level rejection (text output)' }
+    }
+    if ($filtered -gt 0 -or $Content -match '(?i)Host is up\.') {
+        return $counts + @{ Verdict = 'filtered'; Evidence = "$filtered filtered, no response (text output)" }
+    }
+
+    return $counts + @{ Verdict = 'unknown'; Evidence = 'no usable evidence (text output)' }
+}
+
+function Get-HostLivenessVerdict {
+    # Public entry point. XML first, text fallback, never throws.
+    param(
+        [string]$ResultFile,
+        [string]$TargetHost = "",
+        [string]$OutputFlag = "",
+        [int]$MaxXmlBytes = 33554432
+    )
+
+    $result = @{
+        Verdict = 'unknown'; Evidence = 'no scan output'; Source = 'none'
+        OpenCount = 0; ClosedCount = 0; FilteredCount = 0; SrttMs = $null
+    }
+    if ([string]::IsNullOrWhiteSpace($ResultFile)) { return $result }
+
+    # Prefer the .xml sibling -oA already writes; otherwise fall back to whatever
+    # the caller handed us, which may itself be XML (that is how the tests call it).
+    $xmlPath = Get-NmapXmlPath -ResultFile $ResultFile -OutputFlag $OutputFlag
+    $raw     = ""
+    $source  = ""
+
+    $readPath = if ($xmlPath) { $xmlPath } else { $ResultFile }
+    if (-not (Test-Path -LiteralPath $readPath)) { return $result }
 
     try {
-        $content = Get-Content $XmlFile -Raw -ErrorAction Stop
-
-        # Detect file format and use appropriate pattern
-        if ($content -match '<\?xml' -or $content -match '<nmaprun') {
-            # XML format: <state state="open"/>
-            return $content -match '<state\s+state="open"'
-        } elseif ($content -match '^# Nmap .* scan initiated' -and $content -match '\tPorts:') {
-            # Grepable format: "Ports: 53/open/tcp//domain///"
-            return $content -match '\d+/open/(tcp|udp)'
-        } else {
-            # Plain text .nmap format: "22/tcp   open  ssh"
-            return $content -match "\d+/(tcp|udp)\s+open"
+        $size = (Get-Item -LiteralPath $readPath -ErrorAction Stop).Length
+        if ($size -gt $MaxXmlBytes -and $xmlPath) {
+            Write-Warning "Skipping XML parse of $xmlPath ($([math]::Round($size / 1MB)) MB); using text output instead"
+            $xmlPath = ""
+            $readPath = $ResultFile
+            if (-not (Test-Path -LiteralPath $readPath)) { return $result }
         }
+        $raw = Get-Content -LiteralPath $readPath -Raw -ErrorAction Stop
     } catch {
-        return $false
+        return $result
     }
+
+    if ([string]::IsNullOrWhiteSpace($raw)) { return $result }
+
+    $looksXml = $xmlPath -or ($raw -match '<\?xml') -or ($raw -match '<nmaprun')
+
+    if ($looksXml) {
+        $doc = $null
+        try {
+            if ($raw -match '</nmaprun>') {
+                $doc = [xml]$raw
+                $source = 'xml'
+            } else {
+                # nmap flushes <host> elements as they finish, so a killed run
+                # leaves a valid prefix plus a partial tail. Dropping trailing
+                # bytes can only lose a host, never invent a verdict.
+                $lastHost = $raw.LastIndexOf('</host>')
+                if ($lastHost -ge 0) {
+                    $doc = [xml]($raw.Substring(0, $lastHost + 7) + [Environment]::NewLine + '</nmaprun>')
+                    $source = 'xml-repaired'
+                }
+            }
+        } catch {
+            $doc = $null
+        }
+
+        if ($doc) {
+            $facts   = ConvertFrom-NmapXmlHost -Xml $doc -TargetHost $TargetHost
+            $verdict = Resolve-LivenessVerdict -Facts $facts -TargetHost $TargetHost
+            return @{
+                Verdict       = $verdict.Verdict
+                Evidence      = $verdict.Evidence
+                Source        = $source
+                OpenCount     = [int]$facts.OpenCount
+                ClosedCount   = [int]$facts.ClosedCount
+                FilteredCount = [int]$facts.FilteredCount
+                SrttMs        = $(if ($null -ne $facts.Srtt) { [math]::Round($facts.Srtt / 1000, 3) } else { $null })
+            }
+        }
+
+        # Unrepairable XML: if we were reading a sibling, the text output may
+        # still be intact.
+        if ($xmlPath -and $xmlPath -ne $ResultFile -and (Test-Path -LiteralPath $ResultFile)) {
+            try { $raw = Get-Content -LiteralPath $ResultFile -Raw -ErrorAction Stop } catch { return $result }
+        }
+    }
+
+    $text = Get-LivenessVerdictFromText -Content $raw
+    return @{
+        Verdict       = $text.Verdict
+        Evidence      = $text.Evidence
+        Source        = $(if (($raw -match '(?m)^# Nmap .* scan initiated') -and ($raw -match '\tPorts:')) { 'grepable' } else { 'text' })
+        OpenCount     = [int]$text.OpenCount
+        ClosedCount   = [int]$text.ClosedCount
+        FilteredCount = [int]$text.FilteredCount
+        SrttMs        = $null
+    }
+}
+
+function Get-PersistedLiveness {
+    # The verdict recorded in state, or one recomputed from disk exactly once for
+    # a state file written before liveness existed. Never throws.
+    param(
+        $HostState,
+        [string]$TargetHost = ""
+    )
+
+    if (-not $HostState) { return "" }
+
+    $stored = ""
+    try { $stored = [string]$HostState.liveness } catch { $stored = "" }
+    if ($stored) { return $stored }
+
+    $scanFile = ""
+    try { $scanFile = [string]$HostState.scan_file } catch { $scanFile = "" }
+    if (-not $scanFile) { return "" }
+
+    $outputFlag = ""
+    try { $outputFlag = [string]$HostState.output_flag } catch { $outputFlag = "" }
+
+    try {
+        return (Get-HostLivenessVerdict -ResultFile $scanFile -TargetHost $TargetHost -OutputFlag $outputFlag).Verdict
+    } catch {
+        return ""
+    }
+}
+
+function Test-HostNeedsRescan {
+    # Shared predicate for the four retry-dead branches.
+    param(
+        $HostState,
+        [ValidateSet('NoResponse', 'NoOpenPorts')]
+        [string]$Mode = 'NoResponse'
+    )
+
+    $verdict = Get-PersistedLiveness -HostState $HostState
+    # Unclassifiable, or the output file is gone: rescan, as before.
+    if (-not $verdict) { return $true }
+
+    switch ($Mode) {
+        'NoResponse'  { return ($verdict -in @('filtered', 'unreachable', 'unknown')) }
+        'NoOpenPorts' { return ($verdict -ne 'open') }
+    }
+    return $true
+}
+
+function Format-LivenessCounters {
+    # filtered + unreachable + unknown collapse into one "no response" figure:
+    # five counters would push the ETA off a narrow terminal.
+    param(
+        [hashtable]$Counts = @{},
+        [int]$Width = 120
+    )
+
+    $open   = [int]$Counts['open']
+    $alive  = [int]$Counts['alive']
+    $noResp = [int]$Counts['filtered'] + [int]$Counts['unreachable'] + [int]$Counts['unknown']
+
+    if ($Width -ge 100) {
+        return " | Open: $open | Alive: $alive | NoResp: $noResp"
+    }
+    return " | O:$open A:$alive N:$noResp"
+}
+
+function Test-HostHasOpenPorts {
+    # Kept as a thin wrapper over the verdict: callers that only need "is there
+    # anything to attack here" keep working unchanged.
+    param([string]$XmlFile)
+
+    if ([string]::IsNullOrWhiteSpace($XmlFile)) { return $false }
+    if (-not (Test-Path $XmlFile)) { return $false }
+
+    return ((Get-HostLivenessVerdict -ResultFile $XmlFile).Verdict -eq 'open')
 }
 
 function Show-ProgressBar {
@@ -1350,32 +2135,22 @@ function Show-ProgressBar {
         [int]$WorkflowTotalSteps = 0,
         [string]$StepProfile = "",
         [hashtable]$NetworkProgress = @{},
-        [int]$AliveHosts = 0,
-        [hashtable]$HostStateInfo = @{},
+        [hashtable]$LivenessCounts = @{},
         [hashtable]$ActiveJobs = @{},
         [DateTime]$ScanStartTime = [DateTime]::MinValue,
         [array]$CompletedDurations = @(),
-        [int]$Concurrency = 1
+        [int]$Concurrency = 1,
+        [DateTime]$StopTime = [DateTime]::MinValue
     )
 
     $percent = if ($Total -gt 0) { [math]::Min([math]::Round(($Completed / $Total) * 100, 1), 100) } else { 0 }
     $successful = $Completed - $Failed
 
-    # Count hosts with open ports (Live hosts) and without (Dead hosts)
-    $liveHosts = 0
-    $deadHosts = 0
-    if ($HostStateInfo.Count -gt 0) {
-        foreach ($hostEntry in $HostStateInfo.GetEnumerator()) {
-            $hostData = $hostEntry.Value
-            if ($hostData.status -eq "completed" -and $hostData.scan_file) {
-                if (Test-HostHasOpenPorts -XmlFile $hostData.scan_file) {
-                    $liveHosts++
-                } else {
-                    $deadHosts++
-                }
-            }
-        }
-    }
+    # Liveness is tallied as each job finishes, so nothing here touches the disk.
+    $openHosts = [int]$LivenessCounts['open']
+    $livenessSummary = Format-LivenessCounters -Counts $LivenessCounts -Width $(
+        try { $Host.UI.RawUI.WindowSize.Width } catch { 120 }
+    )
 
     # Calculate elapsed time
     $elapsedStr = ""
@@ -1395,6 +2170,14 @@ function Show-ProgressBar {
             $eta = [TimeSpan]::FromSeconds($estimatedSeconds)
             $etaStr = " / ~$(Format-Duration -TimeSpan $eta) ETA"
         }
+    }
+
+    # Wall clock and, when the run has a deadline, how long is left of it. The
+    # elapsed counter above answers "how long have I been here"; this answers
+    # "how much of the window is left", which is the one with a hard edge.
+    $clockStr = " | Now: $((Get-Date).ToString('HH:mm:ss'))"
+    if ($StopTime -ne [DateTime]::MinValue) {
+        $clockStr += " | Stop: $($StopTime.ToString('HH:mm:ss')) (in $(Get-TimeRemainingText -Target $StopTime))"
     }
 
     # Get active hosts list
@@ -1425,7 +2208,7 @@ function Show-ProgressBar {
         $workflowPercent = [math]::Round((($WorkflowStep - 1) / $WorkflowTotalSteps) * 100, 1)
 
         # Build main status with alive hosts and network info
-        $mainStatus = "Step ${WorkflowStep}/${WorkflowTotalSteps}: ${StepProfile} | Alive: ${AliveHosts}/${Total} hosts"
+        $mainStatus = "Step ${WorkflowStep}/${WorkflowTotalSteps}: ${StepProfile} | Open: ${openHosts}/${Total} hosts"
 
         # Add network completion info if scanning multiple networks
         if ($NetworkProgress.Count -gt 0) {
@@ -1442,11 +2225,12 @@ function Show-ProgressBar {
 
         # Build secondary status - Ultra compact format
         $secondaryStatus = "$Completed/$Total ($percent%) | OK: $successful | Fail: $Failed"
-        $secondaryStatus += " | Live: $liveHosts | Dead: $deadHosts"
+        $secondaryStatus += $livenessSummary
 
         if ($elapsedStr -ne "") {
             $secondaryStatus += " | Time: $elapsedStr$etaStr"
         }
+        $secondaryStatus += $clockStr
 
         $secondaryCurrentOperation = ""
         if ($currentHostsDisplay -ne "") {
@@ -1463,11 +2247,12 @@ function Show-ProgressBar {
     } else {
         # Single scan mode: Show single progress bar - Ultra compact format
         $statusMessage = "$Completed/$Total ($percent%) | OK: $successful | Fail: $Failed"
-        $statusMessage += " | Live: $liveHosts | Dead: $deadHosts"
+        $statusMessage += $livenessSummary
 
         if ($elapsedStr -ne "") {
             $statusMessage += " | Time: $elapsedStr$etaStr"
         }
+        $statusMessage += $clockStr
 
         $currentOperation = ""
         if ($currentHostsDisplay -ne "") {
@@ -1505,7 +2290,7 @@ function Show-NetworkSummary {
     if ($completed.Count -gt 0) {
         Write-Host "`nCompleted Networks ($($completed.Count)):" -ForegroundColor Green
         foreach ($net in ($completed | Sort-Object Key)) {
-            Write-Host "  $([char]0x2713) $($net.Key): $($net.Value.Alive)/$($net.Value.Total) alive" -ForegroundColor Green
+            Write-Host "  $([char]0x2713) $($net.Key): $($net.Value.Open)/$($net.Value.Total) with open ports ($($net.Value.Alive) responded)" -ForegroundColor Green
         }
     }
 
@@ -1514,7 +2299,7 @@ function Show-NetworkSummary {
         Write-Host "`nPartially Scanned Networks ($($partial.Count)):" -ForegroundColor Yellow
         foreach ($net in ($partial | Sort-Object Key)) {
             $percent = [math]::Round(($net.Value.Scanned / $net.Value.Total) * 100, 1)
-            Write-Host "  $([char]0x26A0) $($net.Key): $($net.Value.Scanned)/$($net.Value.Total) scanned ($percent%) | $($net.Value.Alive) alive" -ForegroundColor Yellow
+            Write-Host "  $([char]0x26A0) $($net.Key): $($net.Value.Scanned)/$($net.Value.Total) scanned ($percent%) | $($net.Value.Open) open, $($net.Value.Alive) responded" -ForegroundColor Yellow
         }
     }
 
@@ -1691,12 +2476,12 @@ function Load-ScanConfiguration {
         "tcp-1000" = @{
             name = "TCP Top 1000 Ports"
             description = "Fast TCP scan of top 1000 ports with scripts and version detection"
-            command = "nmap -v -T4 -Pn -open -sS --script=default,vuln -A --host-timeout 60m"
+            command = "nmap -v -T4 -Pn -sS --script=default,vuln -A --host-timeout 60m"
         }
         "tcp-full" = @{
             name = "TCP Full Port Scan"
             description = "Complete TCP scan of all 65535 ports"
-            command = "nmap -v -T4 -Pn -open -sS --script=default,vuln -A --host-timeout 60m -p-"
+            command = "nmap -v -T4 -Pn -sS --script=default,vuln -A --host-timeout 60m -p-"
         }
         "udp-common" = @{
             name = "UDP Common Ports"
@@ -3003,7 +3788,8 @@ Invoke-Scanyx -Hosts "192.168.1.0/24" -ScanType tcp-full -MaxConcurrent 10
         [Parameter(Mandatory = $false)]
         [switch]$ResumeRetryFailed,
 
-        # Resume and retry dead hosts (completed but no open ports)
+        # Resume and retry hosts that showed no evidence of a response
+        # (filtered / unreachable / unclassifiable)
         [Parameter(Mandatory = $false)]
         [switch]$ResumeRetryDead,
 
@@ -3011,9 +3797,18 @@ Invoke-Scanyx -Hosts "192.168.1.0/24" -ScanType tcp-full -MaxConcurrent 10
         [Parameter(Mandatory = $false)]
         [switch]$RetryFailed,
 
-        # Retry only dead hosts (skip pending, failed, and alive)
+        # Retry only hosts that showed no evidence of a response
+        # (skip pending, failed, and anything that answered)
         [Parameter(Mandatory = $false)]
         [switch]$RetryDead,
+
+        # Retry every completed host without an open port, including the ones
+        # that answered on every closed port. The pre-liveness -RetryDead.
+        [Parameter(Mandatory = $false)]
+        [switch]$ResumeRetryNoOpenPorts,
+
+        [Parameter(Mandatory = $false)]
+        [switch]$RetryNoOpenPorts,
 
         # Force fresh start (archive old state)
         [Parameter(Mandatory = $false)]
@@ -3031,6 +3826,25 @@ Invoke-Scanyx -Hosts "192.168.1.0/24" -ScanType tcp-full -MaxConcurrent 10
         # Skip the pre-flight confirmation and start scanning straight away
         [Parameter(Mandatory = $false)]
         [switch]$Yes,
+
+        # Stop the scan at a scheduled time: a clock time ("23:30"), a date and
+        # time ("2026-09-18 06:00") or a relative span ("+90m", "1h30m").
+        # Nothing new is launched after it, whatever is running is stopped, and
+        # the rest stays pending for -ResumeSession.
+        [Parameter(Mandatory = $false)]
+        [string]$StopAt = "",
+
+        # What to do with the scans still running when -StopAt arrives:
+        # Hard stops them too (nothing on the wire after that time), Drain lets
+        # them finish and only stops new ones from starting.
+        [Parameter(Mandatory = $false)]
+        [ValidateSet("Hard", "Drain")]
+        [string]$StopMode = "Hard",
+
+        # Hold the scan until a scheduled time, same formats as -StopAt. The
+        # wait happens in this process: no cron, so it has to stay alive.
+        [Parameter(Mandatory = $false)]
+        [string]$StartAt = "",
 
         # A file of complete nmap command lines, one per line, written by the
         # consultant. Scanyx runs them with its own tracking, retries, state
@@ -3190,12 +4004,68 @@ if ($Wizard) {
 }
 
 # Validate mutually exclusive resume/retry/force parameters
-$resumeParams = @($Resume.IsPresent, $ResumeRetryFailed.IsPresent, $ResumeRetryDead.IsPresent, $RetryFailed.IsPresent, $RetryDead.IsPresent, $Force.IsPresent)
+$resumeParams = @($Resume.IsPresent, $ResumeRetryFailed.IsPresent, $ResumeRetryDead.IsPresent, $RetryFailed.IsPresent, $RetryDead.IsPresent, $ResumeRetryNoOpenPorts.IsPresent, $RetryNoOpenPorts.IsPresent, $Force.IsPresent)
 $resumeParamsCount = ($resumeParams | Where-Object { $_ }).Count
 if ($resumeParamsCount -gt 1) {
-    Write-Host "[ERROR] Parameters -Resume, -ResumeRetryFailed, -ResumeRetryDead, -RetryFailed, -RetryDead, and -Force are mutually exclusive. Use only one." -ForegroundColor DarkRed
+    Write-Host "[ERROR] Parameters -Resume, -ResumeRetryFailed, -ResumeRetryDead, -RetryFailed, -RetryDead, -ResumeRetryNoOpenPorts, -RetryNoOpenPorts, and -Force are mutually exclusive. Use only one." -ForegroundColor DarkRed
     return
 }
+
+# ---------------------------------------------------------------------------
+# Scheduled stop: resolve it before anything is read, expanded or created, so a
+# typo in the one parameter that guards the engagement window fails here rather
+# than three hours into the scan.
+# ---------------------------------------------------------------------------
+$stopTime = $null
+if ($StopAt -and $StopAt -ne "") {
+    $stopParsed = Resolve-StopTime -Value $StopAt
+    if (-not $stopParsed.Ok) {
+        Write-Host "[ERROR] $($stopParsed.Error)" -ForegroundColor DarkRed
+        Write-Host "" -ForegroundColor Gray
+        Write-Host "Accepted formats for -StopAt:" -ForegroundColor Yellow
+        Write-Host "  23:30            clock time today (tomorrow if it already passed)" -ForegroundColor Gray
+        Write-Host "  23:30:00         the same, to the second" -ForegroundColor Gray
+        Write-Host "  2026-09-18 06:00 an explicit date and time" -ForegroundColor Gray
+        Write-Host "  +90m / 2h / 1h30m / 1d2h   a span from now" -ForegroundColor Gray
+        Write-Host "" -ForegroundColor Gray
+        return
+    }
+    $stopTime = $stopParsed.Time
+}
+
+$startTime = $null
+if ($StartAt -and $StartAt -ne "") {
+    $startParsed = Resolve-StopTime -Value $StartAt
+    if (-not $startParsed.Ok) {
+        Write-Host "[ERROR] -StartAt: $($startParsed.Error)" -ForegroundColor DarkRed
+        Write-Host "" -ForegroundColor Gray
+        Write-Host "Accepted formats for -StartAt and -StopAt:" -ForegroundColor Yellow
+        Write-Host "  22:00            clock time today (tomorrow if it already passed)" -ForegroundColor Gray
+        Write-Host "  22:00:00         the same, to the second" -ForegroundColor Gray
+        Write-Host "  2026-09-18 22:00 an explicit date and time" -ForegroundColor Gray
+        Write-Host "  +90m / 2h / 1h30m / 1d2h   a span from now" -ForegroundColor Gray
+        Write-Host "" -ForegroundColor Gray
+        return
+    }
+    $startTime = $startParsed.Time
+
+    # A window that closes before it opens scans nothing at all. Say so now,
+    # rather than after waiting until 22:00 to stop at 22:00.
+    if ($stopTime -and $stopTime -le $startTime) {
+        Write-Host "[ERROR] The scheduled stop ($($stopTime.ToString('yyyy-MM-dd HH:mm:ss'))) is not after the scheduled start ($($startTime.ToString('yyyy-MM-dd HH:mm:ss')))." -ForegroundColor DarkRed
+        Write-Host "        A bare clock time always resolves to the next time it comes round," -ForegroundColor Gray
+        Write-Host "        so for a window crossing midnight give the date: -StopAt `"$((Get-Date).AddDays(1).ToString('yyyy-MM-dd')) 06:00`"" -ForegroundColor Gray
+        Write-Host "" -ForegroundColor Gray
+        return
+    }
+}
+
+if ($StopMode -eq "Drain" -and -not $stopTime) {
+    Write-Host "[WARNING] -StopMode only applies together with -StopAt; ignoring it." -ForegroundColor Yellow
+}
+
+# Show-ProgressBar takes a [DateTime], which will not bind $null
+$stopTimeForProgress = if ($stopTime) { $stopTime } else { [DateTime]::MinValue }
 
 # Validate SessionName if provided
 if ($SessionName -and $SessionName -ne "") {
@@ -4092,7 +4962,7 @@ if ($isWorkflowMode) {
     Write-Host "$ScanType " -NoNewline -ForegroundColor White
     Write-Host "- $($scanProfiles[$ScanType].name)" -ForegroundColor Gray
     Write-Host "   Command    : " -NoNewline -ForegroundColor Cyan
-    $cmdLines = Format-CommandForDisplay -Command $scanProfiles[$ScanType].command
+    $cmdLines = @(Format-CommandForDisplay -Command $scanProfiles[$ScanType].command)
     Write-Host $cmdLines[0] -ForegroundColor DarkGray
     foreach ($line in ($cmdLines | Select-Object -Skip 1)) {
         Write-Host $line -ForegroundColor DarkGray
@@ -4106,7 +4976,7 @@ if ($sensitiveHostsToScan.Count -gt 0) {
     $firstProfile = if ($isWorkflowMode) { $workflowSteps[0].profile } else { $ScanType }
     $sensCmd = Get-SensitiveScanCommand -BaseCommand $scanProfiles[$firstProfile].command -Timing $SensitiveTiming -Scripts $SensitiveScripts
     Write-Host "   Command    : " -NoNewline -ForegroundColor Cyan
-    $sLines = Format-CommandForDisplay -Command $sensCmd
+    $sLines = @(Format-CommandForDisplay -Command $sensCmd)
     Write-Host $sLines[0] -ForegroundColor DarkGray
     foreach ($line in ($sLines | Select-Object -Skip 1)) {
         Write-Host $line -ForegroundColor DarkGray
@@ -4130,6 +5000,45 @@ Write-Host "📁 Output     : " -NoNewline -ForegroundColor Cyan
 Write-Host "$OutputDir$([IO.Path]::DirectorySeparatorChar)" -ForegroundColor White
 Write-Host "   Session    : " -NoNewline -ForegroundColor Cyan
 Write-Host "$sessionId" -ForegroundColor White
+
+# The clock the run is measured against, and the line that picks it up again.
+# Both are printed before the confirmation so they are on screen from the start,
+# not only in the summary of a run that may never reach its summary.
+Write-Host "🕒 Clock      : " -NoNewline -ForegroundColor Cyan
+Write-Host "$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))" -NoNewline -ForegroundColor White
+if (-not $startTime -and -not $stopTime) {
+    Write-Host " (no schedule; -StartAt and -StopAt set one)" -ForegroundColor DarkGray
+} else {
+    Write-Host ""
+}
+if ($startTime) {
+    Write-Host "   Starts at  : " -NoNewline -ForegroundColor Cyan
+    Write-Host "$($startTime.ToString('yyyy-MM-dd HH:mm:ss')) " -NoNewline -ForegroundColor Yellow
+    Write-Host "(in $(Get-TimeRemainingText -Target $startTime)) " -NoNewline -ForegroundColor Gray
+    Write-Host "- this process waits; leave it running" -ForegroundColor DarkGray
+}
+if ($stopTime) {
+    Write-Host "   Stops at   : " -NoNewline -ForegroundColor Cyan
+    Write-Host "$($stopTime.ToString('yyyy-MM-dd HH:mm:ss')) " -NoNewline -ForegroundColor Yellow
+    Write-Host "(in $(Get-TimeRemainingText -Target $stopTime))" -ForegroundColor Gray
+    if ($startTime) {
+        Write-Host "   Window     : " -NoNewline -ForegroundColor Cyan
+        Write-Host "$(Format-Duration -TimeSpan ($stopTime - $startTime))" -ForegroundColor White
+    }
+    Write-Host "   On stop    : " -NoNewline -ForegroundColor Cyan
+    if ($StopMode -eq "Drain") {
+        Write-Host "drain " -NoNewline -ForegroundColor White
+        Write-Host "- nothing new is launched, the scans already running finish" -ForegroundColor Gray
+    } else {
+        Write-Host "hard " -NoNewline -ForegroundColor White
+        Write-Host "- the scans still running are stopped too" -ForegroundColor Gray
+    }
+    Write-Host "                Whatever is left stays pending; resume it with the line below." -ForegroundColor DarkGray
+}
+
+$resumeCommand = Get-ResumeCommand -SessionId $sessionId -OutputDir $OutputDir -Elevated (Test-IsElevated)
+Write-Host "↩️  Resume     : " -NoNewline -ForegroundColor Cyan
+Write-Host "$resumeCommand" -ForegroundColor Yellow
 
 Write-Host "⚙️  Execution  : " -NoNewline -ForegroundColor Cyan
 Write-Host "$MaxConcurrent concurrent | $MaxRetries retry | ${RetryDelay}s delay | $OverwriteMode" -ForegroundColor White
@@ -4186,9 +5095,20 @@ $workflowStepNumber = 1
 # Initialize timing tracking for entire scan session
 $scanStartTime = Get-Date
 
+# Set once the scheduled stop time arrives, and never cleared: it ends the
+# current step and keeps any later workflow step from starting.
+$stopReached = $false
+
 foreach ($workflowStep in $workflowSteps) {
     $currentProfile = $workflowStep.profile
     $stepCondition = if ($workflowStep.condition) { $workflowStep.condition } else { $WorkflowCondition }
+    # Nothing consumes $stepCondition yet, so a step declaring anything but
+    # 'always' still runs against every host. Better a visible no-op than a
+    # silent one; implementing it needs a decision on whether the condition is
+    # per-host or global, which is a separate change.
+    if ($stepCondition -and $stepCondition -ne 'always') {
+        Write-Log -Message "Workflow step $workflowStepNumber declares condition '$stepCondition', which is not yet enforced; the step will run unconditionally." -Level "WARNING" -LogFile $logFile
+    }
 
     if ($isWorkflowMode) {
         Write-Host "`n========================================" -ForegroundColor Magenta
@@ -4222,8 +5142,10 @@ foreach ($workflowStep in $workflowSteps) {
     $errorLogFile = Join-Path $sessionDir "scan-errors.log"
     $resultsFile = Join-Path $sessionDir "scan-results.json"
 
-    # Initialize tracking for alive hosts and network progress (per workflow step)
-    $aliveHostsCount = 0
+    # Initialize liveness tallies and network progress (per workflow step).
+    # Counting here, as each job finishes, is what lets the progress bar stop
+    # re-reading every host's output file on every repaint.
+    $script:livenessCounts = @{ open = 0; alive = 0; filtered = 0; unreachable = 0; unknown = 0 }
     $script:networkProgress = @{}
 
     # Initialize network progress tracking for each CIDR
@@ -4232,6 +5154,7 @@ foreach ($workflowStep in $workflowSteps) {
             Total = 0
             Scanned = 0
             Alive = 0
+            Open = 0
         }
     }
 
@@ -4298,6 +5221,7 @@ foreach ($currentHost in $validHosts) {
             target = $unit.Target
             line_number = $unit.LineNumber
             result_file = $unit.ResultFile
+            output_flag = $unit.OutputFlag
             output_folder = $outputFolder
         }
     } else {
@@ -4387,6 +5311,10 @@ if ($hasValidState -and -not $Force) {
         $action = "Retry failed only"
     } elseif ($RetryDead) {
         $action = "Retry dead only"
+    } elseif ($ResumeRetryNoOpenPorts) {
+        $action = "Resume and retry hosts without open ports"
+    } elseif ($RetryNoOpenPorts) {
+        $action = "Retry hosts without open ports only"
     } else {
         # Interactive choice
         $options = @(
@@ -4395,6 +5323,8 @@ if ($hasValidState -and -not $Force) {
             "Resume and retry dead",
             "Retry failed only",
             "Retry dead only",
+            "Resume and retry hosts without open ports",
+            "Retry hosts without open ports only",
             "Force (start fresh)",
             "Cancel"
         )
@@ -4407,6 +5337,39 @@ if ($hasValidState -and -not $Force) {
     }
 
     Write-Log -Message "Action selected: $action" -Level "INFO" -LogFile $logFile
+
+    # The two "no open ports" actions run exactly the selection their "dead"
+    # counterparts do; only the rescan predicate differs, so map them onto the
+    # same cases and carry the difference in $retryDeadMode.
+    $retryDeadMode = 'NoResponse'
+    switch ($action) {
+        "Resume and retry hosts without open ports" {
+            $retryDeadMode = 'NoOpenPorts'
+            $action = "Resume and retry dead"
+        }
+        "Retry hosts without open ports only" {
+            $retryDeadMode = 'NoOpenPorts'
+            $action = "Retry dead only"
+        }
+    }
+
+    # -RetryDead used to mean "no open ports", which rescanned hosts that had
+    # answered RST on every port -- a retry guaranteed to reproduce itself. Say
+    # so once, with the number of hosts it no longer touches.
+    if ($retryDeadMode -eq 'NoResponse' -and $action -in @("Resume and retry dead", "Retry dead only")) {
+        $answeredNoPorts = 0
+        foreach ($currentHost in $validHosts) {
+            $hostState = $existingState.hosts.$currentHost
+            if (-not $hostState -or $hostState.status -ne "completed") { continue }
+            if ((Get-PersistedLiveness -HostState $hostState -TargetHost $currentHost) -eq 'alive') { $answeredNoPorts++ }
+        }
+        if ($answeredNoPorts -gt 0) {
+            Write-Host "[INFO] -RetryDead now retries only hosts with no response (filtered/unreachable/unknown)." -ForegroundColor Cyan
+            Write-Host "       $answeredNoPorts host(s) that answered with all ports closed are no longer retried." -ForegroundColor Cyan
+            Write-Host "       Use -RetryNoOpenPorts for the previous behaviour." -ForegroundColor Cyan
+            Write-Log -Message "-RetryDead narrowed to no-response hosts; $answeredNoPorts host(s) that answered are no longer retried" -Level "INFO" -LogFile $logFile
+        }
+    }
 
     # Build list of hosts to scan based on action
     switch ($action) {
@@ -4462,27 +5425,14 @@ if ($hasValidState -and -not $Force) {
                     $state.failed--
                 }
                 elseif ($hostState.status -eq "completed") {
-                    # Completed host → check if has open ports
-                    $isDeadHost = $false
-
-                    if ($hostState.scan_file -and (Test-Path $hostState.scan_file)) {
-                        # .nmap file exists → check content
-                        $hasOpenPorts = Test-HostHasOpenPorts -XmlFile $hostState.scan_file
-                        if (-not $hasOpenPorts) {
-                            $isDeadHost = $true
-                        }
-                    } else {
-                        # .nmap file does NOT exist → consider "dead"
-                        $isDeadHost = $true
-                    }
-
-                    if ($isDeadHost) {
-                        # NO open ports → RESCAN
+                    # A host that answered RST on every port is alive, and
+                    # rescanning it is guaranteed to reproduce the same answer.
+                    # Only hosts with no evidence of a response are worth a retry.
+                    if (Test-HostNeedsRescan -HostState $hostState -Mode $retryDeadMode) {
                         $hostsToScan += $currentHost
                         $state.hosts[$currentHost] = $hostState
                         $state.hosts[$currentHost].status = "pending"
                     } else {
-                        # Has open ports → SKIP
                         $state.hosts[$currentHost] = $hostState
                     }
                 }
@@ -4520,27 +5470,14 @@ if ($hasValidState -and -not $Force) {
                     }
                 }
                 elseif ($hostState -and $hostState.status -eq "completed") {
-                    # Completed host → check if has open ports
-                    $isDeadHost = $false
-
-                    if ($hostState.scan_file -and (Test-Path $hostState.scan_file)) {
-                        # .nmap file exists → check content
-                        $hasOpenPorts = Test-HostHasOpenPorts -XmlFile $hostState.scan_file
-                        if (-not $hasOpenPorts) {
-                            $isDeadHost = $true
-                        }
-                    } else {
-                        # .nmap file does NOT exist → consider "dead"
-                        $isDeadHost = $true
-                    }
-
-                    if ($isDeadHost) {
-                        # NO open ports → RESCAN
+                    # A host that answered RST on every port is alive, and
+                    # rescanning it is guaranteed to reproduce the same answer.
+                    # Only hosts with no evidence of a response are worth a retry.
+                    if (Test-HostNeedsRescan -HostState $hostState -Mode $retryDeadMode) {
                         $hostsToScan += $currentHost
                         $state.hosts[$currentHost] = $hostState
                         $state.hosts[$currentHost].status = "pending"
                     } else {
-                        # Has open ports → SKIP
                         $state.hosts[$currentHost] = $hostState
                     }
                 }
@@ -4648,10 +5585,18 @@ Write-Log -Message "  - Verbose mode: $VerboseMode" -Level "INFO" -LogFile $logF
 # Save initial state
 Save-StateFile -StateFile $stateFile -State $state
 
+# The resume line on disk, written before the first scan so it is already there
+# if the run dies in a way that prints nothing at all.
+$resumeCommand = Get-ResumeCommand -SessionId $sessionId -OutputDir $OutputDir -Elevated (Test-IsElevated)
+$resumeFile = Write-ResumeFile -SessionDir $sessionDir -ResumeCommand $resumeCommand -SessionId $sessionId -Status "in_progress"
+
 # Remembered for the interrupt handler, which runs in its own scope and may
 # fire on any workflow step.
 $script:currentResultsFile = $resultsFile
 $script:currentSessionId = $sessionId
+$script:currentOutputDir = $OutputDir
+$script:currentElevated = Test-IsElevated
+$script:currentResumeFile = $resumeFile
 
 # Initialize results file
 if (-not (Test-Path $resultsFile)) {
@@ -4692,6 +5637,16 @@ $exitSubscriber = Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Act
         Export-ScanResults -ResultsFile $script:currentResultsFile -SessionId $script:currentSessionId
     }
 
+    # Ctrl+C is precisely when the resume line matters, and the summary that
+    # normally prints it is never reached.
+    if ($script:currentSessionId) {
+        Write-Host "[INFO] Resume this session with:" -ForegroundColor Cyan
+        Write-Host "  $(Get-ResumeCommand -SessionId $script:currentSessionId -OutputDir $script:currentOutputDir -Elevated $script:currentElevated)" -ForegroundColor Yellow
+        if ($script:currentResumeFile) {
+            Write-Host "       Also saved in: $script:currentResumeFile" -ForegroundColor DarkGray
+        }
+    }
+
     Write-Host "[INFO] Cleanup completed. Exiting...`n" -ForegroundColor Yellow
 }
 
@@ -4704,21 +5659,41 @@ $jobQueue = @{}
 $scanDurations = @()  # Array to store completed scan durations in seconds
 $jobStartTimes = @{}  # Hashtable to track when each job started
 
+# Scheduled start: hold here, not earlier. Everything the run needs to ask -
+# the pre-flight, the previous-session choice, the overwrite question - has been
+# asked by now, so an unattended window does not open onto a prompt.
+if ($startTime -and -not $startWaitDone) {
+    $null = Wait-ForScheduledStart -StartTime $startTime -StopTime $stopTime -LogFile $logFile
+    $startWaitDone = $true
+    # The clock the summary and the ETA run on is the scan's, not the wait's.
+    $scanStartTime = Get-Date
+    $scriptStartTime = $scanStartTime
+}
+
+# Warning thresholds already announced, so each one is said once per step
+$stopWarningsFired = @{}
+
 Write-Host ""
 
 foreach ($currentHost in $hostsToScan) {
+    # Scheduled stop: nothing new leaves the machine after the deadline.
+    Show-StopWarning -StopTime $stopTime -Fired $stopWarningsFired -StopMode $StopMode -LogFile $logFile
+    if ($stopTime -and (Get-Date) -ge $stopTime) { $stopReached = $true; break }
+
     # Wait if max concurrent jobs reached
     $progressUpdateCounter = 0
     while ($jobQueue.Count -ge $MaxConcurrent) {
+        Show-StopWarning -StopTime $stopTime -Fired $stopWarningsFired -StopMode $StopMode -LogFile $logFile
+        if ($stopTime -and (Get-Date) -ge $stopTime) { $stopReached = $true; break }
         Start-Sleep -Milliseconds 500
         $progressUpdateCounter++
 
         # Update progress bar every ~60 seconds (120 iterations * 500ms)
         if ($progressUpdateCounter % 120 -eq 0) {
             if ($isWorkflowMode) {
-                Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost "" -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -AliveHosts $aliveHostsCount -HostStateInfo $state.hosts -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent
+                Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost "" -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -LivenessCounts $script:livenessCounts -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -StopTime $stopTimeForProgress
             } else {
-                Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost "" -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -HostStateInfo $state.hosts
+                Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost "" -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -LivenessCounts $script:livenessCounts -StopTime $stopTimeForProgress
             }
         }
 
@@ -4738,7 +5713,10 @@ foreach ($currentHost in $hostsToScan) {
                 # Check if host has open ports and update counters
                 $nmapFile = if ($jobData.ResultFile) { $jobData.ResultFile } else { "$([IO.Path]::Combine($jobData.HostFolder, $jobData.FileName)).nmap" }
 
-                Update-HostState -State $state -TargetHost $jobHost -Status "completed" -Attempts $attempts -ScanFile $nmapFile
+                $verdict = Get-HostLivenessVerdict -ResultFile $nmapFile -TargetHost $jobHost -OutputFlag $state.hosts[$jobHost].output_flag
+                Update-HostState -State $state -TargetHost $jobHost -Status "completed" -Attempts $attempts -ScanFile $nmapFile `
+                                 -Liveness $verdict.Verdict -LivenessReason $verdict.Evidence -OpenPortCount $verdict.OpenCount
+                $script:livenessCounts[$verdict.Verdict]++
                 $completedCount++
                 Write-Log -Message "Scan completed: $jobHost | $currentScanType | Attempt: $attempts | Duration: $(Format-Duration -TimeSpan ([TimeSpan]::FromSeconds($jobResult.DurationSeconds)))" -Level "SUCCESS" -LogFile $logFile
 
@@ -4748,12 +5726,12 @@ foreach ($currentHost in $hostsToScan) {
                     $scanDurations += $duration.TotalSeconds
                     $jobStartTimes.Remove($jobHost)
                 }
-                if (Test-HostHasOpenPorts -XmlFile $nmapFile) {
-                    $aliveHostsCount++
-                    $hostCIDR = $state.hosts[$jobHost].source_cidr
-                    if ($hostCIDR -and $script:networkProgress.ContainsKey($hostCIDR)) {
-                        $script:networkProgress[$hostCIDR].Alive++
-                    }
+                # Alive counts every host that answered, open counts the ones with
+                # attack surface. A host that RSTs every port is alive, not dead.
+                $hostCIDR = $state.hosts[$jobHost].source_cidr
+                if ($hostCIDR -and $script:networkProgress.ContainsKey($hostCIDR)) {
+                    if ($verdict.Verdict -eq 'open') { $script:networkProgress[$hostCIDR].Open++ }
+                    if ($verdict.Verdict -in @('open', 'alive')) { $script:networkProgress[$hostCIDR].Alive++ }
                 }
 
                 # Update network scanned counter
@@ -4785,6 +5763,15 @@ foreach ($currentHost in $hostsToScan) {
                     duration_seconds = $jobResult.DurationSeconds
                     attempts = $attempts
                     output_files = @($nmapFile)
+                    liveness = $verdict.Verdict
+                    liveness_reason = $verdict.Evidence
+                    liveness_source = $verdict.Source
+                    srtt_ms = $verdict.SrttMs
+                    port_counts = @{
+                        open = $verdict.OpenCount
+                        closed = $verdict.ClosedCount
+                        filtered = $verdict.FilteredCount
+                    }
                 }
             } else {
                 # Check if retry needed
@@ -4831,6 +5818,7 @@ foreach ($currentHost in $hostsToScan) {
                         duration_seconds = $jobResult.DurationSeconds
                         attempts = $attempts
                         error = $jobResult.Error
+                        liveness = 'unknown'
                     }
                 }
             }
@@ -4838,15 +5826,18 @@ foreach ($currentHost in $hostsToScan) {
             # Save state and update progress
             Save-StateFile -StateFile $stateFile -State $state
             if ($isWorkflowMode) {
-                Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost $jobHost -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -AliveHosts $aliveHostsCount -HostStateInfo $state.hosts -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent
+                Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost $jobHost -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -LivenessCounts $script:livenessCounts -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -StopTime $stopTimeForProgress
             } else {
-                Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost $jobHost -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -HostStateInfo $state.hosts
+                Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost $jobHost -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -LivenessCounts $script:livenessCounts -StopTime $stopTimeForProgress
             }
 
             # Remove from queue
             $jobQueue.Remove($jobHost)
         }
     }
+
+    # The wait above exits on the deadline as well as on a free slot
+    if ($stopReached) { break }
 
     # Get host metadata from state
     $hostMeta = $state.hosts[$currentHost]
@@ -4891,7 +5882,12 @@ foreach ($currentHost in $hostsToScan) {
             switch ($OverwriteMode) {
                 "Skip" {
                     Write-Log -Message "Skipping $currentHost (results already exist)" -Level "INFO" -LogFile $logFile
-                    Update-HostState -State $state -TargetHost $currentHost -Status "completed" -Attempts 0 -ScanFile $existingNmapFile
+                    # Classify here as well: a skipped host that reached the
+                    # summary without a verdict would just be re-parsed there.
+                    $skipVerdict = Get-HostLivenessVerdict -ResultFile $existingNmapFile -TargetHost $currentHost -OutputFlag $state.hosts[$currentHost].output_flag
+                    Update-HostState -State $state -TargetHost $currentHost -Status "completed" -Attempts 0 -ScanFile $existingNmapFile `
+                                     -Liveness $skipVerdict.Verdict -LivenessReason $skipVerdict.Evidence -OpenPortCount $skipVerdict.OpenCount
+                    $script:livenessCounts[$skipVerdict.Verdict]++
                     $completedCount++
                     Save-StateFile -StateFile $stateFile -State $state
                     $skipHost = $true
@@ -4944,24 +5940,26 @@ foreach ($currentHost in $hostsToScan) {
     $jobStartTimes[$currentHost] = Get-Date
 
     if ($isWorkflowMode) {
-        Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost $currentHost -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -AliveHosts $aliveHostsCount -HostStateInfo $state.hosts -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent
+        Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost $currentHost -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -LivenessCounts $script:livenessCounts -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -StopTime $stopTimeForProgress
     } else {
-        Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost $currentHost -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -HostStateInfo $state.hosts
+        Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost $currentHost -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -LivenessCounts $script:livenessCounts -StopTime $stopTimeForProgress
     }
 }
 
 # Wait for remaining jobs to complete
 $progressUpdateCounter = 0
 while ($jobQueue.Count -gt 0) {
+    Show-StopWarning -StopTime $stopTime -Fired $stopWarningsFired -StopMode $StopMode -LogFile $logFile
+    if ($stopTime -and $StopMode -ne "Drain" -and (Get-Date) -ge $stopTime) { $stopReached = $true; break }
     Start-Sleep -Milliseconds 500
     $progressUpdateCounter++
 
     # Update progress bar every ~60 seconds (120 iterations * 500ms)
     if ($progressUpdateCounter % 120 -eq 0) {
         if ($isWorkflowMode) {
-            Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost "" -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -AliveHosts $aliveHostsCount -HostStateInfo $state.hosts -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent
+            Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost "" -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -LivenessCounts $script:livenessCounts -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -StopTime $stopTimeForProgress
         } else {
-            Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost "" -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -HostStateInfo $state.hosts
+            Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost "" -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -LivenessCounts $script:livenessCounts -StopTime $stopTimeForProgress
         }
     }
 
@@ -4979,15 +5977,18 @@ while ($jobQueue.Count -gt 0) {
             # Check if host has open ports and update counters
             $nmapFile = if ($jobData.ResultFile) { $jobData.ResultFile } else { "$([IO.Path]::Combine($jobData.HostFolder, $jobData.FileName)).nmap" }
 
-            Update-HostState -State $state -TargetHost $jobHost -Status "completed" -Attempts $attempts -ScanFile $nmapFile
+            $verdict = Get-HostLivenessVerdict -ResultFile $nmapFile -TargetHost $jobHost -OutputFlag $state.hosts[$jobHost].output_flag
+            Update-HostState -State $state -TargetHost $jobHost -Status "completed" -Attempts $attempts -ScanFile $nmapFile `
+                             -Liveness $verdict.Verdict -LivenessReason $verdict.Evidence -OpenPortCount $verdict.OpenCount
+            $script:livenessCounts[$verdict.Verdict]++
             $completedCount++
             Write-Log -Message "Scan completed: $jobHost | $currentScanType | Attempt: $attempts | Duration: $(Format-Duration -TimeSpan ([TimeSpan]::FromSeconds($jobResult.DurationSeconds)))" -Level "SUCCESS" -LogFile $logFile
-            if (Test-HostHasOpenPorts -XmlFile $nmapFile) {
-                $aliveHostsCount++
-                $hostCIDR = $state.hosts[$jobHost].source_cidr
-                if ($hostCIDR -and $script:networkProgress.ContainsKey($hostCIDR)) {
-                    $script:networkProgress[$hostCIDR].Alive++
-                }
+            # Alive counts every host that answered, open counts the ones with
+            # attack surface. A host that RSTs every port is alive, not dead.
+            $hostCIDR = $state.hosts[$jobHost].source_cidr
+            if ($hostCIDR -and $script:networkProgress.ContainsKey($hostCIDR)) {
+                if ($verdict.Verdict -eq 'open') { $script:networkProgress[$hostCIDR].Open++ }
+                if ($verdict.Verdict -in @('open', 'alive')) { $script:networkProgress[$hostCIDR].Alive++ }
             }
 
             # Update network scanned counter
@@ -5018,6 +6019,15 @@ while ($jobQueue.Count -gt 0) {
                 duration_seconds = $jobResult.DurationSeconds
                 attempts = $attempts
                 output_files = @($nmapFile)
+                liveness = $verdict.Verdict
+                liveness_reason = $verdict.Evidence
+                liveness_source = $verdict.Source
+                srtt_ms = $verdict.SrttMs
+                port_counts = @{
+                    open = $verdict.OpenCount
+                    closed = $verdict.ClosedCount
+                    filtered = $verdict.FilteredCount
+                }
             }
         } else {
             if ($attempts -lt ($MaxRetries + 1)) {
@@ -5060,19 +6070,47 @@ while ($jobQueue.Count -gt 0) {
                     duration_seconds = $jobResult.DurationSeconds
                     attempts = $attempts
                     error = $jobResult.Error
+                    liveness = 'unknown'
                 }
             }
         }
 
         Save-StateFile -StateFile $stateFile -State $state
         if ($isWorkflowMode) {
-            Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost $jobHost -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -AliveHosts $aliveHostsCount -HostStateInfo $state.hosts -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent
+            Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost $jobHost -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -LivenessCounts $script:livenessCounts -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -StopTime $stopTimeForProgress
         } else {
-            Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost $jobHost -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -HostStateInfo $state.hosts
+            Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost $jobHost -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -LivenessCounts $script:livenessCounts -StopTime $stopTimeForProgress
         }
 
         $jobQueue.Remove($jobHost)
     }
+}
+
+# Scheduled stop: cut the run here. Scans still in flight are stopped and left
+# unfinished rather than recorded as failures - they were never given the chance
+# to complete, and the resume has to run them again from the beginning.
+# They stay "in_progress" on purpose: a killed nmap still leaves a partial .nmap
+# on disk, and that is the one status the resume treats as incomplete results to
+# overwrite instead of a finished scan to skip.
+$stoppedInFlight = 0
+if ($stopReached) {
+    foreach ($entry in @($jobQueue.GetEnumerator())) {
+        $stoppedHost = $entry.Key
+        try {
+            Stop-Job -Job $entry.Value.Job -ErrorAction SilentlyContinue
+            Remove-Job -Job $entry.Value.Job -Force -ErrorAction SilentlyContinue
+        } catch { }
+        Update-HostState -State $state -TargetHost $stoppedHost -Status "in_progress" -Attempts $entry.Value.Attempts -Error "Stopped at the scheduled stop time (incomplete, will be scanned again)"
+        $stoppedInFlight++
+        $jobQueue.Remove($stoppedHost)
+    }
+    Save-StateFile -StateFile $stateFile -State $state
+    $stopDetail = if ($StopMode -eq "Drain") {
+        "the scans already running were allowed to finish"
+    } else {
+        "$stoppedInFlight scan(s) stopped in flight and left unfinished"
+    }
+    Write-Log -Message "Scheduled stop reached ($($stopTime.ToString('yyyy-MM-dd HH:mm:ss')), mode $StopMode): $stopDetail" -Level "WARNING" -LogFile $logFile
 }
 
 # Clear progress bars
@@ -5085,8 +6123,9 @@ if ($isWorkflowMode) {
 # Final summary
 $scriptEndTime = Get-Date
 $totalDuration = $scriptEndTime - $scriptStartTime
-$state.status = "completed"
+$state.status = if ($stopReached) { "stopped" } else { "completed" }
 $state.end_time = (Get-Date -Format "yyyy-MM-ddTHH:mm:ss")
+if ($stopTime) { $state.stop_at = $stopTime.ToString("yyyy-MM-ddTHH:mm:ss") }
 Save-StateFile -StateFile $stateFile -State $state
 
 # Calculate detailed statistics
@@ -5104,6 +6143,15 @@ $normalIndividualSuccess = 0
 $normalIndividualFailed = 0
 $sensitiveIndividualSuccess = 0
 $sensitiveIndividualFailed = 0
+# A host that was never scanned - left pending by a scheduled stop, or skipped
+# by a retry-only mode - is not a failure. Counting it as one turns a run that
+# was cut short on purpose into a report full of red.
+$normalNetworkPending = 0
+$sensitiveNetworkPending = 0
+$normalIndividualPending = 0
+$sensitiveIndividualPending = 0
+$normalPending = 0
+$sensitivePending = 0
 
 # Count unique networks
 $uniqueNetworks = @{}
@@ -5113,6 +6161,7 @@ foreach ($currentHost in $validHosts) {
     $isSensitive = $hostMeta.sensitive
     $isFromCIDR = $null -ne $hostMeta.source_cidr -and $hostMeta.source_cidr -ne ""
     $isSuccess = $hostMeta.status -eq "completed"
+    $isFailure = $hostMeta.status -eq "failed"
 
     # Track unique networks
     if ($isFromCIDR) {
@@ -5122,47 +6171,54 @@ foreach ($currentHost in $validHosts) {
     if ($isFromCIDR) {
         $networkHostsCount++
         if ($isSensitive) {
-            if ($isSuccess) { $sensitiveNetworkSuccess++ } else { $sensitiveNetworkFailed++ }
+            if ($isSuccess) { $sensitiveNetworkSuccess++ } elseif ($isFailure) { $sensitiveNetworkFailed++ } else { $sensitiveNetworkPending++ }
         } else {
-            if ($isSuccess) { $normalNetworkSuccess++ } else { $normalNetworkFailed++ }
+            if ($isSuccess) { $normalNetworkSuccess++ } elseif ($isFailure) { $normalNetworkFailed++ } else { $normalNetworkPending++ }
         }
     } else {
         $individualHostsCount++
         if ($isSensitive) {
-            if ($isSuccess) { $sensitiveIndividualSuccess++ } else { $sensitiveIndividualFailed++ }
+            if ($isSuccess) { $sensitiveIndividualSuccess++ } elseif ($isFailure) { $sensitiveIndividualFailed++ } else { $sensitiveIndividualPending++ }
         } else {
-            if ($isSuccess) { $normalIndividualSuccess++ } else { $normalIndividualFailed++ }
+            if ($isSuccess) { $normalIndividualSuccess++ } elseif ($isFailure) { $normalIndividualFailed++ } else { $normalIndividualPending++ }
         }
     }
 
     if ($isSensitive) {
-        if ($isSuccess) { $sensitiveSuccess++ } else { $sensitiveFailed++ }
+        if ($isSuccess) { $sensitiveSuccess++ } elseif ($isFailure) { $sensitiveFailed++ } else { $sensitivePending++ }
     } else {
-        if ($isSuccess) { $normalSuccess++ } else { $normalFailed++ }
+        if ($isSuccess) { $normalSuccess++ } elseif ($isFailure) { $normalFailed++ } else { $normalPending++ }
     }
 }
 
 $networkCount = $uniqueNetworks.Count
 $conflictCount = if ($conflicts) { $conflicts.Count } else { 0 }
 
-# Calculate Live and Dead hosts
-$liveHostsCount = 0
-$deadHostsCount = 0
+# Tally the liveness verdicts. State files written before liveness existed carry
+# no verdict, so those hosts are classified once, here, and nowhere else.
+$verdictCounts = @{ open = 0; alive = 0; filtered = 0; unreachable = 0; unknown = 0 }
 
 foreach ($currentHost in $validHosts) {
     $hostMeta = $state.hosts[$currentHost]
-    if ($hostMeta.status -eq "completed" -and $hostMeta.scan_file) {
-        if (Test-HostHasOpenPorts -XmlFile $hostMeta.scan_file) {
-            $liveHostsCount++
-        } else {
-            $deadHostsCount++
-        }
+    if ($hostMeta.status -ne "completed") { continue }
+
+    $verdict = if ($hostMeta.liveness) {
+        [string]$hostMeta.liveness
+    } else {
+        Get-PersistedLiveness -HostState $hostMeta -TargetHost $currentHost
     }
+    if (-not $verdict -or -not $verdictCounts.ContainsKey($verdict)) { $verdict = 'unknown' }
+    $verdictCounts[$verdict]++
 }
+
+$openHostsCount   = $verdictCounts.open
+$aliveHostsCount  = $verdictCounts.alive
+$noRespHostsCount = $verdictCounts.filtered + $verdictCounts.unreachable + $verdictCounts.unknown
 
 # Calculate metrics
 $totalCompleted = $normalSuccess + $sensitiveSuccess
 $totalFailed = $normalFailed + $sensitiveFailed
+$totalPending = $normalPending + $sensitivePending
 
 $avgTimePerHost = if ($totalCompleted -gt 0) {
     [math]::Round($totalDuration.TotalSeconds / $totalCompleted, 1)
@@ -5188,14 +6244,26 @@ $failPercent = if ($validHosts.Count -gt 0) {
     0
 }
 
-$livePercent = if ($totalCompleted -gt 0) {
-    [math]::Round($liveHostsCount / $totalCompleted * 100, 1)
+$pendingPercent = if ($validHosts.Count -gt 0) {
+    [math]::Round($totalPending / $validHosts.Count * 100, 1)
 } else {
     0
 }
 
-$deadPercent = if ($totalCompleted -gt 0) {
-    [math]::Round($deadHostsCount / $totalCompleted * 100, 1)
+$openPercent = if ($totalCompleted -gt 0) {
+    [math]::Round($openHostsCount / $totalCompleted * 100, 1)
+} else {
+    0
+}
+
+$alivePercent = if ($totalCompleted -gt 0) {
+    [math]::Round($aliveHostsCount / $totalCompleted * 100, 1)
+} else {
+    0
+}
+
+$noRespPercent = if ($totalCompleted -gt 0) {
+    [math]::Round($noRespHostsCount / $totalCompleted * 100, 1)
 } else {
     0
 }
@@ -5244,17 +6312,35 @@ Write-Host "($successPercent%)" -NoNewline -ForegroundColor Green
 Write-Host " | " -NoNewline -ForegroundColor DarkGray
 Write-Host "$totalFailed " -NoNewline -ForegroundColor White
 Write-Host "❌ " -NoNewline -ForegroundColor Red
-Write-Host "($failPercent%)" -ForegroundColor Red
+if ($totalPending -gt 0) {
+    Write-Host "($failPercent%)" -NoNewline -ForegroundColor Red
+    Write-Host " | " -NoNewline -ForegroundColor DarkGray
+    Write-Host "$totalPending " -NoNewline -ForegroundColor White
+    Write-Host "⏸ " -NoNewline -ForegroundColor Yellow
+    Write-Host "pending ($pendingPercent%)" -ForegroundColor Yellow
+} else {
+    Write-Host "($failPercent%)" -ForegroundColor Red
+}
 
-# Host status (Live/Dead)
+# Host status. "Open" is attack surface, "Responded" is a host that answered but
+# offers nothing, "No response" is the only bucket where we genuinely do not know.
 Write-Host "🎯 Status   : " -NoNewline -ForegroundColor Cyan
-Write-Host "$liveHostsCount " -NoNewline -ForegroundColor White
+Write-Host "$openHostsCount " -NoNewline -ForegroundColor White
 Write-Host "🟢 " -NoNewline -ForegroundColor Green
-Write-Host "Live ($livePercent%)" -NoNewline -ForegroundColor Green
+Write-Host "Open ($openPercent%)" -NoNewline -ForegroundColor Green
 Write-Host " | " -NoNewline -ForegroundColor DarkGray
-Write-Host "$deadHostsCount " -NoNewline -ForegroundColor White
-Write-Host "🔴 " -NoNewline -ForegroundColor Red
-Write-Host "Dead ($deadPercent%)" -ForegroundColor Red
+Write-Host "$aliveHostsCount " -NoNewline -ForegroundColor White
+Write-Host "🟡 " -NoNewline -ForegroundColor Yellow
+Write-Host "Responded, no ports ($alivePercent%)" -NoNewline -ForegroundColor Yellow
+Write-Host " | " -NoNewline -ForegroundColor DarkGray
+Write-Host "$noRespHostsCount " -NoNewline -ForegroundColor White
+Write-Host "⚫ " -NoNewline -ForegroundColor DarkGray
+Write-Host "No response ($noRespPercent%)" -ForegroundColor DarkGray
+
+if ($noRespHostsCount -gt 0) {
+    Write-Host "              └─ of those $noRespHostsCount" -NoNewline -ForegroundColor DarkGray
+    Write-Host ": $($verdictCounts.filtered) filtered · $($verdictCounts.unreachable) unreachable · $($verdictCounts.unknown) unknown" -ForegroundColor DarkGray
+}
 
 Write-Host ""
 
@@ -5267,19 +6353,27 @@ if ($networkCount -gt 0) {
     Write-Host "$networkCount CIDR(s) - $networkHostsCount hosts" -ForegroundColor White
 
     Write-Host "   ├─ Normal    : " -NoNewline -ForegroundColor White
-    Write-Host "$($normalNetworkSuccess + $normalNetworkFailed) " -NoNewline -ForegroundColor White
+    Write-Host "$($normalNetworkSuccess + $normalNetworkFailed + $normalNetworkPending) " -NoNewline -ForegroundColor White
     Write-Host "(✅ " -NoNewline -ForegroundColor Green
     Write-Host "$normalNetworkSuccess" -NoNewline -ForegroundColor Green
     Write-Host " | ❌ " -NoNewline -ForegroundColor Red
     Write-Host "$normalNetworkFailed" -NoNewline -ForegroundColor Red
+    if ($normalNetworkPending -gt 0) {
+        Write-Host " | ⏸ " -NoNewline -ForegroundColor Yellow
+        Write-Host "$normalNetworkPending" -NoNewline -ForegroundColor Yellow
+    }
     Write-Host ")" -ForegroundColor White
 
     Write-Host "   └─ Sensitive : " -NoNewline -ForegroundColor White
-    Write-Host "$($sensitiveNetworkSuccess + $sensitiveNetworkFailed) " -NoNewline -ForegroundColor Yellow
+    Write-Host "$($sensitiveNetworkSuccess + $sensitiveNetworkFailed + $sensitiveNetworkPending) " -NoNewline -ForegroundColor Yellow
     Write-Host "(✅ " -NoNewline -ForegroundColor Green
     Write-Host "$sensitiveNetworkSuccess" -NoNewline -ForegroundColor Green
     Write-Host " | ❌ " -NoNewline -ForegroundColor Red
     Write-Host "$sensitiveNetworkFailed" -NoNewline -ForegroundColor Red
+    if ($sensitiveNetworkPending -gt 0) {
+        Write-Host " | ⏸ " -NoNewline -ForegroundColor Yellow
+        Write-Host "$sensitiveNetworkPending" -NoNewline -ForegroundColor Yellow
+    }
     Write-Host ")" -ForegroundColor Yellow
 
     Write-Host ""
@@ -5291,19 +6385,27 @@ if ($individualHostsCount -gt 0) {
     Write-Host "$individualHostsCount hosts" -ForegroundColor White
 
     Write-Host "   ├─ Normal    : " -NoNewline -ForegroundColor White
-    Write-Host "$($normalIndividualSuccess + $normalIndividualFailed) " -NoNewline -ForegroundColor White
+    Write-Host "$($normalIndividualSuccess + $normalIndividualFailed + $normalIndividualPending) " -NoNewline -ForegroundColor White
     Write-Host "(✅ " -NoNewline -ForegroundColor Green
     Write-Host "$normalIndividualSuccess" -NoNewline -ForegroundColor Green
     Write-Host " | ❌ " -NoNewline -ForegroundColor Red
     Write-Host "$normalIndividualFailed" -NoNewline -ForegroundColor Red
+    if ($normalIndividualPending -gt 0) {
+        Write-Host " | ⏸ " -NoNewline -ForegroundColor Yellow
+        Write-Host "$normalIndividualPending" -NoNewline -ForegroundColor Yellow
+    }
     Write-Host ")" -ForegroundColor White
 
     Write-Host "   └─ Sensitive : " -NoNewline -ForegroundColor White
-    Write-Host "$($sensitiveIndividualSuccess + $sensitiveIndividualFailed) " -NoNewline -ForegroundColor Yellow
+    Write-Host "$($sensitiveIndividualSuccess + $sensitiveIndividualFailed + $sensitiveIndividualPending) " -NoNewline -ForegroundColor Yellow
     Write-Host "(✅ " -NoNewline -ForegroundColor Green
     Write-Host "$sensitiveIndividualSuccess" -NoNewline -ForegroundColor Green
     Write-Host " | ❌ " -NoNewline -ForegroundColor Red
     Write-Host "$sensitiveIndividualFailed" -NoNewline -ForegroundColor Red
+    if ($sensitiveIndividualPending -gt 0) {
+        Write-Host " | ⏸ " -NoNewline -ForegroundColor Yellow
+        Write-Host "$sensitiveIndividualPending" -NoNewline -ForegroundColor Yellow
+    }
     Write-Host ")" -ForegroundColor Yellow
 }
 
@@ -5318,7 +6420,8 @@ Write-Host "$conflictCount" -ForegroundColor Gray
 
 Write-Host ""
 
-Write-Log -Message "Scan session completed | Total: $($validHosts.Count) | Normal: $($normalSuccess + $normalFailed) (success: $normalSuccess, failed: $normalFailed) | Sensitive: $($sensitiveSuccess + $sensitiveFailed) (success: $sensitiveSuccess, failed: $sensitiveFailed) | Excluded: $($excludedHosts.Count) | Duration: $durationFormatted" -Level "SUCCESS" -LogFile $logFile
+$sessionOutcome = if ($stopReached) { "Scan session stopped at the scheduled time" } else { "Scan session completed" }
+Write-Log -Message "$sessionOutcome | Total: $($validHosts.Count) | Normal: $($normalSuccess + $normalFailed) (success: $normalSuccess, failed: $normalFailed) | Sensitive: $($sensitiveSuccess + $sensitiveFailed) (success: $sensitiveSuccess, failed: $sensitiveFailed) | Pending: $totalPending | Excluded: $($excludedHosts.Count) | Duration: $durationFormatted" -Level $(if ($stopReached) { "WARNING" } else { "SUCCESS" }) -LogFile $logFile
 
 if ($failedCount -gt 0) {
     Write-Host "[INFO] To retry failed hosts, run:" -ForegroundColor Yellow
@@ -5327,6 +6430,44 @@ if ($failedCount -gt 0) {
     } else {
         Write-Host "  $(Get-InvocationHint) -HostFile $HostFile -ScanType $ScanType -RetryFailed`n" -ForegroundColor Yellow
     }
+}
+
+# Hosts that never answered are the only ones a second pass can change.
+if (($verdictCounts.filtered + $verdictCounts.unreachable) -gt 0) {
+    Write-Host "[INFO] To re-probe the hosts that never responded, run:" -ForegroundColor Yellow
+    if ($isWorkflowMode) {
+        Write-Host "  $(Get-InvocationHint) -HostFile $HostFile -Workflow $Workflow -RetryDead`n" -ForegroundColor Yellow
+    } else {
+        Write-Host "  $(Get-InvocationHint) -HostFile $HostFile -ScanType $ScanType -RetryDead`n" -ForegroundColor Yellow
+    }
+}
+
+# What was left behind and how to pick it up. Printed on every run, because the
+# session that most needs its resume line is the one that did not finish.
+Write-Host ""
+if ($stopReached) {
+    $remainingPending = @($state.hosts.GetEnumerator() | Where-Object { $_.Value.status -eq "pending" -or $_.Value.status -eq "in_progress" }).Count
+    Write-Host "⏹️  Scheduled stop reached" -ForegroundColor Yellow
+    Write-Host "   Stop time : " -NoNewline -ForegroundColor Cyan
+    Write-Host "$($stopTime.ToString('yyyy-MM-dd HH:mm:ss')) " -NoNewline -ForegroundColor White
+    Write-Host "| now: $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))" -ForegroundColor Gray
+    Write-Host "   Left over : " -NoNewline -ForegroundColor Cyan
+    Write-Host "$remainingPending pending " -NoNewline -ForegroundColor White
+    if ($StopMode -eq "Drain") {
+        Write-Host "(drain: the scans already running were allowed to finish)" -ForegroundColor Gray
+    } else {
+        Write-Host "($stoppedInFlight stopped in flight, they will be scanned again)" -ForegroundColor Gray
+    }
+    Write-Host ""
+}
+
+Write-Host "↩️  Resume this session" -ForegroundColor Cyan
+Write-Host "   $resumeCommand" -ForegroundColor Yellow
+# Same line on disk, with the outcome of this run, for whoever comes back to it
+$resumeFile = Write-ResumeFile -SessionDir $sessionDir -ResumeCommand $resumeCommand -SessionId $sessionId -Status $state.status
+if ($resumeFile) {
+    Write-Host "   Saved in  : " -NoNewline -ForegroundColor Cyan
+    Write-Host "$resumeFile" -ForegroundColor Gray
 }
 
 # Next steps suggestion with XNP
@@ -5353,13 +6494,24 @@ Write-Host "──────────────────────�
 
     $workflowStepNumber++
     Export-ScanResults -ResultsFile $resultsFile -SessionId $sessionId
+
+    if ($stopReached) {
+        $stepsLeft = $workflowSteps.Count - ($workflowStepNumber - 1)
+        if ($isWorkflowMode -and $stepsLeft -gt 0) {
+            Write-Host "[INFO] $stepsLeft workflow step(s) were not started because of the scheduled stop." -ForegroundColor Yellow
+            Write-Log -Message "Workflow halted by the scheduled stop: $stepsLeft step(s) not started" -Level "WARNING" -LogFile $logFile
+        }
+        break
+    }
 } # End of workflow loop
 
 # Clear all progress bars after workflow completes
 if ($isWorkflowMode) {
     Write-Progress -Id 1 -Activity "Workflow Progress" -Completed
     Write-Progress -Id 2 -Activity "Current step" -Completed
+}
 
+if ($isWorkflowMode -and -not $stopReached) {
     Write-Host "`n========================================" -ForegroundColor Green
     Write-Host "  Workflow Complete: $($workflowDef.name)" -ForegroundColor Green
     Write-Host "  All $($workflowSteps.Count) steps finished" -ForegroundColor Green
