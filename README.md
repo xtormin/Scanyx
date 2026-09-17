@@ -19,6 +19,7 @@
 - ✅ **Gestión de sesiones** - Crea, lista y reanuda sesiones con nombres personalizados
 - ✅ **Persistencia de estado** - Reanuda escaneos interrumpidos
 - ✅ **Ventana horaria** - Arranca y para a las horas acordadas, y deja lo que falte pendiente
+- ✅ **Franjas recurrentes** - Escanea solo en los días y horas permitidos, pausando y siguiendo solo
 - ✅ **Hosts sensibles** - Timing y scripts personalizados para hosts críticos
 - ✅ **Exclusiones inteligentes** - CIDR, IPs individuales, hostnames
 - ✅ **Carga remota** - Ejecuta desde URL sin descargar archivos
@@ -176,9 +177,50 @@ Qué hace al llegar la hora de parada:
 
 Avisa por consola y en `scan.log` cuando faltan 30, 10 y 1 minuto para la parada.
 
-### Sobre `-StartAt`: no hace falta cron
+### Franjas recurrentes: escaneos que no caben en una sola sesión
 
-La espera la hace el propio proceso de Scanyx, no `cron`, `launchd` ni `at`. Eso significa que **la sesión tiene que seguir viva** hasta que llegue la hora: nada de cerrar la terminal, y la máquina no puede suspenderse. Para una espera larga:
+Para un escaneo largo que solo puede correr en horario acordado, `-Schedule` define la franja y `-Until` la fecha límite. Al cerrar la franja Scanyx para igual que con `-StopAt`, **espera a la siguiente apertura y sigue por donde iba**, sin que nadie lo relance.
+
+```bash
+# Lunes, jueves y viernes de 8:00 a 17:00, hasta el 18/09/2026
+sudo ./scanyx.sh -HostFile networks.txt -ScanType tcp-full -SessionName cliente \
+     -Schedule "L,J,V 08:00-17:00" -Until "2026-09-18" -Yes
+```
+
+```powershell
+# Laborables en horario de oficina y sábados por la mañana, sin fecha límite:
+# termina cuando termine el escaneo
+scanyx -HostFile networks.txt -ScanType tcp-full -SessionName cliente `
+       -Schedule "L-V 08:00-17:00; S 10:00-14:00"
+```
+
+Sintaxis de `-Schedule`: `"<días> <HH:mm>-<HH:mm>"`, varias franjas separadas por `;`.
+
+| Parte | Admite |
+|---|---|
+| Días | `L,M,X,J,V,S,D` y `Mon..Sun`, nombres completos (`miércoles`, `friday`), rangos (`L-V`, `Mon-Fri`, `V-L` cruza el finde) y palabras (`diario`, `laborables`, `finde`, `daily`, `weekdays`, `weekend`) |
+| Horas | `08:00-17:00`, `8:00-17:00`. Si la hora final es anterior a la inicial, la franja cruza medianoche: `"V 22:00-06:00"` abre el viernes por la noche y cierra el sábado por la mañana |
+| Sin días | `"08:00-17:00"` es todos los días |
+
+`-Until` acepta `2026-09-18` (fin de ese día), `18/09/2026`, `"2026-09-18 17:00"` o `+3d`. Sin `-Until`, el escaneo sigue por las franjas que haga falta hasta terminar.
+
+Lo que ocurre al cerrar cada franja es lo mismo que con `-StopAt`, incluido `-StopMode`: los escaneos cortados vuelven a la cola y son lo primero que se lanza en la franja siguiente. La barra de progreso mantiene el total original —un host escaneado dos veces sigue siendo un host— y el tiempo de espera entre franjas no cuenta como tiempo de escaneo: el resumen lo muestra aparte.
+
+La configuración previa enseña la franja tal y como Scanyx la ha entendido, con la próxima apertura calculada, para que una sintaxis mal leída se vea antes de escanear y no a las tres de la mañana:
+
+```
+🕒 Clock      : 2026-09-17 16:47:29
+   Schedule   : L,J,V 08:00-17:00
+   Window     : open now until jue 2026-09-17 17:00
+   Ends       : 2026-09-18 23:59:59 (in 1d 07h)
+   On close   : hard - the scans still running are stopped too
+```
+
+Vale lo mismo que para `-StartAt`: la espera la hace este proceso (ver abajo).
+
+### Sobre `-StartAt` y `-Schedule`: no hace falta cron
+
+La espera la hace el propio proceso de Scanyx, no `cron`, `launchd` ni `at`. Eso significa que **la sesión tiene que seguir viva** hasta que llegue la hora —o, con `-Schedule`, durante todos los días que dure el encargo: nada de cerrar la terminal, y la máquina no puede suspenderse. Para una espera larga:
 
 ```bash
 # Linux/macOS: sesión que sobrevive a cerrar la terminal

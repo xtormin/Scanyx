@@ -131,6 +131,20 @@ What happens to the scans still running when -StopAt arrives.
 - Drain: launch nothing new, but let the ones already running finish
 Only meaningful together with -StopAt.
 
+.PARAMETER Schedule
+Recurring window the scan may run in, for scans that take more than one sitting.
+Format: "<days> <HH:mm>-<HH:mm>", several windows separated by ';'.
+Days accept Spanish and English spellings (L,M,X,J,V,S,D / Mon..Sun), ranges (L-V,
+Mon-Fri) and keywords (diario, laborables, finde, daily, weekdays, weekend).
+Omitting the days means every day. A range that ends before it starts crosses
+midnight ("V 22:00-06:00" opens Friday night and closes Saturday morning).
+When the window closes Scanyx stops as it would for -StopAt, waits for the next
+opening and carries on where it left off, until the work is done or -Until passes.
+
+.PARAMETER Until
+End of the engagement: nothing runs past it. A bare date means the end of that day.
+Accepts "2026-09-18", "18/09/2026", "2026-09-18 17:00" and relative spans ("+3d").
+
 .PARAMETER StartAt
 Hold the scan until a scheduled time, in the same formats as -StopAt.
 Scanyx waits in this process: no cron, launchd or at(1) is involved, so the session
@@ -185,6 +199,11 @@ Scan until 06:00 and then stop, leaving whatever is left pending for a later res
 .\scanyx.ps1 -HostFile .\hosts.txt -ScanType tcp-full -SessionName night-window -StartAt 22:00 -StopAt 06:00 -StopMode Drain
 Wait until 22:00, scan the agreed window, and at 06:00 launch nothing new while
 letting the scans already running finish.
+
+.EXAMPLE
+.\scanyx.ps1 -HostFile .\hosts.txt -ScanType tcp-full -SessionName engagement -Schedule "L,J,V 08:00-17:00" -Until "2026-09-18"
+Scan only on Monday, Thursday and Friday between 08:00 and 17:00, pausing and
+resuming on its own until the work is done or the 18th ends.
 
 .EXAMPLE
 .\scanyx.ps1 -Hosts "192.168.1.0/24","10.0.0.50" -ScanType tcp-1000
@@ -406,13 +425,19 @@ function Get-ResumeCommand {
     param(
         [string]$SessionId,
         [string]$OutputDir = "",
-        [bool]$Elevated = $false
+        [bool]$Elevated = $false,
+        [string]$Schedule = ""
     )
 
     $prefix = if ($Elevated -and ($IsLinux -or $IsMacOS)) { "sudo " } else { "" }
     $command = "$prefix$(Get-InvocationHint) -ResumeSession `"$SessionId`""
     if ($OutputDir -and $OutputDir -ne "") {
         $command += " -OutputDir `"$OutputDir`""
+    }
+    # The window the client agreed to still applies tomorrow; the deadline that
+    # ended this run does not, so -Until is deliberately left out.
+    if ($Schedule -and $Schedule -ne "") {
+        $command += " -Schedule `"$Schedule`""
     }
     return "$command -Resume"
 }
@@ -444,6 +469,256 @@ function Get-DueStopWarnings {
         }
     }
     return @($due | Sort-Object -Descending)
+}
+
+# Day-of-week tokens, Spanish and English, mapped to [DayOfWeek] values
+# (0 = Sunday). "M" is martes and "X" miercoles, as everyone writes them here.
+$Global:ScanyxDayTokens = @{
+    'd' = 0; 'do' = 0; 'dom' = 0; 'domingo' = 0; 'sun' = 0; 'sunday' = 0
+    'l' = 1; 'lu' = 1; 'lun' = 1; 'lunes' = 1; 'mon' = 1; 'monday' = 1
+    'm' = 2; 'ma' = 2; 'mar' = 2; 'martes' = 2; 'tue' = 2; 'tues' = 2; 'tuesday' = 2
+    'x' = 3; 'mi' = 3; 'mie' = 3; 'miercoles' = 3; 'wed' = 3; 'wednesday' = 3
+    'j' = 4; 'ju' = 4; 'jue' = 4; 'jueves' = 4; 'thu' = 4; 'thur' = 4; 'thurs' = 4; 'thursday' = 4
+    'v' = 5; 'vi' = 5; 'vie' = 5; 'viernes' = 5; 'fri' = 5; 'friday' = 5
+    's' = 6; 'sa' = 6; 'sab' = 6; 'sabado' = 6; 'sat' = 6; 'saturday' = 6
+}
+
+function ConvertTo-ScanyxDayNumber {
+    # One day token to its [DayOfWeek] number, or $null if it is not a day.
+    param([string]$Token)
+
+    if ([string]::IsNullOrWhiteSpace($Token)) { return $null }
+
+    # Accents are how people actually type "miércoles" and "sábado"
+    $key = $Token.Trim().ToLowerInvariant()
+    $key = $key -replace '[áà]', 'a' -replace '[éè]', 'e' -replace '[íì]', 'i' -replace '[óò]', 'o' -replace '[úùü]', 'u'
+    $key = $key.TrimEnd('.')
+
+    if ($Global:ScanyxDayTokens.ContainsKey($key)) { return $Global:ScanyxDayTokens[$key] }
+    return $null
+}
+
+function ConvertTo-ScanyxDaySet {
+    # The days named by "L,J,V", "L-V", "Mon-Fri", "diario", "finde"...
+    # Returns a sorted array of [DayOfWeek] numbers, or $null if unreadable.
+    param([string]$Days)
+
+    if ([string]::IsNullOrWhiteSpace($Days)) { return @(0, 1, 2, 3, 4, 5, 6) }
+
+    $set = @{}
+    foreach ($piece in ($Days -split '[,;/+ ]+' | Where-Object { $_ })) {
+        $token = $piece.Trim().ToLowerInvariant()
+
+        switch -regex ($token) {
+            '^(diario|diaria|todos|todo|daily|all|every|\*|l-d|lun-dom|mon-sun)$' {
+                foreach ($d in 0..6) { $set[$d] = $true }
+                continue
+            }
+            '^(laborables|laborable|entresemana|weekday|weekdays|semana)$' {
+                foreach ($d in 1..5) { $set[$d] = $true }
+                continue
+            }
+            '^(finde|findes|fin-de-semana|weekend|weekends)$' {
+                $set[6] = $true; $set[0] = $true
+                continue
+            }
+            default {
+                if ($token -match '^([a-zñáéíóúü.]+)-([a-zñáéíóúü.]+)$') {
+                    $from = ConvertTo-ScanyxDayNumber -Token $Matches[1]
+                    $to   = ConvertTo-ScanyxDayNumber -Token $Matches[2]
+                    if ($null -eq $from -or $null -eq $to) { return $null }
+                    # A range may wrap the week: V-L is Fri, Sat, Sun, Mon
+                    $day = $from
+                    $set[$day] = $true
+                    while ($day -ne $to) {
+                        $day = ($day + 1) % 7
+                        $set[$day] = $true
+                    }
+                } else {
+                    $day = ConvertTo-ScanyxDayNumber -Token $token
+                    if ($null -eq $day) { return $null }
+                    $set[$day] = $true
+                }
+            }
+        }
+    }
+
+    if ($set.Count -eq 0) { return $null }
+    return @($set.Keys | Sort-Object)
+}
+
+function ConvertFrom-ScheduleSpec {
+    # "L,J,V 08:00-17:00" or "L-V 08:00-17:00; S 10:00-14:00" into windows the
+    # scan loop can ask about. Days are optional and default to every day.
+    # A range whose end is not after its start crosses midnight: "V 22:00-06:00"
+    # opens Friday night and closes Saturday morning.
+    param([string]$Spec)
+
+    $result = @{ Ok = $true; Windows = @(); Error = "" }
+    if ([string]::IsNullOrWhiteSpace($Spec)) { return $result }
+
+    $windows = @()
+    foreach ($chunk in ($Spec -split ';' | Where-Object { $_.Trim() })) {
+        $text = $chunk.Trim()
+
+        # The time range is the anchor; whatever precedes it names the days.
+        if ($text -notmatch '(\d{1,2}:\d{2})\s*(?:-|–|—|a|to|hasta)\s*(\d{1,2}:\d{2})\s*$') {
+            $result.Ok = $false
+            $result.Error = "'$text' has no time range. Expected something like 'L-V 08:00-17:00'."
+            return $result
+        }
+
+        $startText = $Matches[1]
+        $endText   = $Matches[2]
+        $daysText  = $text.Substring(0, $text.Length - $Matches[0].Length).Trim()
+
+        $startParts = $startText -split ':'
+        $endParts   = $endText   -split ':'
+        $startSpan  = New-TimeSpan -Hours ([int]$startParts[0]) -Minutes ([int]$startParts[1])
+        $endSpan    = New-TimeSpan -Hours ([int]$endParts[0])   -Minutes ([int]$endParts[1])
+
+        if ($startSpan.TotalHours -ge 24 -or $endSpan.TotalHours -gt 24) {
+            $result.Ok = $false
+            $result.Error = "'$text' has an hour outside 00:00-24:00."
+            return $result
+        }
+        if ($startSpan -eq $endSpan) {
+            $result.Ok = $false
+            $result.Error = "'$text' opens and closes at the same time."
+            return $result
+        }
+
+        $days = ConvertTo-ScanyxDaySet -Days $daysText
+        if ($null -eq $days) {
+            $result.Ok = $false
+            $result.Error = "Could not read '$daysText' as days of the week."
+            return $result
+        }
+
+        $windows += @{
+            Days            = $days
+            Start           = $startSpan
+            End             = $endSpan
+            CrossesMidnight = ($endSpan -lt $startSpan)
+        }
+    }
+
+    if ($windows.Count -eq 0) {
+        $result.Ok = $false
+        $result.Error = "Empty schedule."
+        return $result
+    }
+
+    $result.Windows = $windows
+    return $result
+}
+
+function Get-ScheduleWindowFor {
+    # The window instance that contains $Now, as @{ Open; Close }, or $null.
+    # Yesterday is checked too: a window that crosses midnight is still open at
+    # 02:00 even though its day is the one before.
+    param(
+        [array]$Windows,
+        [DateTime]$Now = [DateTime]::MinValue
+    )
+
+    if (-not $Windows -or $Windows.Count -eq 0) { return $null }
+    if ($Now -eq [DateTime]::MinValue) { $Now = Get-Date }
+
+    $best = $null
+    foreach ($offset in -1..0) {
+        $date = $Now.Date.AddDays($offset)
+        foreach ($window in $Windows) {
+            if ($window.Days -notcontains [int]$date.DayOfWeek) { continue }
+            $open  = $date.Add($window.Start)
+            $close = if ($window.CrossesMidnight) { $date.AddDays(1).Add($window.End) } else { $date.Add($window.End) }
+            if ($Now -ge $open -and $Now -lt $close) {
+                # Overlapping windows extend one another rather than cutting short
+                if ($null -eq $best -or $close -gt $best.Close) {
+                    $best = @{ Open = $open; Close = $close }
+                }
+            }
+        }
+    }
+    return $best
+}
+
+function Get-NextScheduleOpen {
+    # When the schedule next opens after $Now. $null if it never does within a
+    # fortnight, which in practice only happens with an empty schedule.
+    param(
+        [array]$Windows,
+        [DateTime]$Now = [DateTime]::MinValue
+    )
+
+    if (-not $Windows -or $Windows.Count -eq 0) { return $null }
+    if ($Now -eq [DateTime]::MinValue) { $Now = Get-Date }
+
+    $next = $null
+    foreach ($offset in 0..14) {
+        $date = $Now.Date.AddDays($offset)
+        foreach ($window in $Windows) {
+            if ($window.Days -notcontains [int]$date.DayOfWeek) { continue }
+            $open = $date.Add($window.Start)
+            if ($open -gt $Now -and ($null -eq $next -or $open -lt $next)) { $next = $open }
+        }
+        if ($next) { return $next }
+    }
+    return $next
+}
+
+function Resolve-DeadlineTime {
+    # The end of the engagement. A bare date means the end of that day: "until
+    # the 18th" is not "until the 18th at midnight", which would be the 17th.
+    param(
+        [string]$Value,
+        [DateTime]$Now = [DateTime]::MinValue
+    )
+
+    if ($Now -eq [DateTime]::MinValue) { $Now = Get-Date }
+
+    $result = @{ Ok = $true; Time = $null; Error = "" }
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $result }
+
+    $raw = $Value.Trim()
+    $invariant = [System.Globalization.CultureInfo]::InvariantCulture
+    $styles    = [System.Globalization.DateTimeStyles]::None
+    $parsed    = [datetime]::MinValue
+
+    [string[]]$dateOnly = @('yyyy-MM-dd', 'dd/MM/yyyy', 'yyyy/MM/dd', 'd/M/yyyy')
+    if ([datetime]::TryParseExact($raw, $dateOnly, $invariant, $styles, [ref]$parsed)) {
+        $endOfDay = $parsed.Date.AddDays(1).AddSeconds(-1)
+        if ($endOfDay -le $Now) {
+            $result.Ok = $false
+            $result.Error = "The deadline $($parsed.ToString('yyyy-MM-dd')) is already in the past."
+            return $result
+        }
+        $result.Time = $endOfDay
+        return $result
+    }
+
+    return Resolve-StopTime -Value $raw -Now $Now
+}
+
+function Start-ScanyxDelay {
+    # Sleep, but not past a deadline. A 60-second retry delay - or an hour, the
+    # parameter allows it - must not carry a run twenty minutes past the hour
+    # its window closed.
+    param(
+        [int]$Seconds,
+        $StopTime = $null
+    )
+
+    if ($Seconds -le 0) { return }
+
+    $deadline = (Get-Date).AddSeconds($Seconds)
+    if ($StopTime -and $StopTime -lt $deadline) { $deadline = $StopTime }
+
+    while ((Get-Date) -lt $deadline) {
+        $left = ($deadline - (Get-Date)).TotalSeconds
+        if ($left -le 0) { break }
+        Start-Sleep -Seconds ([math]::Max(1, [math]::Min(5, [int][math]::Ceiling($left))))
+    }
 }
 
 function Show-StopWarning {
@@ -551,17 +826,22 @@ function Wait-ForScheduledStart {
         Write-Log -Message "Waiting for the scheduled start at $($StartTime.ToString('yyyy-MM-dd HH:mm:ss')) ($(Format-Duration -TimeSpan $wait) from now)" -Level "INFO" -LogFile $LogFile
     }
 
+    # A countdown rewritten in place is right in front of a person and wrong in
+    # a file: carriage returns do not erase anything in a log, they just pile up.
+    $liveCountdown = $true
+    try { $liveCountdown = -not [Console]::IsOutputRedirected } catch { $liveCountdown = $false }
+
     while ((Get-Date) -lt $StartTime) {
         $left = $StartTime - (Get-Date)
-        $line = "   Starting in $(Format-Duration -TimeSpan $left)   (now $((Get-Date).ToString('HH:mm:ss')))"
-        # One line, rewritten in place: an overnight wait must not leave a
-        # thousand countdown lines above the scan itself.
-        Write-Host "`r$($line.PadRight(70))" -NoNewline -ForegroundColor DarkGray
+        if ($liveCountdown) {
+            $line = "   Starting in $(Format-Duration -TimeSpan $left)   (now $((Get-Date).ToString('HH:mm:ss')))"
+            Write-Host "`r$($line.PadRight(70))" -NoNewline -ForegroundColor DarkGray
+        }
         $sleep = [math]::Min($RefreshSeconds, [math]::Max(1, [int][math]::Ceiling($left.TotalSeconds)))
         Start-Sleep -Seconds $sleep
     }
 
-    Write-Host "`r$(' ' * 70)`r" -NoNewline
+    if ($liveCountdown) { Write-Host "`r$(' ' * 70)`r" -NoNewline }
     $started = Get-Date
     Write-Host "   Started at $($started.ToString('yyyy-MM-dd HH:mm:ss'))" -ForegroundColor Green
     Write-Host ""
@@ -3846,6 +4126,18 @@ Invoke-Scanyx -Hosts "192.168.1.0/24" -ScanType tcp-full -MaxConcurrent 10
         [Parameter(Mandatory = $false)]
         [string]$StartAt = "",
 
+        # Recurring window the scan is allowed to run in, for work that takes
+        # more than one sitting: "L-V 08:00-17:00", "L,J,V 08:00-17:00",
+        # "Mon-Fri 08:00-17:00; S 10:00-14:00", "V 22:00-06:00".
+        # Outside the window Scanyx waits and then carries on where it stopped.
+        [Parameter(Mandatory = $false)]
+        [string]$Schedule = "",
+
+        # End of the engagement: nothing runs past it. A bare date means the end
+        # of that day. "2026-09-18", "18/09/2026", "2026-09-18 17:00", "+3d".
+        [Parameter(Mandatory = $false)]
+        [string]$Until = "",
+
         # A file of complete nmap command lines, one per line, written by the
         # consultant. Scanyx runs them with its own tracking, retries, state
         # and resume instead of replacing them with a profile.
@@ -4060,8 +4352,84 @@ if ($StartAt -and $StartAt -ne "") {
     }
 }
 
-if ($StopMode -eq "Drain" -and -not $stopTime) {
-    Write-Host "[WARNING] -StopMode only applies together with -StopAt; ignoring it." -ForegroundColor Yellow
+# ---------------------------------------------------------------------------
+# Recurring windows: the scan runs inside them, sleeps between them, and ends
+# for good at -Until. The pair is what makes a scan that does not fit in one
+# sitting survivable without anyone relaunching it every morning.
+# ---------------------------------------------------------------------------
+$scheduleWindows = $null
+if ($Schedule -and $Schedule -ne "") {
+    $scheduleParsed = ConvertFrom-ScheduleSpec -Spec $Schedule
+    if (-not $scheduleParsed.Ok) {
+        Write-Host "[ERROR] -Schedule: $($scheduleParsed.Error)" -ForegroundColor DarkRed
+        Write-Host "" -ForegroundColor Gray
+        Write-Host "Examples:" -ForegroundColor Yellow
+        Write-Host "  -Schedule `"L-V 08:00-17:00`"                 weekdays, office hours" -ForegroundColor Gray
+        Write-Host "  -Schedule `"L,J,V 08:00-17:00`"               only Monday, Thursday and Friday" -ForegroundColor Gray
+        Write-Host "  -Schedule `"Mon-Fri 08:00-17:00; S 10:00-14:00`"  two windows" -ForegroundColor Gray
+        Write-Host "  -Schedule `"V 22:00-06:00`"                   Friday night into Saturday" -ForegroundColor Gray
+        Write-Host "  -Schedule `"08:00-17:00`"                     every day" -ForegroundColor Gray
+        Write-Host "" -ForegroundColor Gray
+        return
+    }
+    $scheduleWindows = $scheduleParsed.Windows
+}
+
+$overallDeadline = $null
+if ($Until -and $Until -ne "") {
+    $untilParsed = Resolve-DeadlineTime -Value $Until
+    if (-not $untilParsed.Ok) {
+        Write-Host "[ERROR] -Until: $($untilParsed.Error)" -ForegroundColor DarkRed
+        Write-Host "        Accepted: 2026-09-18, 18/09/2026, `"2026-09-18 17:00`", +3d" -ForegroundColor Gray
+        Write-Host "" -ForegroundColor Gray
+        return
+    }
+    $overallDeadline = $untilParsed.Time
+}
+
+if ($scheduleWindows) {
+    # With a schedule, the daily hours come from -Schedule and -StopAt can only
+    # mean the end of the whole thing, which is what -Until says.
+    if ($stopTime -and $overallDeadline) {
+        Write-Host "[ERROR] With -Schedule, use -Until for the end of the engagement, not both -Until and -StopAt." -ForegroundColor DarkRed
+        Write-Host "" -ForegroundColor Gray
+        return
+    }
+    if ($stopTime) {
+        $overallDeadline = $stopTime
+        Write-Host "[INFO] With -Schedule, -StopAt is taken as the end of the engagement ($($overallDeadline.ToString('yyyy-MM-dd HH:mm:ss')))." -ForegroundColor Cyan
+    }
+    # Per-window stops are computed as each window opens
+    $stopTime = $null
+    $stopTimeForProgress = [DateTime]::MinValue
+
+    if ($overallDeadline) {
+        $probeFrom = if ($startTime) { $startTime } else { Get-Date }
+        $opensInside = Get-ScheduleWindowFor -Windows $scheduleWindows -Now $probeFrom
+        $opensNext   = Get-NextScheduleOpen  -Windows $scheduleWindows -Now $probeFrom
+        if (-not $opensInside -and (-not $opensNext -or $opensNext -ge $overallDeadline)) {
+            Write-Host "[ERROR] The schedule never opens before $($overallDeadline.ToString('yyyy-MM-dd HH:mm:ss')), so nothing would be scanned." -ForegroundColor DarkRed
+            if ($opensNext) {
+                Write-Host "        It next opens $($opensNext.ToString('yyyy-MM-dd HH:mm')), after that deadline." -ForegroundColor Gray
+            }
+            Write-Host "" -ForegroundColor Gray
+            return
+        }
+    }
+} elseif ($overallDeadline) {
+    # No schedule: -Until is just another way of saying -StopAt
+    if (-not $stopTime) {
+        $stopTime = $overallDeadline
+        $stopTimeForProgress = $stopTime
+    } elseif ($stopTime -ne $overallDeadline) {
+        Write-Host "[ERROR] -StopAt and -Until disagree; without -Schedule they mean the same thing, so give only one." -ForegroundColor DarkRed
+        Write-Host "" -ForegroundColor Gray
+        return
+    }
+}
+
+if ($StopMode -eq "Drain" -and -not $stopTime -and -not $scheduleWindows) {
+    Write-Host "[WARNING] -StopMode only applies together with -StopAt or -Schedule; ignoring it." -ForegroundColor Yellow
 }
 
 # Show-ProgressBar takes a [DateTime], which will not bind $null
@@ -5006,8 +5374,8 @@ Write-Host "$sessionId" -ForegroundColor White
 # not only in the summary of a run that may never reach its summary.
 Write-Host "🕒 Clock      : " -NoNewline -ForegroundColor Cyan
 Write-Host "$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))" -NoNewline -ForegroundColor White
-if (-not $startTime -and -not $stopTime) {
-    Write-Host " (no schedule; -StartAt and -StopAt set one)" -ForegroundColor DarkGray
+if (-not $startTime -and -not $stopTime -and -not $scheduleWindows) {
+    Write-Host " (no schedule; -StartAt, -StopAt and -Schedule set one)" -ForegroundColor DarkGray
 } else {
     Write-Host ""
 }
@@ -5016,6 +5384,53 @@ if ($startTime) {
     Write-Host "$($startTime.ToString('yyyy-MM-dd HH:mm:ss')) " -NoNewline -ForegroundColor Yellow
     Write-Host "(in $(Get-TimeRemainingText -Target $startTime)) " -NoNewline -ForegroundColor Gray
     Write-Host "- this process waits; leave it running" -ForegroundColor DarkGray
+}
+if ($scheduleWindows) {
+    Write-Host "   Schedule   : " -NoNewline -ForegroundColor Cyan
+    Write-Host "$Schedule" -ForegroundColor White
+
+    # Print the window Scanyx actually computed, so a misread spec is obvious
+    # here rather than at 03:00 when nothing has been scanned.
+    $previewFrom = if ($startTime) { $startTime } else { Get-Date }
+    $previewNow  = Get-ScheduleWindowFor -Windows $scheduleWindows -Now $previewFrom
+    if ($previewNow) {
+        Write-Host "   Window     : " -NoNewline -ForegroundColor Cyan
+        Write-Host "open now " -NoNewline -ForegroundColor Green
+        Write-Host "until $($previewNow.Close.ToString('ddd yyyy-MM-dd HH:mm'))" -ForegroundColor Gray
+    } else {
+        $previewNext = Get-NextScheduleOpen -Windows $scheduleWindows -Now $previewFrom
+        if ($previewNext) {
+            $previewWindow = Get-ScheduleWindowFor -Windows $scheduleWindows -Now $previewNext
+            Write-Host "   Window     : " -NoNewline -ForegroundColor Cyan
+            Write-Host "$($previewNext.ToString('ddd yyyy-MM-dd HH:mm'))" -NoNewline -ForegroundColor Yellow
+            if ($previewWindow) {
+                Write-Host " -> $($previewWindow.Close.ToString('HH:mm')) " -NoNewline -ForegroundColor Yellow
+            } else {
+                Write-Host " " -NoNewline
+            }
+            Write-Host "(opens in $(Get-TimeRemainingText -Target $previewNext))" -ForegroundColor Gray
+        }
+    }
+
+    if ($overallDeadline) {
+        Write-Host "   Ends       : " -NoNewline -ForegroundColor Cyan
+        Write-Host "$($overallDeadline.ToString('yyyy-MM-dd HH:mm:ss')) " -NoNewline -ForegroundColor Yellow
+        Write-Host "(in $(Get-TimeRemainingText -Target $overallDeadline))" -ForegroundColor Gray
+    } else {
+        Write-Host "   Ends       : " -NoNewline -ForegroundColor Cyan
+        Write-Host "when the scan finishes " -NoNewline -ForegroundColor White
+        Write-Host "(-Until sets a last day)" -ForegroundColor DarkGray
+    }
+
+    Write-Host "   On close   : " -NoNewline -ForegroundColor Cyan
+    if ($StopMode -eq "Drain") {
+        Write-Host "drain " -NoNewline -ForegroundColor White
+        Write-Host "- nothing new is launched, the scans already running finish" -ForegroundColor Gray
+    } else {
+        Write-Host "hard " -NoNewline -ForegroundColor White
+        Write-Host "- the scans still running are stopped too" -ForegroundColor Gray
+    }
+    Write-Host "                Between windows Scanyx waits here and carries on by itself." -ForegroundColor DarkGray
 }
 if ($stopTime) {
     Write-Host "   Stops at   : " -NoNewline -ForegroundColor Cyan
@@ -5036,7 +5451,7 @@ if ($stopTime) {
     Write-Host "                Whatever is left stays pending; resume it with the line below." -ForegroundColor DarkGray
 }
 
-$resumeCommand = Get-ResumeCommand -SessionId $sessionId -OutputDir $OutputDir -Elevated (Test-IsElevated)
+$resumeCommand = Get-ResumeCommand -SessionId $sessionId -OutputDir $OutputDir -Elevated (Test-IsElevated) -Schedule $Schedule
 Write-Host "↩️  Resume     : " -NoNewline -ForegroundColor Cyan
 Write-Host "$resumeCommand" -ForegroundColor Yellow
 
@@ -5587,7 +6002,7 @@ Save-StateFile -StateFile $stateFile -State $state
 
 # The resume line on disk, written before the first scan so it is already there
 # if the run dies in a way that prints nothing at all.
-$resumeCommand = Get-ResumeCommand -SessionId $sessionId -OutputDir $OutputDir -Elevated (Test-IsElevated)
+$resumeCommand = Get-ResumeCommand -SessionId $sessionId -OutputDir $OutputDir -Elevated (Test-IsElevated) -Schedule $Schedule
 $resumeFile = Write-ResumeFile -SessionDir $sessionDir -ResumeCommand $resumeCommand -SessionId $sessionId -Status "in_progress"
 
 # Remembered for the interrupt handler, which runs in its own scope and may
@@ -5670,15 +6085,92 @@ if ($startTime -and -not $startWaitDone) {
     $scriptStartTime = $scanStartTime
 }
 
-# Warning thresholds already announced, so each one is said once per step
+# Warning thresholds already announced, so each one is said once per window
 $stopWarningsFired = @{}
 
 Write-Host ""
 
-foreach ($currentHost in $hostsToScan) {
+# ---------------------------------------------------------------------------
+# One pass per open window. Without -Schedule there is exactly one pass and
+# this behaves as it always did; with it, the run spans as many passes as the
+# schedule has openings, keeping its place in $hostIndex across the pauses.
+# ---------------------------------------------------------------------------
+# $hostsToScan may arrive as a key collection or a single scalar; foreach never
+# cared, but indexing by position does.
+$hostsToScan = @($hostsToScan)
+
+# What is left to dispatch, and where we are in it. A window that closes on a
+# running scan puts that host back here, so the next window starts by redoing
+# what it interrupted. The progress denominator stays the original count: a
+# host scanned twice is still one host.
+$workList = @($hostsToScan)
+$totalWork = $hostsToScan.Count
+$carryOver = @()
+
+$hostIndex = 0
+$runStopped = $false      # the schedule itself is over: deadline, or no window left
+$stoppedInFlight = 0      # scans killed at a window close, across every window
+$windowNumber = 0
+$totalPausedSeconds = 0
+
+while ($true) {
+
+if ($scheduleWindows) {
+    $windowNumber++
+    $nowInSchedule = Get-Date
+
+    if ($overallDeadline -and $nowInSchedule -ge $overallDeadline) { $runStopped = $true; break }
+
+    $window = Get-ScheduleWindowFor -Windows $scheduleWindows -Now $nowInSchedule
+    if (-not $window) {
+        $nextOpen = Get-NextScheduleOpen -Windows $scheduleWindows -Now $nowInSchedule
+        if (-not $nextOpen -or ($overallDeadline -and $nextOpen -ge $overallDeadline)) {
+            $runStopped = $true
+            break
+        }
+
+        $nextWindow = Get-ScheduleWindowFor -Windows $scheduleWindows -Now $nextOpen
+        $waitedFrom = Get-Date
+        $null = Wait-ForScheduledStart -StartTime $nextOpen -StopTime $(if ($nextWindow) { $nextWindow.Close } else { $null }) -LogFile $logFile
+        $paused = (Get-Date) - $waitedFrom
+        $totalPausedSeconds += $paused.TotalSeconds
+        # The elapsed counter and the ETA measure scanning, not the nights in
+        # between: move their origin forward by however long we slept.
+        $scanStartTime = $scanStartTime.AddSeconds($paused.TotalSeconds)
+        $scriptStartTime = $scriptStartTime.AddSeconds($paused.TotalSeconds)
+
+        $window = Get-ScheduleWindowFor -Windows $scheduleWindows -Now (Get-Date)
+        if (-not $window) { $runStopped = $true; break }
+    }
+
+    # The window closes at its own hour, or at the end of the engagement,
+    # whichever comes first. Everything downstream already understands $stopTime.
+    $stopTime = if ($overallDeadline -and $overallDeadline -lt $window.Close) { $overallDeadline } else { $window.Close }
+    $stopTimeForProgress = $stopTime
+    $stopWarningsFired = @{}
+    $stopReached = $false
+
+    if ($carryOver.Count -gt 0) {
+        $notYetStarted = if ($hostIndex -lt $workList.Count) { @($workList[$hostIndex..($workList.Count - 1)]) } else { @() }
+        $workList = @($carryOver) + $notYetStarted
+        $hostIndex = 0
+        $carryOver = @()
+    }
+
+    $remainingNow = $workList.Count - $hostIndex
+    Write-Host ""
+    Write-Host "▶️  Window $windowNumber open " -NoNewline -ForegroundColor Cyan
+    Write-Host "$($window.Open.ToString('ddd yyyy-MM-dd HH:mm')) -> $($stopTime.ToString('HH:mm')) " -NoNewline -ForegroundColor White
+    Write-Host "($(Format-Duration -TimeSpan ($stopTime - (Get-Date))) left, $remainingNow item(s) to go)" -ForegroundColor Gray
+    Write-Log -Message "Scan window $windowNumber open until $($stopTime.ToString('yyyy-MM-dd HH:mm:ss')): $remainingNow item(s) left" -Level "INFO" -LogFile $logFile
+}
+
+while ($hostIndex -lt $workList.Count) {
     # Scheduled stop: nothing new leaves the machine after the deadline.
     Show-StopWarning -StopTime $stopTime -Fired $stopWarningsFired -StopMode $StopMode -LogFile $logFile
     if ($stopTime -and (Get-Date) -ge $stopTime) { $stopReached = $true; break }
+
+    $currentHost = $workList[$hostIndex]
 
     # Wait if max concurrent jobs reached
     $progressUpdateCounter = 0
@@ -5691,9 +6183,9 @@ foreach ($currentHost in $hostsToScan) {
         # Update progress bar every ~60 seconds (120 iterations * 500ms)
         if ($progressUpdateCounter % 120 -eq 0) {
             if ($isWorkflowMode) {
-                Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost "" -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -LivenessCounts $script:livenessCounts -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -StopTime $stopTimeForProgress
+                Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $totalWork -Failed $failedCount -CurrentHost "" -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -LivenessCounts $script:livenessCounts -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -StopTime $stopTimeForProgress
             } else {
-                Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost "" -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -LivenessCounts $script:livenessCounts -StopTime $stopTimeForProgress
+                Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $totalWork -Failed $failedCount -CurrentHost "" -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -LivenessCounts $script:livenessCounts -StopTime $stopTimeForProgress
             }
         }
 
@@ -5779,7 +6271,7 @@ foreach ($currentHost in $hostsToScan) {
                     Write-Log -Message "Scan failed: $jobHost | $currentScanType | Attempt: $attempts/$($MaxRetries + 1) | Error: $($jobResult.Error)" -Level "WARNING" -LogFile $logFile -ErrorLogFile $errorLogFile
                     Write-Log -Message "Retrying in $RetryDelay seconds..." -Level "INFO" -LogFile $logFile
 
-                    Start-Sleep -Seconds $RetryDelay
+                    Start-ScanyxDelay -Seconds $RetryDelay -StopTime $stopTime
 
                     # Retry
                     $newAttempts = $attempts + 1
@@ -5826,9 +6318,9 @@ foreach ($currentHost in $hostsToScan) {
             # Save state and update progress
             Save-StateFile -StateFile $stateFile -State $state
             if ($isWorkflowMode) {
-                Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost $jobHost -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -LivenessCounts $script:livenessCounts -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -StopTime $stopTimeForProgress
+                Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $totalWork -Failed $failedCount -CurrentHost $jobHost -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -LivenessCounts $script:livenessCounts -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -StopTime $stopTimeForProgress
             } else {
-                Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost $jobHost -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -LivenessCounts $script:livenessCounts -StopTime $stopTimeForProgress
+                Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $totalWork -Failed $failedCount -CurrentHost $jobHost -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -LivenessCounts $script:livenessCounts -StopTime $stopTimeForProgress
             }
 
             # Remove from queue
@@ -5838,6 +6330,10 @@ foreach ($currentHost in $hostsToScan) {
 
     # The wait above exits on the deadline as well as on a free slot
     if ($stopReached) { break }
+
+    # This host is ours now: the index moves on even if the body skips it, which
+    # is what keeps a `continue` below from re-reading the same entry forever.
+    $hostIndex++
 
     # Get host metadata from state
     $hostMeta = $state.hosts[$currentHost]
@@ -5940,9 +6436,9 @@ foreach ($currentHost in $hostsToScan) {
     $jobStartTimes[$currentHost] = Get-Date
 
     if ($isWorkflowMode) {
-        Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost $currentHost -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -LivenessCounts $script:livenessCounts -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -StopTime $stopTimeForProgress
+        Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $totalWork -Failed $failedCount -CurrentHost $currentHost -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -LivenessCounts $script:livenessCounts -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -StopTime $stopTimeForProgress
     } else {
-        Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost $currentHost -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -LivenessCounts $script:livenessCounts -StopTime $stopTimeForProgress
+        Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $totalWork -Failed $failedCount -CurrentHost $currentHost -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -LivenessCounts $script:livenessCounts -StopTime $stopTimeForProgress
     }
 }
 
@@ -5957,9 +6453,9 @@ while ($jobQueue.Count -gt 0) {
     # Update progress bar every ~60 seconds (120 iterations * 500ms)
     if ($progressUpdateCounter % 120 -eq 0) {
         if ($isWorkflowMode) {
-            Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost "" -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -LivenessCounts $script:livenessCounts -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -StopTime $stopTimeForProgress
+            Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $totalWork -Failed $failedCount -CurrentHost "" -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -LivenessCounts $script:livenessCounts -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -StopTime $stopTimeForProgress
         } else {
-            Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost "" -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -LivenessCounts $script:livenessCounts -StopTime $stopTimeForProgress
+            Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $totalWork -Failed $failedCount -CurrentHost "" -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -LivenessCounts $script:livenessCounts -StopTime $stopTimeForProgress
         }
     }
 
@@ -6034,7 +6530,7 @@ while ($jobQueue.Count -gt 0) {
                 Write-Log -Message "Scan failed: $jobHost | $currentScanType | Attempt: $attempts/$($MaxRetries + 1) | Error: $($jobResult.Error)" -Level "WARNING" -LogFile $logFile -ErrorLogFile $errorLogFile
                 Write-Log -Message "Retrying in $RetryDelay seconds..." -Level "INFO" -LogFile $logFile
 
-                Start-Sleep -Seconds $RetryDelay
+                Start-ScanyxDelay -Seconds $RetryDelay -StopTime $stopTime
 
                 $newAttempts = $attempts + 1
                 Update-HostState -State $state -TargetHost $jobHost -Status "in_progress" -Attempts $newAttempts -Error $jobResult.Error
@@ -6077,22 +6573,22 @@ while ($jobQueue.Count -gt 0) {
 
         Save-StateFile -StateFile $stateFile -State $state
         if ($isWorkflowMode) {
-            Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost $jobHost -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -LivenessCounts $script:livenessCounts -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -StopTime $stopTimeForProgress
+            Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $totalWork -Failed $failedCount -CurrentHost $jobHost -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -LivenessCounts $script:livenessCounts -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -StopTime $stopTimeForProgress
         } else {
-            Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $hostsToScan.Count -Failed $failedCount -CurrentHost $jobHost -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -LivenessCounts $script:livenessCounts -StopTime $stopTimeForProgress
+            Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $totalWork -Failed $failedCount -CurrentHost $jobHost -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -LivenessCounts $script:livenessCounts -StopTime $stopTimeForProgress
         }
 
         $jobQueue.Remove($jobHost)
     }
 }
 
-# Scheduled stop: cut the run here. Scans still in flight are stopped and left
-# unfinished rather than recorded as failures - they were never given the chance
-# to complete, and the resume has to run them again from the beginning.
+# Scheduled stop: cut this window here. Scans still in flight are stopped and
+# left unfinished rather than recorded as failures - they were never given the
+# chance to complete, and the next window has to run them again from the start.
 # They stay "in_progress" on purpose: a killed nmap still leaves a partial .nmap
 # on disk, and that is the one status the resume treats as incomplete results to
 # overwrite instead of a finished scan to skip.
-$stoppedInFlight = 0
+$killedHere = 0
 if ($stopReached) {
     foreach ($entry in @($jobQueue.GetEnumerator())) {
         $stoppedHost = $entry.Key
@@ -6101,17 +6597,46 @@ if ($stopReached) {
             Remove-Job -Job $entry.Value.Job -Force -ErrorAction SilentlyContinue
         } catch { }
         Update-HostState -State $state -TargetHost $stoppedHost -Status "in_progress" -Attempts $entry.Value.Attempts -Error "Stopped at the scheduled stop time (incomplete, will be scanned again)"
+        $killedHere++
         $stoppedInFlight++
+        $carryOver += $stoppedHost
         $jobQueue.Remove($stoppedHost)
     }
     Save-StateFile -StateFile $stateFile -State $state
     $stopDetail = if ($StopMode -eq "Drain") {
         "the scans already running were allowed to finish"
     } else {
-        "$stoppedInFlight scan(s) stopped in flight and left unfinished"
+        "$killedHere scan(s) stopped in flight and left unfinished"
     }
     Write-Log -Message "Scheduled stop reached ($($stopTime.ToString('yyyy-MM-dd HH:mm:ss')), mode $StopMode): $stopDetail" -Level "WARNING" -LogFile $logFile
 }
+
+# --- end of this window -----------------------------------------------------
+if (-not $scheduleWindows) { break }
+
+$itemsLeft = ($workList.Count - $hostIndex) + $carryOver.Count
+$unfinishedNow = @($state.hosts.GetEnumerator() | Where-Object {
+    $_.Value.status -eq "pending" -or $_.Value.status -eq "in_progress"
+}).Count
+
+# Nothing left to hand out and nothing still running: the work is done, whatever
+# the clock says. Without this a schedule would keep opening empty windows.
+if ($itemsLeft -le 0 -and $jobQueue.Count -eq 0) { break }
+
+if ($overallDeadline -and (Get-Date) -ge $overallDeadline) {
+    $runStopped = $true
+    break
+}
+
+# There is work left and the engagement has not ended: sleep until the schedule
+# opens again and carry on where we stopped.
+Write-Host ""
+Write-Host "⏸️  Window $windowNumber closed " -NoNewline -ForegroundColor Yellow
+Write-Host "at $((Get-Date).ToString('HH:mm:ss')) " -NoNewline -ForegroundColor White
+Write-Host "- $unfinishedNow item(s) still to scan" -ForegroundColor Gray
+Write-Log -Message "Window $windowNumber closed: $unfinishedNow item(s) still to scan" -Level "INFO" -LogFile $logFile
+
+} # End of window loop
 
 # Clear progress bars
 if ($isWorkflowMode) {
@@ -6123,9 +6648,18 @@ if ($isWorkflowMode) {
 # Final summary
 $scriptEndTime = Get-Date
 $totalDuration = $scriptEndTime - $scriptStartTime
+# "Stopped" means the schedule ended the run with work still to do. A run that
+# finished everything inside its windows completed, whatever the clock did.
+$unfinishedAtEnd = @($state.hosts.GetEnumerator() | Where-Object {
+    $_.Value.status -eq "pending" -or $_.Value.status -eq "in_progress"
+}).Count
+$stopReached = ($stopReached -or $runStopped) -and $unfinishedAtEnd -gt 0
+
 $state.status = if ($stopReached) { "stopped" } else { "completed" }
 $state.end_time = (Get-Date -Format "yyyy-MM-ddTHH:mm:ss")
 if ($stopTime) { $state.stop_at = $stopTime.ToString("yyyy-MM-ddTHH:mm:ss") }
+if ($Schedule -and $Schedule -ne "") { $state.schedule = $Schedule }
+if ($overallDeadline) { $state.until = $overallDeadline.ToString("yyyy-MM-ddTHH:mm:ss") }
 Save-StateFile -StateFile $stateFile -State $state
 
 # Calculate detailed statistics
@@ -6294,6 +6828,12 @@ Write-Host " | throughput: " -NoNewline -ForegroundColor DarkGray
 Write-Host "$throughput hosts/min" -NoNewline -ForegroundColor Gray
 Write-Host ")" -ForegroundColor DarkGray
 
+if ($totalPausedSeconds -gt 0) {
+    Write-Host "   Paused   : " -NoNewline -ForegroundColor Cyan
+    Write-Host "$(Format-Duration -TimeSpan ([TimeSpan]::FromSeconds($totalPausedSeconds))) " -NoNewline -ForegroundColor White
+    Write-Host "between windows (not counted above)" -ForegroundColor DarkGray
+}
+
 # Output directory info
 Write-Host "📁 Output   : " -NoNewline -ForegroundColor Cyan
 if ($isWorkflowMode) {
@@ -6446,13 +6986,23 @@ if (($verdictCounts.filtered + $verdictCounts.unreachable) -gt 0) {
 # session that most needs its resume line is the one that did not finish.
 Write-Host ""
 if ($stopReached) {
-    $remainingPending = @($state.hosts.GetEnumerator() | Where-Object { $_.Value.status -eq "pending" -or $_.Value.status -eq "in_progress" }).Count
-    Write-Host "⏹️  Scheduled stop reached" -ForegroundColor Yellow
-    Write-Host "   Stop time : " -NoNewline -ForegroundColor Cyan
-    Write-Host "$($stopTime.ToString('yyyy-MM-dd HH:mm:ss')) " -NoNewline -ForegroundColor White
-    Write-Host "| now: $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))" -ForegroundColor Gray
+    Write-Host "⏹️  Stopped by the schedule" -ForegroundColor Yellow
+    if ($scheduleWindows) {
+        Write-Host "   Schedule  : " -NoNewline -ForegroundColor Cyan
+        Write-Host "$Schedule " -NoNewline -ForegroundColor White
+        Write-Host "| $windowNumber window(s) used" -ForegroundColor Gray
+        if ($overallDeadline) {
+            Write-Host "   Ended at  : " -NoNewline -ForegroundColor Cyan
+            Write-Host "$($overallDeadline.ToString('yyyy-MM-dd HH:mm:ss')) " -NoNewline -ForegroundColor White
+            Write-Host "(-Until)" -ForegroundColor Gray
+        }
+    } elseif ($stopTime) {
+        Write-Host "   Stop time : " -NoNewline -ForegroundColor Cyan
+        Write-Host "$($stopTime.ToString('yyyy-MM-dd HH:mm:ss')) " -NoNewline -ForegroundColor White
+        Write-Host "| now: $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))" -ForegroundColor Gray
+    }
     Write-Host "   Left over : " -NoNewline -ForegroundColor Cyan
-    Write-Host "$remainingPending pending " -NoNewline -ForegroundColor White
+    Write-Host "$unfinishedAtEnd still to scan " -NoNewline -ForegroundColor White
     if ($StopMode -eq "Drain") {
         Write-Host "(drain: the scans already running were allowed to finish)" -ForegroundColor Gray
     } else {

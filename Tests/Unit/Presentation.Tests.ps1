@@ -338,6 +338,13 @@ Describe "Get-ResumeCommand" -Tag "Unit", "Presentation" {
         Get-ResumeCommand -SessionId "s1" -OutputDir "/tmp/my scans" | Should -Match '-OutputDir "/tmp/my scans"'
     }
 
+    It "Carries the recurring window over, but not the deadline that ended the run" {
+        $r = Get-ResumeCommand -SessionId "s1" -OutputDir "/tmp/scans" -Schedule "L-V 08:00-17:00"
+        $r | Should -Match ([regex]::Escape('-Schedule "L-V 08:00-17:00"'))
+        $r | Should -Not -Match '-Until'
+        Get-ResumeCommand -SessionId "s1" -OutputDir "/tmp/scans" | Should -Not -Match '-Schedule'
+    }
+
     It "Keeps sudo on a run that needed root, and only there" {
         $elevated = Get-ResumeCommand -SessionId "s1" -OutputDir "/tmp/scans" -Elevated $true
         $plain    = Get-ResumeCommand -SessionId "s1" -OutputDir "/tmp/scans" -Elevated $false

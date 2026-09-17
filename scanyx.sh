@@ -68,9 +68,15 @@ Scan inside an agreed window and leave the rest pending for a later resume:
   sudo ./scanyx.sh -HostFile hosts.txt -ScanType tcp-full -SessionName window -StopAt +90m
   sudo ./scanyx.sh -HostFile hosts.txt -ScanType tcp-full -SessionName window -StartAt 22:00 -StopAt 06:00
 
+Spread a long scan over a recurring window, pausing and resuming on its own:
+
+  sudo ./scanyx.sh -HostFile hosts.txt -ScanType tcp-full -SessionName client \
+       -Schedule "L,J,V 08:00-17:00" -Until 2026-09-18
+
 -StopMode Drain lets the scans already running finish instead of stopping them.
--StartAt waits in this process, so keep the session alive (tmux, nohup) and the
-machine awake; the resume line is saved in <output>/.sessions/<name>/resume.txt.
+-StartAt and -Schedule wait in this process, so keep the session alive (tmux,
+nohup) and the machine awake; the resume line is saved in
+<output>/.sessions/<name>/resume.txt.
 
 Command-list mode runs a file of complete nmap commands, one per line, with
 Scanyx's tracking, retries, state and resume on top:
