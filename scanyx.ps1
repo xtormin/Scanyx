@@ -6127,6 +6127,148 @@ $jobQueue = @{}
 # not in a sleep, so the loop keeps collecting the other jobs meanwhile.
 $retryQueue = @{}
 
+# Collect every finished job: record its verdict, queue its retry or mark it
+# failed, and refresh the bar. Dot-sourced by the dispatch loop and by the
+# final drain, so it runs in their scope and updates the counters in place.
+# It used to be two copies of the same 130 lines, and they had drifted: the
+# drain never fed the ETA, and both carried the same lost-retry bug.
+$collectFinishedJobs = {
+    $completedJobs = $jobQueue.GetEnumerator() | Where-Object { $_.Value.Job.State -ne "Running" }
+    foreach ($job in $completedJobs) {
+        $jobHost = $job.Key
+        $jobData = $job.Value
+        $jobResult = Receive-Job -Job $jobData.Job
+        Remove-Job -Job $jobData.Job -Force
+        # Out of the queue now, not after processing: a retry put back under
+        # the same key below must survive, or its job runs untracked.
+        $jobQueue.Remove($jobHost)
+
+        # Process result
+        $scanSuccess = $jobResult.Success
+        $attempts = $jobData.Attempts
+
+        if ($scanSuccess) {
+            # Check if host has open ports and update counters
+            $nmapFile = if ($jobData.ResultFile) { $jobData.ResultFile } else { "$([IO.Path]::Combine($jobData.HostFolder, $jobData.FileName)).nmap" }
+
+            $verdict = Get-HostLivenessVerdict -ResultFile $nmapFile -TargetHost $jobHost -OutputFlag $state.hosts[$jobHost].output_flag
+            Update-HostState -State $state -TargetHost $jobHost -Status "completed" -Attempts $attempts -ScanFile $nmapFile `
+                             -Liveness $verdict.Verdict -LivenessReason $verdict.Evidence -OpenPortCount $verdict.OpenCount
+            $script:livenessCounts[$verdict.Verdict]++
+            $completedCount++
+            Write-Log -Message "Scan completed: $jobHost | $currentScanType | Attempt: $attempts | Duration: $(Format-Duration -TimeSpan ([TimeSpan]::FromSeconds($jobResult.DurationSeconds)))" -Level "SUCCESS" -LogFile $logFile
+
+            # Track scan duration for ETA calculation
+            if ($jobStartTimes.ContainsKey($jobHost)) {
+                $duration = (Get-Date) - $jobStartTimes[$jobHost]
+                $scanDurations += $duration.TotalSeconds
+                $jobStartTimes.Remove($jobHost)
+            }
+            # Alive counts every host that answered, open counts the ones with
+            # attack surface. A host that RSTs every port is alive, not dead.
+            $hostCIDR = $state.hosts[$jobHost].source_cidr
+            if ($hostCIDR -and $script:networkProgress.ContainsKey($hostCIDR)) {
+                if ($verdict.Verdict -eq 'open') { $script:networkProgress[$hostCIDR].Open++ }
+                if ($verdict.Verdict -in @('open', 'alive')) { $script:networkProgress[$hostCIDR].Alive++ }
+            }
+
+            # Update network scanned counter
+            $hostCIDR = $state.hosts[$jobHost].source_cidr
+            if ($hostCIDR -and $script:networkProgress.ContainsKey($hostCIDR)) {
+                $script:networkProgress[$hostCIDR].Scanned++
+            }
+
+            # Verbose: Show nmap output after completion
+            if ($VerboseMode) {
+                $stdoutFile = "$([IO.Path]::Combine($jobData.HostFolder, $jobData.FileName)).stdout"
+                if (Test-Path $stdoutFile) {
+                    $nmapOutput = Get-Content $stdoutFile -Raw
+                    if ($nmapOutput) {
+                        Write-Host "`n--- Nmap Output for $jobHost ---" -ForegroundColor Cyan
+                        Write-Host $nmapOutput -ForegroundColor DarkGray
+                        Write-Host "--- End Output ---`n" -ForegroundColor Cyan
+                    }
+                }
+            }
+
+            # Add to results
+            Add-ScanResult -ResultsFile $resultsFile -ScanResult @{
+                host = $jobHost
+                scan_type = $currentScanType
+                status = "completed"
+                start_time = $jobResult.StartTime
+                end_time = $jobResult.EndTime
+                duration_seconds = $jobResult.DurationSeconds
+                attempts = $attempts
+                output_files = @($nmapFile)
+                liveness = $verdict.Verdict
+                liveness_reason = $verdict.Evidence
+                liveness_source = $verdict.Source
+                srtt_ms = $verdict.SrttMs
+                port_counts = @{
+                    open = $verdict.OpenCount
+                    closed = $verdict.ClosedCount
+                    filtered = $verdict.FilteredCount
+                }
+            }
+        } else {
+            # Check if retry needed
+            if ($attempts -lt ($MaxRetries + 1)) {
+                Write-Log -Message "Scan failed: $jobHost | $currentScanType | Attempt: $attempts/$($MaxRetries + 1) | Error: $($jobResult.Error)" -Level "WARNING" -LogFile $logFile -ErrorLogFile $errorLogFile
+                $retryAt = (Get-Date).AddSeconds([math]::Max(0, $RetryDelay))
+                Write-Log -Message "Retrying in $RetryDelay seconds (at $($retryAt.ToString('HH:mm:ss')))" -Level "INFO" -LogFile $logFile
+
+                $newAttempts = $attempts + 1
+                Update-HostState -State $state -TargetHost $jobHost -Status "in_progress" -Attempts $newAttempts -Error $jobResult.Error
+                Save-StateFile -StateFile $stateFile -State $state
+
+                # Verbose: Show retry command
+                if ($VerboseMode) {
+                    $fullNmapCommand = "$($jobData.ScanCommand) -oA `"$([IO.Path]::Combine($jobData.HostFolder, $jobData.FileName))`" $jobHost"
+                    Write-Log -Message "Retry command: $fullNmapCommand" -Level "VERBOSE" -LogFile $logFile
+                }
+
+                # Queued, not slept on: Start-DueRetries launches it once the
+                # delay is over, and the other scans keep being collected meanwhile.
+                $retryQueue[$jobHost] = @{
+                    NotBefore = $retryAt
+                    Attempts = $newAttempts
+                    HostFolder = $jobData.HostFolder
+                    FileName = $jobData.FileName
+                    ScanCommand = $jobData.ScanCommand
+                    ResultFile = $jobData.ResultFile
+                }
+            } else {
+                # Max retries reached
+                Update-HostState -State $state -TargetHost $jobHost -Status "failed" -Attempts $attempts -Error $jobResult.Error
+                $failedCount++
+                Write-Log -Message "Scan failed (max retries): $jobHost | $currentScanType | Attempts: $attempts | Error: $($jobResult.Error)" -Level "ERROR" -LogFile $logFile -ErrorLogFile $errorLogFile
+
+                # Add to results
+                Add-ScanResult -ResultsFile $resultsFile -ScanResult @{
+                    host = $jobHost
+                    scan_type = $currentScanType
+                    status = "failed"
+                    start_time = $jobResult.StartTime
+                    end_time = $jobResult.EndTime
+                    duration_seconds = $jobResult.DurationSeconds
+                    attempts = $attempts
+                    error = $jobResult.Error
+                    liveness = 'unknown'
+                }
+            }
+        }
+
+        # Save state and update progress
+        Save-StateFile -StateFile $stateFile -State $state
+        if ($isWorkflowMode) {
+            Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $totalWork -Failed $failedCount -CurrentHost $jobHost -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -LivenessCounts $script:livenessCounts -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -StopTime $stopTimeForProgress -PendingRetries $retryQueue.Count
+        } else {
+            Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $totalWork -Failed $failedCount -CurrentHost $jobHost -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -LivenessCounts $script:livenessCounts -StopTime $stopTimeForProgress -PendingRetries $retryQueue.Count
+        }
+    }
+}
+
 # Timing tracking for individual scans
 $scanDurations = @()  # Array to store completed scan durations in seconds
 $jobStartTimes = @{}  # Hashtable to track when each job started
@@ -6250,141 +6392,7 @@ while ($hostIndex -lt $workList.Count) {
             }
         }
 
-        # Check completed jobs
-        $completedJobs = $jobQueue.GetEnumerator() | Where-Object { $_.Value.Job.State -ne "Running" }
-        foreach ($job in $completedJobs) {
-            $jobHost = $job.Key
-            $jobData = $job.Value
-            $jobResult = Receive-Job -Job $jobData.Job
-            Remove-Job -Job $jobData.Job -Force
-            # Out of the queue now, not after processing: a retry put back under
-            # the same key below must survive, or its job runs untracked.
-            $jobQueue.Remove($jobHost)
-
-            # Process result
-            $scanSuccess = $jobResult.Success
-            $attempts = $jobData.Attempts
-
-            if ($scanSuccess) {
-                # Check if host has open ports and update counters
-                $nmapFile = if ($jobData.ResultFile) { $jobData.ResultFile } else { "$([IO.Path]::Combine($jobData.HostFolder, $jobData.FileName)).nmap" }
-
-                $verdict = Get-HostLivenessVerdict -ResultFile $nmapFile -TargetHost $jobHost -OutputFlag $state.hosts[$jobHost].output_flag
-                Update-HostState -State $state -TargetHost $jobHost -Status "completed" -Attempts $attempts -ScanFile $nmapFile `
-                                 -Liveness $verdict.Verdict -LivenessReason $verdict.Evidence -OpenPortCount $verdict.OpenCount
-                $script:livenessCounts[$verdict.Verdict]++
-                $completedCount++
-                Write-Log -Message "Scan completed: $jobHost | $currentScanType | Attempt: $attempts | Duration: $(Format-Duration -TimeSpan ([TimeSpan]::FromSeconds($jobResult.DurationSeconds)))" -Level "SUCCESS" -LogFile $logFile
-
-                # Track scan duration for ETA calculation
-                if ($jobStartTimes.ContainsKey($jobHost)) {
-                    $duration = (Get-Date) - $jobStartTimes[$jobHost]
-                    $scanDurations += $duration.TotalSeconds
-                    $jobStartTimes.Remove($jobHost)
-                }
-                # Alive counts every host that answered, open counts the ones with
-                # attack surface. A host that RSTs every port is alive, not dead.
-                $hostCIDR = $state.hosts[$jobHost].source_cidr
-                if ($hostCIDR -and $script:networkProgress.ContainsKey($hostCIDR)) {
-                    if ($verdict.Verdict -eq 'open') { $script:networkProgress[$hostCIDR].Open++ }
-                    if ($verdict.Verdict -in @('open', 'alive')) { $script:networkProgress[$hostCIDR].Alive++ }
-                }
-
-                # Update network scanned counter
-                $hostCIDR = $state.hosts[$jobHost].source_cidr
-                if ($hostCIDR -and $script:networkProgress.ContainsKey($hostCIDR)) {
-                    $script:networkProgress[$hostCIDR].Scanned++
-                }
-
-                # Verbose: Show nmap output after completion
-                if ($VerboseMode) {
-                    $stdoutFile = "$([IO.Path]::Combine($jobData.HostFolder, $jobData.FileName)).stdout"
-                    if (Test-Path $stdoutFile) {
-                        $nmapOutput = Get-Content $stdoutFile -Raw
-                        if ($nmapOutput) {
-                            Write-Host "`n--- Nmap Output for $jobHost ---" -ForegroundColor Cyan
-                            Write-Host $nmapOutput -ForegroundColor DarkGray
-                            Write-Host "--- End Output ---`n" -ForegroundColor Cyan
-                        }
-                    }
-                }
-
-                # Add to results
-                Add-ScanResult -ResultsFile $resultsFile -ScanResult @{
-                    host = $jobHost
-                    scan_type = $currentScanType
-                    status = "completed"
-                    start_time = $jobResult.StartTime
-                    end_time = $jobResult.EndTime
-                    duration_seconds = $jobResult.DurationSeconds
-                    attempts = $attempts
-                    output_files = @($nmapFile)
-                    liveness = $verdict.Verdict
-                    liveness_reason = $verdict.Evidence
-                    liveness_source = $verdict.Source
-                    srtt_ms = $verdict.SrttMs
-                    port_counts = @{
-                        open = $verdict.OpenCount
-                        closed = $verdict.ClosedCount
-                        filtered = $verdict.FilteredCount
-                    }
-                }
-            } else {
-                # Check if retry needed
-                if ($attempts -lt ($MaxRetries + 1)) {
-                    Write-Log -Message "Scan failed: $jobHost | $currentScanType | Attempt: $attempts/$($MaxRetries + 1) | Error: $($jobResult.Error)" -Level "WARNING" -LogFile $logFile -ErrorLogFile $errorLogFile
-                    $retryAt = (Get-Date).AddSeconds([math]::Max(0, $RetryDelay))
-                    Write-Log -Message "Retrying in $RetryDelay seconds (at $($retryAt.ToString('HH:mm:ss')))" -Level "INFO" -LogFile $logFile
-
-                    $newAttempts = $attempts + 1
-                    Update-HostState -State $state -TargetHost $jobHost -Status "in_progress" -Attempts $newAttempts -Error $jobResult.Error
-                    Save-StateFile -StateFile $stateFile -State $state
-
-                    # Verbose: Show retry command
-                    if ($VerboseMode) {
-                        $fullNmapCommand = "$($jobData.ScanCommand) -oA `"$([IO.Path]::Combine($jobData.HostFolder, $jobData.FileName))`" $jobHost"
-                        Write-Log -Message "Retry command: $fullNmapCommand" -Level "VERBOSE" -LogFile $logFile
-                    }
-
-                    # Queued, not slept on: Start-DueRetries launches it once the
-                    # delay is over, and the other scans keep being collected meanwhile.
-                    $retryQueue[$jobHost] = @{
-                        NotBefore = $retryAt
-                        Attempts = $newAttempts
-                        HostFolder = $jobData.HostFolder
-                        FileName = $jobData.FileName
-                        ScanCommand = $jobData.ScanCommand
-                        ResultFile = $jobData.ResultFile
-                    }
-                } else {
-                    # Max retries reached
-                    Update-HostState -State $state -TargetHost $jobHost -Status "failed" -Attempts $attempts -Error $jobResult.Error
-                    $failedCount++
-                    Write-Log -Message "Scan failed (max retries): $jobHost | $currentScanType | Attempts: $attempts | Error: $($jobResult.Error)" -Level "ERROR" -LogFile $logFile -ErrorLogFile $errorLogFile
-
-                    # Add to results
-                    Add-ScanResult -ResultsFile $resultsFile -ScanResult @{
-                        host = $jobHost
-                        scan_type = $currentScanType
-                        status = "failed"
-                        start_time = $jobResult.StartTime
-                        end_time = $jobResult.EndTime
-                        duration_seconds = $jobResult.DurationSeconds
-                        attempts = $attempts
-                        error = $jobResult.Error
-                        liveness = 'unknown'
-                    }
-                }
-            }
-
-            # Save state and update progress
-            Save-StateFile -StateFile $stateFile -State $state
-            if ($isWorkflowMode) {
-                Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $totalWork -Failed $failedCount -CurrentHost $jobHost -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -LivenessCounts $script:livenessCounts -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -StopTime $stopTimeForProgress -PendingRetries $retryQueue.Count
-            } else {
-                Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $totalWork -Failed $failedCount -CurrentHost $jobHost -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -LivenessCounts $script:livenessCounts -StopTime $stopTimeForProgress -PendingRetries $retryQueue.Count
-            }
-        }
+        . $collectFinishedJobs
 
         # Slots freed above go to due retries first
         $null = Start-DueRetries -RetryQueue $retryQueue -JobQueue $jobQueue -JobStartTimes $jobStartTimes -MaxConcurrent $MaxConcurrent -StopTime $stopTime -Unprivileged $Unprivileged -NmapPath $nmapExePath -Verbatim $isCommandMode
@@ -6524,127 +6532,7 @@ while ($jobQueue.Count -gt 0 -or ($retryQueue.Count -gt 0 -and -not ($stopTime -
         }
     }
 
-    $completedJobs = $jobQueue.GetEnumerator() | Where-Object { $_.Value.Job.State -ne "Running" }
-    foreach ($job in $completedJobs) {
-        $jobHost = $job.Key
-        $jobData = $job.Value
-        $jobResult = Receive-Job -Job $jobData.Job
-        Remove-Job -Job $jobData.Job -Force
-        # Out of the queue now, not after processing: a retry put back under
-        # the same key below must survive, or its job runs untracked.
-        $jobQueue.Remove($jobHost)
-
-        $scanSuccess = $jobResult.Success
-        $attempts = $jobData.Attempts
-
-        if ($scanSuccess) {
-            # Check if host has open ports and update counters
-            $nmapFile = if ($jobData.ResultFile) { $jobData.ResultFile } else { "$([IO.Path]::Combine($jobData.HostFolder, $jobData.FileName)).nmap" }
-
-            $verdict = Get-HostLivenessVerdict -ResultFile $nmapFile -TargetHost $jobHost -OutputFlag $state.hosts[$jobHost].output_flag
-            Update-HostState -State $state -TargetHost $jobHost -Status "completed" -Attempts $attempts -ScanFile $nmapFile `
-                             -Liveness $verdict.Verdict -LivenessReason $verdict.Evidence -OpenPortCount $verdict.OpenCount
-            $script:livenessCounts[$verdict.Verdict]++
-            $completedCount++
-            Write-Log -Message "Scan completed: $jobHost | $currentScanType | Attempt: $attempts | Duration: $(Format-Duration -TimeSpan ([TimeSpan]::FromSeconds($jobResult.DurationSeconds)))" -Level "SUCCESS" -LogFile $logFile
-            # Alive counts every host that answered, open counts the ones with
-            # attack surface. A host that RSTs every port is alive, not dead.
-            $hostCIDR = $state.hosts[$jobHost].source_cidr
-            if ($hostCIDR -and $script:networkProgress.ContainsKey($hostCIDR)) {
-                if ($verdict.Verdict -eq 'open') { $script:networkProgress[$hostCIDR].Open++ }
-                if ($verdict.Verdict -in @('open', 'alive')) { $script:networkProgress[$hostCIDR].Alive++ }
-            }
-
-            # Update network scanned counter
-            $hostCIDR = $state.hosts[$jobHost].source_cidr
-            if ($hostCIDR -and $script:networkProgress.ContainsKey($hostCIDR)) {
-                $script:networkProgress[$hostCIDR].Scanned++
-            }
-
-            # Verbose: Show nmap output after completion
-            if ($VerboseMode) {
-                $stdoutFile = "$([IO.Path]::Combine($jobData.HostFolder, $jobData.FileName)).stdout"
-                if (Test-Path $stdoutFile) {
-                    $nmapOutput = Get-Content $stdoutFile -Raw
-                    if ($nmapOutput) {
-                        Write-Host "`n--- Nmap Output for $jobHost ---" -ForegroundColor Cyan
-                        Write-Host $nmapOutput -ForegroundColor DarkGray
-                        Write-Host "--- End Output ---`n" -ForegroundColor Cyan
-                    }
-                }
-            }
-
-            Add-ScanResult -ResultsFile $resultsFile -ScanResult @{
-                host = $jobHost
-                scan_type = $currentScanType
-                status = "completed"
-                start_time = $jobResult.StartTime
-                end_time = $jobResult.EndTime
-                duration_seconds = $jobResult.DurationSeconds
-                attempts = $attempts
-                output_files = @($nmapFile)
-                liveness = $verdict.Verdict
-                liveness_reason = $verdict.Evidence
-                liveness_source = $verdict.Source
-                srtt_ms = $verdict.SrttMs
-                port_counts = @{
-                    open = $verdict.OpenCount
-                    closed = $verdict.ClosedCount
-                    filtered = $verdict.FilteredCount
-                }
-            }
-        } else {
-            if ($attempts -lt ($MaxRetries + 1)) {
-                Write-Log -Message "Scan failed: $jobHost | $currentScanType | Attempt: $attempts/$($MaxRetries + 1) | Error: $($jobResult.Error)" -Level "WARNING" -LogFile $logFile -ErrorLogFile $errorLogFile
-                $retryAt = (Get-Date).AddSeconds([math]::Max(0, $RetryDelay))
-                Write-Log -Message "Retrying in $RetryDelay seconds (at $($retryAt.ToString('HH:mm:ss')))" -Level "INFO" -LogFile $logFile
-
-                $newAttempts = $attempts + 1
-                Update-HostState -State $state -TargetHost $jobHost -Status "in_progress" -Attempts $newAttempts -Error $jobResult.Error
-                Save-StateFile -StateFile $stateFile -State $state
-
-                # Verbose: Show retry command
-                if ($VerboseMode) {
-                    $fullNmapCommand = "$($jobData.ScanCommand) -oA `"$([IO.Path]::Combine($jobData.HostFolder, $jobData.FileName))`" $jobHost"
-                    Write-Log -Message "Retry command: $fullNmapCommand" -Level "VERBOSE" -LogFile $logFile
-                }
-
-                # Queued, not slept on: Start-DueRetries launches it once the
-                # delay is over, and the other scans keep being collected meanwhile.
-                $retryQueue[$jobHost] = @{
-                    NotBefore = $retryAt
-                    Attempts = $newAttempts
-                    HostFolder = $jobData.HostFolder
-                    FileName = $jobData.FileName
-                    ScanCommand = $jobData.ScanCommand
-                    ResultFile = $jobData.ResultFile
-                }
-            } else {
-                Update-HostState -State $state -TargetHost $jobHost -Status "failed" -Attempts $attempts -Error $jobResult.Error
-                $failedCount++
-                Write-Log -Message "Scan failed (max retries): $jobHost | $currentScanType | Attempts: $attempts | Error: $($jobResult.Error)" -Level "ERROR" -LogFile $logFile -ErrorLogFile $errorLogFile
-
-                Add-ScanResult -ResultsFile $resultsFile -ScanResult @{
-                    host = $jobHost
-                    scan_type = $currentScanType
-                    status = "failed"
-                    start_time = $jobResult.StartTime
-                    end_time = $jobResult.EndTime
-                    duration_seconds = $jobResult.DurationSeconds
-                    attempts = $attempts
-                    error = $jobResult.Error
-                    liveness = 'unknown'
-                }
-            }
-        }
-
-        Save-StateFile -StateFile $stateFile -State $state
-        if ($isWorkflowMode) {
-            Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $totalWork -Failed $failedCount -CurrentHost $jobHost -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -LivenessCounts $script:livenessCounts -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -StopTime $stopTimeForProgress -PendingRetries $retryQueue.Count
-        } else {
-            Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $totalWork -Failed $failedCount -CurrentHost $jobHost -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -LivenessCounts $script:livenessCounts -StopTime $stopTimeForProgress -PendingRetries $retryQueue.Count
-        }
-    }
+    . $collectFinishedJobs
 
     $null = Start-DueRetries -RetryQueue $retryQueue -JobQueue $jobQueue -JobStartTimes $jobStartTimes -MaxConcurrent $MaxConcurrent -StopTime $stopTime -Unprivileged $Unprivileged -NmapPath $nmapExePath -Verbatim $isCommandMode
 }
