@@ -721,6 +721,55 @@ function Start-ScanyxDelay {
     }
 }
 
+function Start-DueRetries {
+    # Launch the retries whose delay has run out, while there is a free slot and
+    # the deadline has not passed. A failed scan waits here instead of in a
+    # sleep: sleeping inside the loop that collects jobs froze every other scan,
+    # and the progress bar with them, for RetryDelay seconds per failure. The
+    # tables are hashtables and therefore shared with the caller by reference.
+    param(
+        [hashtable]$RetryQueue,
+        [hashtable]$JobQueue,
+        [hashtable]$JobStartTimes,
+        [int]$MaxConcurrent,
+        $StopTime = $null,
+        [bool]$Unprivileged = $false,
+        [string]$NmapPath = "nmap",
+        [bool]$Verbatim = $false,
+        $Now = $null
+    )
+
+    if (-not $Now) { $Now = Get-Date }
+    if ($RetryQueue.Count -eq 0) { return 0 }
+    if ($StopTime -and $Now -ge $StopTime) { return 0 }
+
+    $due = @($RetryQueue.GetEnumerator() |
+        Where-Object { $_.Value.NotBefore -le $Now } |
+        Sort-Object { $_.Value.NotBefore })
+
+    $launched = 0
+    foreach ($entry in $due) {
+        if ($JobQueue.Count -ge $MaxConcurrent) { break }
+
+        $retryHost = $entry.Key
+        $r = $entry.Value
+        $job = Start-NmapScanJob -TargetHost $retryHost -ScanCommand $r.ScanCommand -OutputPath $r.HostFolder -FileName $r.FileName -Attempts $r.Attempts -Unprivileged $Unprivileged -NmapPath $NmapPath -Verbatim $Verbatim -ResultFile $r.ResultFile
+
+        $JobQueue[$retryHost] = @{
+            Job = $job
+            Attempts = $r.Attempts
+            HostFolder = $r.HostFolder
+            FileName = $r.FileName
+            ScanCommand = $r.ScanCommand
+            ResultFile = $r.ResultFile
+        }
+        $JobStartTimes[$retryHost] = $Now
+        $RetryQueue.Remove($retryHost)
+        $launched++
+    }
+    return $launched
+}
+
 function Show-StopWarning {
     # Announce an approaching stop once per threshold. $Fired is a hashtable and
     # therefore shared with the caller by reference: what is said here is not
@@ -2420,7 +2469,8 @@ function Show-ProgressBar {
         [DateTime]$ScanStartTime = [DateTime]::MinValue,
         [array]$CompletedDurations = @(),
         [int]$Concurrency = 1,
-        [DateTime]$StopTime = [DateTime]::MinValue
+        [DateTime]$StopTime = [DateTime]::MinValue,
+        [int]$PendingRetries = 0
     )
 
     $percent = if ($Total -gt 0) { [math]::Min([math]::Round(($Completed / $Total) * 100, 1), 100) } else { 0 }
@@ -2459,6 +2509,10 @@ function Show-ProgressBar {
     if ($StopTime -ne [DateTime]::MinValue) {
         $clockStr += " | Stop: $($StopTime.ToString('HH:mm:ss')) (in $(Get-TimeRemainingText -Target $StopTime))"
     }
+
+    # Failed scans waiting out their retry delay. Without this, a run whose
+    # last hosts are all waiting to retry looks exactly like a stuck one.
+    $retryStr = if ($PendingRetries -gt 0) { " | Retry: $PendingRetries" } else { "" }
 
     # Get active hosts list
     $activeHostsList = @()
@@ -2504,7 +2558,7 @@ function Show-ProgressBar {
                        -PercentComplete $workflowPercent
 
         # Build secondary status - Ultra compact format
-        $secondaryStatus = "$Completed/$Total ($percent%) | OK: $successful | Fail: $Failed"
+        $secondaryStatus = "$Completed/$Total ($percent%) | OK: $successful | Fail: $Failed$retryStr"
         $secondaryStatus += $livenessSummary
 
         if ($elapsedStr -ne "") {
@@ -2526,7 +2580,7 @@ function Show-ProgressBar {
                        -PercentComplete $percent
     } else {
         # Single scan mode: Show single progress bar - Ultra compact format
-        $statusMessage = "$Completed/$Total ($percent%) | OK: $successful | Fail: $Failed"
+        $statusMessage = "$Completed/$Total ($percent%) | OK: $successful | Fail: $Failed$retryStr"
         $statusMessage += $livenessSummary
 
         if ($elapsedStr -ne "") {
@@ -6069,6 +6123,9 @@ $exitSubscriber = Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Act
 $completedCount = $state.completed
 $failedCount = $state.failed
 $jobQueue = @{}
+# Failed scans waiting out RetryDelay before their next attempt. They wait here,
+# not in a sleep, so the loop keeps collecting the other jobs meanwhile.
+$retryQueue = @{}
 
 # Timing tracking for individual scans
 $scanDurations = @()  # Array to store completed scan durations in seconds
@@ -6170,6 +6227,9 @@ while ($hostIndex -lt $workList.Count) {
     Show-StopWarning -StopTime $stopTime -Fired $stopWarningsFired -StopMode $StopMode -LogFile $logFile
     if ($stopTime -and (Get-Date) -ge $stopTime) { $stopReached = $true; break }
 
+    # A retry whose delay is over takes a free slot before the next new host
+    $null = Start-DueRetries -RetryQueue $retryQueue -JobQueue $jobQueue -JobStartTimes $jobStartTimes -MaxConcurrent $MaxConcurrent -StopTime $stopTime -Unprivileged $Unprivileged -NmapPath $nmapExePath -Verbatim $isCommandMode
+
     $currentHost = $workList[$hostIndex]
 
     # Wait if max concurrent jobs reached
@@ -6180,12 +6240,13 @@ while ($hostIndex -lt $workList.Count) {
         Start-Sleep -Milliseconds 500
         $progressUpdateCounter++
 
-        # Update progress bar every ~60 seconds (120 iterations * 500ms)
-        if ($progressUpdateCounter % 120 -eq 0) {
+        # Refresh the bar every ~5 seconds (10 iterations * 500ms) even when no
+        # job finishes: a clock that stands still for a minute reads as a hang
+        if ($progressUpdateCounter % 10 -eq 0) {
             if ($isWorkflowMode) {
-                Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $totalWork -Failed $failedCount -CurrentHost "" -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -LivenessCounts $script:livenessCounts -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -StopTime $stopTimeForProgress
+                Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $totalWork -Failed $failedCount -CurrentHost "" -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -LivenessCounts $script:livenessCounts -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -StopTime $stopTimeForProgress -PendingRetries $retryQueue.Count
             } else {
-                Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $totalWork -Failed $failedCount -CurrentHost "" -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -LivenessCounts $script:livenessCounts -StopTime $stopTimeForProgress
+                Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $totalWork -Failed $failedCount -CurrentHost "" -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -LivenessCounts $script:livenessCounts -StopTime $stopTimeForProgress -PendingRetries $retryQueue.Count
             }
         }
 
@@ -6196,6 +6257,9 @@ while ($hostIndex -lt $workList.Count) {
             $jobData = $job.Value
             $jobResult = Receive-Job -Job $jobData.Job
             Remove-Job -Job $jobData.Job -Force
+            # Out of the queue now, not after processing: a retry put back under
+            # the same key below must survive, or its job runs untracked.
+            $jobQueue.Remove($jobHost)
 
             # Process result
             $scanSuccess = $jobResult.Success
@@ -6269,11 +6333,9 @@ while ($hostIndex -lt $workList.Count) {
                 # Check if retry needed
                 if ($attempts -lt ($MaxRetries + 1)) {
                     Write-Log -Message "Scan failed: $jobHost | $currentScanType | Attempt: $attempts/$($MaxRetries + 1) | Error: $($jobResult.Error)" -Level "WARNING" -LogFile $logFile -ErrorLogFile $errorLogFile
-                    Write-Log -Message "Retrying in $RetryDelay seconds..." -Level "INFO" -LogFile $logFile
+                    $retryAt = (Get-Date).AddSeconds([math]::Max(0, $RetryDelay))
+                    Write-Log -Message "Retrying in $RetryDelay seconds (at $($retryAt.ToString('HH:mm:ss')))" -Level "INFO" -LogFile $logFile
 
-                    Start-ScanyxDelay -Seconds $RetryDelay -StopTime $stopTime
-
-                    # Retry
                     $newAttempts = $attempts + 1
                     Update-HostState -State $state -TargetHost $jobHost -Status "in_progress" -Attempts $newAttempts -Error $jobResult.Error
                     Save-StateFile -StateFile $stateFile -State $state
@@ -6284,16 +6346,16 @@ while ($hostIndex -lt $workList.Count) {
                         Write-Log -Message "Retry command: $fullNmapCommand" -Level "VERBOSE" -LogFile $logFile
                     }
 
-                    $retryJob = Start-NmapScanJob -TargetHost $jobHost -ScanCommand $jobData.ScanCommand -OutputPath $jobData.HostFolder -FileName $jobData.FileName -Attempts $newAttempts -Unprivileged $Unprivileged -NmapPath $nmapExePath -Verbatim $isCommandMode -ResultFile $jobData.ResultFile
-
-                    $jobQueue[$jobHost] = @{
-                        Job = $retryJob
+                    # Queued, not slept on: Start-DueRetries launches it once the
+                    # delay is over, and the other scans keep being collected meanwhile.
+                    $retryQueue[$jobHost] = @{
+                        NotBefore = $retryAt
                         Attempts = $newAttempts
                         HostFolder = $jobData.HostFolder
                         FileName = $jobData.FileName
                         ScanCommand = $jobData.ScanCommand
+                        ResultFile = $jobData.ResultFile
                     }
-                    $jobStartTimes[$jobHost] = Get-Date
                 } else {
                     # Max retries reached
                     Update-HostState -State $state -TargetHost $jobHost -Status "failed" -Attempts $attempts -Error $jobResult.Error
@@ -6318,14 +6380,14 @@ while ($hostIndex -lt $workList.Count) {
             # Save state and update progress
             Save-StateFile -StateFile $stateFile -State $state
             if ($isWorkflowMode) {
-                Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $totalWork -Failed $failedCount -CurrentHost $jobHost -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -LivenessCounts $script:livenessCounts -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -StopTime $stopTimeForProgress
+                Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $totalWork -Failed $failedCount -CurrentHost $jobHost -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -LivenessCounts $script:livenessCounts -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -StopTime $stopTimeForProgress -PendingRetries $retryQueue.Count
             } else {
-                Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $totalWork -Failed $failedCount -CurrentHost $jobHost -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -LivenessCounts $script:livenessCounts -StopTime $stopTimeForProgress
+                Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $totalWork -Failed $failedCount -CurrentHost $jobHost -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -LivenessCounts $script:livenessCounts -StopTime $stopTimeForProgress -PendingRetries $retryQueue.Count
             }
-
-            # Remove from queue
-            $jobQueue.Remove($jobHost)
         }
+
+        # Slots freed above go to due retries first
+        $null = Start-DueRetries -RetryQueue $retryQueue -JobQueue $jobQueue -JobStartTimes $jobStartTimes -MaxConcurrent $MaxConcurrent -StopTime $stopTime -Unprivileged $Unprivileged -NmapPath $nmapExePath -Verbatim $isCommandMode
     }
 
     # The wait above exits on the deadline as well as on a free slot
@@ -6436,26 +6498,29 @@ while ($hostIndex -lt $workList.Count) {
     $jobStartTimes[$currentHost] = Get-Date
 
     if ($isWorkflowMode) {
-        Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $totalWork -Failed $failedCount -CurrentHost $currentHost -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -LivenessCounts $script:livenessCounts -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -StopTime $stopTimeForProgress
+        Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $totalWork -Failed $failedCount -CurrentHost $currentHost -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -LivenessCounts $script:livenessCounts -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -StopTime $stopTimeForProgress -PendingRetries $retryQueue.Count
     } else {
-        Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $totalWork -Failed $failedCount -CurrentHost $currentHost -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -LivenessCounts $script:livenessCounts -StopTime $stopTimeForProgress
+        Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $totalWork -Failed $failedCount -CurrentHost $currentHost -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -LivenessCounts $script:livenessCounts -StopTime $stopTimeForProgress -PendingRetries $retryQueue.Count
     }
 }
 
 # Wait for remaining jobs to complete
 $progressUpdateCounter = 0
-while ($jobQueue.Count -gt 0) {
+# Retries still waiting keep this loop alive, but only until the deadline: past
+# it nothing new is launched, and they are carried over below instead.
+while ($jobQueue.Count -gt 0 -or ($retryQueue.Count -gt 0 -and -not ($stopTime -and (Get-Date) -ge $stopTime))) {
     Show-StopWarning -StopTime $stopTime -Fired $stopWarningsFired -StopMode $StopMode -LogFile $logFile
     if ($stopTime -and $StopMode -ne "Drain" -and (Get-Date) -ge $stopTime) { $stopReached = $true; break }
     Start-Sleep -Milliseconds 500
     $progressUpdateCounter++
 
-    # Update progress bar every ~60 seconds (120 iterations * 500ms)
-    if ($progressUpdateCounter % 120 -eq 0) {
+    # Refresh the bar every ~5 seconds (10 iterations * 500ms) even when no
+    # job finishes: a clock that stands still for a minute reads as a hang
+    if ($progressUpdateCounter % 10 -eq 0) {
         if ($isWorkflowMode) {
-            Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $totalWork -Failed $failedCount -CurrentHost "" -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -LivenessCounts $script:livenessCounts -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -StopTime $stopTimeForProgress
+            Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $totalWork -Failed $failedCount -CurrentHost "" -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -LivenessCounts $script:livenessCounts -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -StopTime $stopTimeForProgress -PendingRetries $retryQueue.Count
         } else {
-            Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $totalWork -Failed $failedCount -CurrentHost "" -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -LivenessCounts $script:livenessCounts -StopTime $stopTimeForProgress
+            Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $totalWork -Failed $failedCount -CurrentHost "" -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -LivenessCounts $script:livenessCounts -StopTime $stopTimeForProgress -PendingRetries $retryQueue.Count
         }
     }
 
@@ -6465,6 +6530,9 @@ while ($jobQueue.Count -gt 0) {
         $jobData = $job.Value
         $jobResult = Receive-Job -Job $jobData.Job
         Remove-Job -Job $jobData.Job -Force
+        # Out of the queue now, not after processing: a retry put back under
+        # the same key below must survive, or its job runs untracked.
+        $jobQueue.Remove($jobHost)
 
         $scanSuccess = $jobResult.Success
         $attempts = $jobData.Attempts
@@ -6528,9 +6596,8 @@ while ($jobQueue.Count -gt 0) {
         } else {
             if ($attempts -lt ($MaxRetries + 1)) {
                 Write-Log -Message "Scan failed: $jobHost | $currentScanType | Attempt: $attempts/$($MaxRetries + 1) | Error: $($jobResult.Error)" -Level "WARNING" -LogFile $logFile -ErrorLogFile $errorLogFile
-                Write-Log -Message "Retrying in $RetryDelay seconds..." -Level "INFO" -LogFile $logFile
-
-                Start-ScanyxDelay -Seconds $RetryDelay -StopTime $stopTime
+                $retryAt = (Get-Date).AddSeconds([math]::Max(0, $RetryDelay))
+                Write-Log -Message "Retrying in $RetryDelay seconds (at $($retryAt.ToString('HH:mm:ss')))" -Level "INFO" -LogFile $logFile
 
                 $newAttempts = $attempts + 1
                 Update-HostState -State $state -TargetHost $jobHost -Status "in_progress" -Attempts $newAttempts -Error $jobResult.Error
@@ -6542,16 +6609,16 @@ while ($jobQueue.Count -gt 0) {
                     Write-Log -Message "Retry command: $fullNmapCommand" -Level "VERBOSE" -LogFile $logFile
                 }
 
-                $retryJob = Start-NmapScanJob -TargetHost $jobHost -ScanCommand $jobData.ScanCommand -OutputPath $jobData.HostFolder -FileName $jobData.FileName -Attempts $newAttempts -Unprivileged $Unprivileged -NmapPath $nmapExePath -Verbatim $isCommandMode -ResultFile $jobData.ResultFile
-
-                $jobQueue[$jobHost] = @{
-                    Job = $retryJob
+                # Queued, not slept on: Start-DueRetries launches it once the
+                # delay is over, and the other scans keep being collected meanwhile.
+                $retryQueue[$jobHost] = @{
+                    NotBefore = $retryAt
                     Attempts = $newAttempts
                     HostFolder = $jobData.HostFolder
                     FileName = $jobData.FileName
                     ScanCommand = $jobData.ScanCommand
+                    ResultFile = $jobData.ResultFile
                 }
-                $jobStartTimes[$jobHost] = Get-Date
             } else {
                 Update-HostState -State $state -TargetHost $jobHost -Status "failed" -Attempts $attempts -Error $jobResult.Error
                 $failedCount++
@@ -6573,13 +6640,13 @@ while ($jobQueue.Count -gt 0) {
 
         Save-StateFile -StateFile $stateFile -State $state
         if ($isWorkflowMode) {
-            Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $totalWork -Failed $failedCount -CurrentHost $jobHost -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -LivenessCounts $script:livenessCounts -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -StopTime $stopTimeForProgress
+            Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $totalWork -Failed $failedCount -CurrentHost $jobHost -WorkflowStep $workflowStepNumber -WorkflowTotalSteps $workflowSteps.Count -StepProfile $currentProfile -NetworkProgress $script:networkProgress -LivenessCounts $script:livenessCounts -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -StopTime $stopTimeForProgress -PendingRetries $retryQueue.Count
         } else {
-            Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $totalWork -Failed $failedCount -CurrentHost $jobHost -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -LivenessCounts $script:livenessCounts -StopTime $stopTimeForProgress
+            Show-ProgressBar -Completed ($completedCount + $failedCount) -Total $totalWork -Failed $failedCount -CurrentHost $jobHost -ActiveJobs $jobQueue -ScanStartTime $scanStartTime -CompletedDurations $scanDurations -Concurrency $MaxConcurrent -LivenessCounts $script:livenessCounts -StopTime $stopTimeForProgress -PendingRetries $retryQueue.Count
         }
-
-        $jobQueue.Remove($jobHost)
     }
+
+    $null = Start-DueRetries -RetryQueue $retryQueue -JobQueue $jobQueue -JobStartTimes $jobStartTimes -MaxConcurrent $MaxConcurrent -StopTime $stopTime -Unprivileged $Unprivileged -NmapPath $nmapExePath -Verbatim $isCommandMode
 }
 
 # Scheduled stop: cut this window here. Scans still in flight are stopped and
@@ -6588,6 +6655,10 @@ while ($jobQueue.Count -gt 0) {
 # They stay "in_progress" on purpose: a killed nmap still leaves a partial .nmap
 # on disk, and that is the one status the resume treats as incomplete results to
 # overwrite instead of a finished scan to skip.
+# A retry still waiting when the deadline came was never launched: it ends
+# this window the same way as a scan stopped in flight.
+if ($retryQueue.Count -gt 0) { $stopReached = $true }
+
 $killedHere = 0
 if ($stopReached) {
     foreach ($entry in @($jobQueue.GetEnumerator())) {
@@ -6602,12 +6673,19 @@ if ($stopReached) {
         $carryOver += $stoppedHost
         $jobQueue.Remove($stoppedHost)
     }
+    $retriesLeft = $retryQueue.Count
+    foreach ($entry in @($retryQueue.GetEnumerator())) {
+        Update-HostState -State $state -TargetHost $entry.Key -Status "in_progress" -Attempts $entry.Value.Attempts -Error "Retry pending at the scheduled stop time (will be scanned again)"
+        $carryOver += $entry.Key
+    }
+    $retryQueue.Clear()
     Save-StateFile -StateFile $stateFile -State $state
     $stopDetail = if ($StopMode -eq "Drain") {
         "the scans already running were allowed to finish"
     } else {
         "$killedHere scan(s) stopped in flight and left unfinished"
     }
+    if ($retriesLeft -gt 0) { $stopDetail += "; $retriesLeft retry(ies) not launched" }
     Write-Log -Message "Scheduled stop reached ($($stopTime.ToString('yyyy-MM-dd HH:mm:ss')), mode $StopMode): $stopDetail" -Level "WARNING" -LogFile $logFile
 }
 
