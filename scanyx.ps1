@@ -291,6 +291,22 @@ function Get-NmapPath {
     }
 }
 
+function Test-NmapSupportsNoninteractive {
+    # nmap opens /dev/tty for its runtime keys (v, d, p...) and switches the
+    # terminal to raw mode while it runs. Several at once fight over the same
+    # terminal, and they can swallow the reply PowerShell waits for when it asks
+    # where the cursor is, which is how the progress bar gets lost. Older nmap
+    # rejects the option outright (exit 255), so ask once before using it.
+    param([string]$NmapPath = "nmap")
+
+    try {
+        & $NmapPath --noninteractive -V *> $null
+        return ($LASTEXITCODE -eq 0)
+    } catch {
+        return $false
+    }
+}
+
 function ConvertTo-ScanyxDateTime {
     # ConvertFrom-Json on PowerShell 7 turns ISO-8601 strings into [DateTime]
     # objects, and interpolating one yields an invariant "MM/dd/yyyy" string that
@@ -736,6 +752,7 @@ function Start-DueRetries {
         [bool]$Unprivileged = $false,
         [string]$NmapPath = "nmap",
         [bool]$Verbatim = $false,
+        [bool]$Noninteractive = $false,
         $Now = $null
     )
 
@@ -753,7 +770,7 @@ function Start-DueRetries {
 
         $retryHost = $entry.Key
         $r = $entry.Value
-        $job = Start-NmapScanJob -TargetHost $retryHost -ScanCommand $r.ScanCommand -OutputPath $r.HostFolder -FileName $r.FileName -Attempts $r.Attempts -Unprivileged $Unprivileged -NmapPath $NmapPath -Verbatim $Verbatim -ResultFile $r.ResultFile
+        $job = Start-NmapScanJob -TargetHost $retryHost -ScanCommand $r.ScanCommand -OutputPath $r.HostFolder -FileName $r.FileName -Attempts $r.Attempts -Unprivileged $Unprivileged -NmapPath $NmapPath -Verbatim $Verbatim -ResultFile $r.ResultFile -Noninteractive $Noninteractive
 
         $JobQueue[$retryHost] = @{
             Job = $job
@@ -2973,7 +2990,7 @@ function Load-ScanConfiguration {
 
 # Global ScriptBlock for nmap scan jobs (reusable across retry and initial scans)
 $Global:NmapScanScriptBlock = {
-    param($TargetHost, $ScanCommand, $OutputPath, $FileName, $Attempts, $Unprivileged, $NmapPath, $Verbatim, $ResultFile)
+    param($TargetHost, $ScanCommand, $OutputPath, $FileName, $Attempts, $Unprivileged, $NmapPath, $Verbatim, $ResultFile, $Noninteractive)
 
     $startTime = Get-Date
 
@@ -2998,6 +3015,13 @@ $Global:NmapScanScriptBlock = {
     # already added it at the command-string level, so guard against duplicates.
     if ($Unprivileged -and $nmapArgs -notcontains "--unprivileged") {
         $nmapArgs += "--unprivileged"
+    }
+
+    # Keep nmap off the terminal (Test-NmapSupportsNoninteractive). Not in
+    # command-list mode: nmap records its argv in the .nmap, and an extra
+    # option there would stop the result matching the author's line on resume.
+    if ($Noninteractive -and -not $Verbatim -and $nmapArgs -notcontains "--noninteractive") {
+        $nmapArgs += "--noninteractive"
     }
 
     # Command-list mode: the author's line already carries its own output flag
@@ -3092,10 +3116,11 @@ function Start-NmapScanJob {
         [bool]$Unprivileged,
         [string]$NmapPath = "nmap",
         [bool]$Verbatim = $false,
-        [string]$ResultFile = ""
+        [string]$ResultFile = "",
+        [bool]$Noninteractive = $false
     )
 
-    return Start-Job -ScriptBlock $Global:NmapScanScriptBlock -ArgumentList $TargetHost, $ScanCommand, $OutputPath, $FileName, $Attempts, $Unprivileged, $NmapPath, $Verbatim, $ResultFile
+    return Start-Job -ScriptBlock $Global:NmapScanScriptBlock -ArgumentList $TargetHost, $ScanCommand, $OutputPath, $FileName, $Attempts, $Unprivileged, $NmapPath, $Verbatim, $ResultFile, $Noninteractive
 }
 
 function Test-SessionName {
@@ -4267,6 +4292,7 @@ if (-not (Test-NmapInstalled)) {
 
 # Resolve nmap once, up front: background jobs inherit a reduced PATH under sudo
 $nmapExePath = Get-NmapPath
+$nmapNoninteractive = Test-NmapSupportsNoninteractive -NmapPath $nmapExePath
 
 # Load scan configuration (profiles and workflows)
 # When loaded via IEX, $PSScriptRoot and $MyInvocation.MyCommand.Path are $null
@@ -6370,7 +6396,7 @@ while ($hostIndex -lt $workList.Count) {
     if ($stopTime -and (Get-Date) -ge $stopTime) { $stopReached = $true; break }
 
     # A retry whose delay is over takes a free slot before the next new host
-    $null = Start-DueRetries -RetryQueue $retryQueue -JobQueue $jobQueue -JobStartTimes $jobStartTimes -MaxConcurrent $MaxConcurrent -StopTime $stopTime -Unprivileged $Unprivileged -NmapPath $nmapExePath -Verbatim $isCommandMode
+    $null = Start-DueRetries -RetryQueue $retryQueue -JobQueue $jobQueue -JobStartTimes $jobStartTimes -MaxConcurrent $MaxConcurrent -StopTime $stopTime -Unprivileged $Unprivileged -NmapPath $nmapExePath -Verbatim $isCommandMode -Noninteractive $nmapNoninteractive
 
     $currentHost = $workList[$hostIndex]
 
@@ -6395,7 +6421,7 @@ while ($hostIndex -lt $workList.Count) {
         . $collectFinishedJobs
 
         # Slots freed above go to due retries first
-        $null = Start-DueRetries -RetryQueue $retryQueue -JobQueue $jobQueue -JobStartTimes $jobStartTimes -MaxConcurrent $MaxConcurrent -StopTime $stopTime -Unprivileged $Unprivileged -NmapPath $nmapExePath -Verbatim $isCommandMode
+        $null = Start-DueRetries -RetryQueue $retryQueue -JobQueue $jobQueue -JobStartTimes $jobStartTimes -MaxConcurrent $MaxConcurrent -StopTime $stopTime -Unprivileged $Unprivileged -NmapPath $nmapExePath -Verbatim $isCommandMode -Noninteractive $nmapNoninteractive
     }
 
     # The wait above exits on the deadline as well as on a free slot
@@ -6493,7 +6519,7 @@ while ($hostIndex -lt $workList.Count) {
         Write-Log -Message "Command: $fullNmapCommand" -Level "VERBOSE" -LogFile $logFile
     }
 
-    $job = Start-NmapScanJob -TargetHost $currentHost -ScanCommand $currentScanCommand -OutputPath $hostFolder -FileName $fileName -Attempts 1 -Unprivileged $Unprivileged -NmapPath $nmapExePath -Verbatim $isCommandMode -ResultFile $unitResultFile
+    $job = Start-NmapScanJob -TargetHost $currentHost -ScanCommand $currentScanCommand -OutputPath $hostFolder -FileName $fileName -Attempts 1 -Unprivileged $Unprivileged -NmapPath $nmapExePath -Verbatim $isCommandMode -ResultFile $unitResultFile -Noninteractive $nmapNoninteractive
 
     $jobQueue[$currentHost] = @{
         Job = $job
@@ -6534,7 +6560,7 @@ while ($jobQueue.Count -gt 0 -or ($retryQueue.Count -gt 0 -and -not ($stopTime -
 
     . $collectFinishedJobs
 
-    $null = Start-DueRetries -RetryQueue $retryQueue -JobQueue $jobQueue -JobStartTimes $jobStartTimes -MaxConcurrent $MaxConcurrent -StopTime $stopTime -Unprivileged $Unprivileged -NmapPath $nmapExePath -Verbatim $isCommandMode
+    $null = Start-DueRetries -RetryQueue $retryQueue -JobQueue $jobQueue -JobStartTimes $jobStartTimes -MaxConcurrent $MaxConcurrent -StopTime $stopTime -Unprivileged $Unprivileged -NmapPath $nmapExePath -Verbatim $isCommandMode -Noninteractive $nmapNoninteractive
 }
 
 # Scheduled stop: cut this window here. Scans still in flight are stopped and
