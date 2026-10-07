@@ -4535,6 +4535,8 @@ if ($SessionName -and $SessionName -ne "") {
 # Handle -ResumeSession
 $resumingSession = $false
 $resumedSessionData = $null
+$resumedCommandLines = @()
+$resumedCommandBaseDir = $null
 if ($ResumeSession -and $ResumeSession -ne "") {
     Write-Host "[INFO] Resuming session: $ResumeSession" -ForegroundColor Cyan
     $resumedSessionData = Get-SessionState -SessionName $ResumeSession -OutputDir $OutputDir
@@ -4545,6 +4547,26 @@ if ($ResumeSession -and $ResumeSession -ne "") {
 
     # Override sessionId with resumed session name
     $sessionId = $ResumeSession
+
+    # A command-list session has no profile to load: its work is the list
+    # itself, saved in the state when it ran. Resuming it as a profile scan
+    # turned every unit id into a hostname and ran nmap with no command at all,
+    # which "succeeds" on zero hosts and marks the line as done.
+    if ($resumedSessionData.State.scan_type -eq "commands") {
+        $savedLines = @($resumedSessionData.State.command_lines | Where-Object { $null -ne $_ })
+        if (($CommandFile -and $CommandFile -ne "") -or $Commands.Count -gt 0) {
+            # An explicit list wins: that is how a list edited since is resumed.
+        } elseif ($savedLines.Count -gt 0) {
+            $resumedCommandLines = $savedLines
+            $resumedCommandBaseDir = $resumedSessionData.State.command_base_dir
+            Write-Host "[INFO] Loaded command list from session: $($savedLines.Count) line(s)" -ForegroundColor Green
+        } else {
+            Write-Host "[ERROR] '$ResumeSession' ran a command list, and its state predates saving that list." -ForegroundColor DarkRed
+            Write-Host "        Resume it by passing the same list again:" -ForegroundColor Yellow
+            Write-Host "        $(Get-InvocationHint) -CommandFile <file> -SessionName `"$ResumeSession`" -OutputDir `"$OutputDir`" -Resume`n" -ForegroundColor Yellow
+            return
+        }
+    }
 
     # Load scan configuration from session state
     $stateScanType = $null
@@ -4568,11 +4590,28 @@ if ($ResumeSession -and $ResumeSession -ne "") {
     if ($resumedSessionData.State.workflow -and $resumedSessionData.State.workflow -ne "null" -and $resumedSessionData.State.workflow -ne "") {
         $Workflow = $resumedSessionData.State.workflow
         Write-Host "[INFO] Loaded workflow from session: $Workflow" -ForegroundColor Green
+    } elseif ($stateScanType -eq "commands") {
+        Write-Host "[INFO] Session type: command list" -ForegroundColor Green
     } elseif ($stateScanType) {
         $ScanType = $stateScanType
         Write-Host "[INFO] Loaded scan type from session: $ScanType" -ForegroundColor Green
     } else {
         Write-Host "[WARNING] Could not load scan type or workflow from session state" -ForegroundColor Yellow
+    }
+
+    # The profile the session ran with has to exist in the configuration loaded
+    # now (a custom -ConfigFile is not remembered). Without it every host would
+    # be launched with an empty command.
+    $missingProfile = $null
+    if ($Workflow -and $Workflow -ne "" -and -not $scanWorkflows.ContainsKey($Workflow)) {
+        $missingProfile = "workflow '$Workflow'"
+    } elseif ((-not $Workflow -or $Workflow -eq "") -and $ScanType -and $ScanType -ne "" -and -not $scanProfiles.ContainsKey($ScanType)) {
+        $missingProfile = "scan profile '$ScanType'"
+    }
+    if ($missingProfile) {
+        Write-Host "[ERROR] The session ran with $missingProfile, which is not in the loaded configuration ($configFile)." -ForegroundColor DarkRed
+        Write-Host "        If it came from a custom file, pass it again with -ConfigFile.`n" -ForegroundColor Yellow
+        return
     }
 
     Write-Host "[INFO] Session loaded successfully" -ForegroundColor Green
@@ -4583,7 +4622,7 @@ if ($ResumeSession -and $ResumeSession -ne "") {
 # not a target plus a profile. Everything downstream (state, resume, sessions,
 # retries, summary) is the same engine.
 # ---------------------------------------------------------------------------
-$isCommandMode = ($CommandFile -and $CommandFile -ne "") -or ($Commands.Count -gt 0)
+$isCommandMode = ($CommandFile -and $CommandFile -ne "") -or ($Commands.Count -gt 0) -or ($resumedCommandLines.Count -gt 0)
 $commandUnits = @()
 
 if ($isCommandMode) {
@@ -4609,11 +4648,18 @@ if ($isCommandMode) {
         $listLines += Get-Content $CommandFile
     }
     if ($Commands.Count -gt 0) { $listLines += $Commands }
+    $listFromSession = $false
+    if ($listLines.Count -eq 0 -and $resumedCommandLines.Count -gt 0) {
+        $listLines += $resumedCommandLines
+        $listFromSession = $true
+    }
 
     # Relative -oA paths resolve against the invocation directory, exactly as
     # they would running the list by hand. A background job does not reliably
     # inherit the working directory, so this is pinned here rather than there.
-    $invocationDir = (Get-Location).Path
+    # A resumed list keeps the directory it was first run from, or its
+    # relative paths would land somewhere else.
+    $invocationDir = if ($listFromSession -and $resumedCommandBaseDir) { $resumedCommandBaseDir } else { (Get-Location).Path }
     $commandFallbackDir = [IO.Path]::Combine($OutputDir, "commands")
     $parsed = Read-CommandList -Lines $listLines -BaseDirectory $invocationDir -FallbackOutputDir $commandFallbackDir
     $commandUnits = $parsed.Units
@@ -4875,7 +4921,9 @@ $invalidEntries = @()
 $totalExpanded = 0
 $totalEntriesProcessed = 0
 
-if (-not $resumingSession) {
+# A resumed command list is rebuilt from its lines like a fresh one; only a
+# profile session takes its hosts from the state.
+if (-not $resumingSession -or $isCommandMode) {
     # Process host file if provided
     if ($HostFile -and $HostFile -ne "") {
     Write-Log -Message "Processing target hosts file: $HostFile" -Level "INFO" -LogFile $logFile
@@ -5678,6 +5726,9 @@ $state = @{
     pending = $validHosts.Count
     elapsed_seconds = 0
     output_dir = $OutputDir
+    # What -ResumeSession needs to run the list again without being handed it
+    command_lines = if ($isCommandMode) { @($listLines) } else { $null }
+    command_base_dir = if ($isCommandMode) { $invocationDir } else { $null }
     hosts = @{}
 }
 
@@ -6454,6 +6505,19 @@ while ($hostIndex -lt $workList.Count) {
         }
         $unitResultFile = ""
         $existingResultFile = "$([IO.Path]::Combine($hostFolder, $fileName)).nmap"
+    }
+
+    # Nothing to run is a broken state, not a scan: nmap handed only
+    # "-oA <dir> <target>" scans nothing, exits 0, and the item would be
+    # recorded as done without ever having been scanned.
+    $commandToRun = if ($isCommandMode) { $currentScanCommand } else { $baseScanCommand }
+    if ([string]::IsNullOrWhiteSpace($commandToRun) -or $commandToRun.Trim() -eq "nmap") {
+        $reason = if ($isCommandMode) { "No command recorded for this unit" } else { "Unknown scan profile '$currentScanType'" }
+        Write-Log -Message "Not scanning $currentHost : $reason" -Level "ERROR" -LogFile $logFile -ErrorLogFile $errorLogFile
+        Update-HostState -State $state -TargetHost $currentHost -Status "failed" -Attempts 0 -Error $reason
+        $failedCount++
+        Save-StateFile -StateFile $stateFile -State $state
+        continue
     }
 
     # Check if results already exist. In command-list mode a file at the

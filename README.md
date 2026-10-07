@@ -436,7 +436,17 @@ scanyx -CommandFile comandos.txt -SessionName cliente-2025
 
 # Reanudar: solo corre lo que quedó pendiente o falló
 scanyx -CommandFile comandos.txt -SessionName cliente-2025 -Resume
+
+# O con la línea que imprime Scanyx al parar (también en .sessions/<sesión>/resume.txt):
+# usa la lista tal como era cuando se lanzó la sesión
+scanyx -ResumeSession cliente-2025 -Resume
 ```
+
+La sesión guarda la lista con la que se ejecutó y el directorio desde el que se
+lanzó, así que `-ResumeSession` no necesita el fichero y las rutas relativas de
+`-oA` siguen apuntando al mismo sitio aunque reanudes desde otro directorio. Si
+has editado la lista y quieres reanudar con la versión nueva, pásala con
+`-CommandFile`.
 
 **Dónde se guardan los resultados.** Donde diga el `-oA` de cada línea, igual
 que si ejecutaras la lista a mano; las rutas relativas se resuelven contra el
