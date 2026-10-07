@@ -307,6 +307,92 @@ function Test-NmapSupportsNoninteractive {
     }
 }
 
+function ConvertFrom-Meminfo {
+    # Linux: MemAvailable is the kernel's own estimate of what can be handed out
+    # without swapping, page cache it can drop included. In MB; 0 if absent.
+    param([string[]]$Lines)
+
+    foreach ($line in $Lines) {
+        if ($line -match '^MemAvailable:\s+(\d+)\s*kB') { return [int]([long]$Matches[1] / 1024) }
+    }
+    return 0
+}
+
+function ConvertFrom-VmStat {
+    # macOS: free, inactive and speculative pages are what the system gives
+    # away without pressure. Conservative: memory it could get back by
+    # compressing is not counted. In MB; 0 if the output is not recognised.
+    param([string[]]$Lines)
+
+    $pageSize = 0
+    $pages = [long]0
+    foreach ($line in $Lines) {
+        if ($line -match 'page size of (\d+) bytes') { $pageSize = [long]$Matches[1] }
+        elseif ($line -match '^Pages (free|inactive|speculative):\s+(\d+)') { $pages += [long]$Matches[2] }
+    }
+    if ($pageSize -le 0) { return 0 }
+    return [int]($pages * $pageSize / 1MB)
+}
+
+function Get-AvailableMemoryMB {
+    # Memory available to new processes, in MB, or 0 when it cannot be read:
+    # the caller then says nothing rather than guess.
+    try {
+        if ($IsLinux -and (Test-Path /proc/meminfo)) {
+            return ConvertFrom-Meminfo -Lines (Get-Content /proc/meminfo -ErrorAction Stop)
+        }
+        if ($IsMacOS) {
+            return ConvertFrom-VmStat -Lines @(& vm_stat 2>$null)
+        }
+    } catch { }
+    return 0
+}
+
+function Get-ScanSlotMemoryMB {
+    # What one concurrent scan costs. Each slot is a whole pwsh process for the
+    # job (~155 MB measured on pwsh 7.6 before it does anything) plus its nmap,
+    # which stays small on its own but reached 176 MB running the stock
+    # "--script=default,vuln -sV" profile. Rounded up: this is a warning, and
+    # under-estimating is the failure that matters.
+    param([string]$Command)
+
+    $jobMB = 160
+    $nmapMB = 30
+    $tokens = @(Split-NmapCommandLine -Command $Command)
+    # -sC also hides inside combined scan types such as the common -sCV
+    $usesScripts = $tokens | Where-Object { $_ -match '^--script(=|$)' -or $_ -cmatch '^-s[A-Za-z]*C' -or $_ -ceq '-A' }
+    if ($usesScripts) { $nmapMB = 180 }
+    return $jobMB + $nmapMB
+}
+
+function Test-ConcurrencyFitsMemory {
+    # Whether running $Concurrency scans at once fits in memory, and how many
+    # would. Only 80% of what is available is budgeted: the main process, the
+    # file cache and everything else on the machine need the rest. Exceeding it
+    # sends the box into swap, where a scan looks exactly like a hung one.
+    param(
+        [int]$Concurrency,
+        [string[]]$Commands,
+        [int]$AvailableMB
+    )
+
+    $perSlot = 0
+    foreach ($c in $Commands) {
+        $perSlot = [math]::Max($perSlot, (Get-ScanSlotMemoryMB -Command $c))
+    }
+    if ($perSlot -le 0) { $perSlot = Get-ScanSlotMemoryMB -Command "" }
+
+    $needed = $Concurrency * $perSlot
+    $budget = [int]($AvailableMB * 0.8)
+    return [pscustomobject]@{
+        Fits         = ($AvailableMB -le 0) -or ($needed -le $budget)
+        NeededMB     = $needed
+        PerSlotMB    = $perSlot
+        AvailableMB  = $AvailableMB
+        SuggestedMax = [math]::Max(1, [int][math]::Floor($budget / $perSlot))
+    }
+}
+
 function ConvertTo-ScanyxDateTime {
     # ConvertFrom-Json on PowerShell 7 turns ISO-8601 strings into [DateTime]
     # objects, and interpolating one yields an invariant "MM/dd/yyyy" string that
@@ -5588,6 +5674,34 @@ Write-Host "$MaxConcurrent concurrent | $MaxRetries retry | ${RetryDelay}s delay
 if ($Unprivileged) {
     Write-Host "   Privileges : " -NoNewline -ForegroundColor Cyan
     Write-Host "unprivileged (downgraded, no raw sockets)" -ForegroundColor Yellow
+}
+
+# Linux/macOS: every concurrent scan is a full pwsh process plus its nmap. Too
+# many for the RAM and the box swaps, which looks like a hang from the outside.
+if ($IsLinux -or $IsMacOS) {
+    $plannedCommands = if ($isCommandMode) {
+        @($commandUnits | ForEach-Object { $_.Command })
+    } elseif ($isWorkflowMode) {
+        @($workflowSteps | ForEach-Object { $scanProfiles[$_.profile].command })
+    } else {
+        @($scanProfiles[$ScanType].command)
+    }
+    if ($sensitiveHostsToScan.Count -gt 0) {
+        $plannedCommands += @($plannedCommands | ForEach-Object {
+            Get-SensitiveScanCommand -BaseCommand $_ -Timing $SensitiveTiming -Scripts $SensitiveScripts
+        })
+    }
+    # Never more at once than there are items to scan
+    $itemCount = if ($isCommandMode) { $commandUnits.Count } else { $validHosts.Count }
+    $slots = [math]::Max(1, [math]::Min($MaxConcurrent, $itemCount))
+    $memoryCheck = Test-ConcurrencyFitsMemory -Concurrency $slots -Commands $plannedCommands -AvailableMB (Get-AvailableMemoryMB)
+    if (-not $memoryCheck.Fits) {
+        Write-Host "   Memory     : " -NoNewline -ForegroundColor Cyan
+        Write-Host "~$($memoryCheck.NeededMB) MB for $slots scans at once (~$($memoryCheck.PerSlotMB) MB each), $($memoryCheck.AvailableMB) MB available" -ForegroundColor Yellow
+        Write-Host "                Past that the machine swaps and the scan looks hung. -MaxConcurrent $($memoryCheck.SuggestedMax) fits." -ForegroundColor Yellow
+        # File only: the two lines above already say it on screen
+        Add-Content -Path $logFile -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [WARNING] Memory: ~$($memoryCheck.NeededMB) MB needed for $slots concurrent scans, $($memoryCheck.AvailableMB) MB available; -MaxConcurrent $($memoryCheck.SuggestedMax) fits" -ErrorAction SilentlyContinue
+    }
 }
 Write-Host ""
 

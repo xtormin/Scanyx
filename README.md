@@ -61,6 +61,13 @@ parámetros de Scanyx): `--check`, `--install`/`--yes`, `--no-install`,
 `--sudo`/`--no-sudo`, `--remote [URL]`, `--help`. Cualquier otro argumento se
 reenvía tal cual a `Invoke-Scanyx`.
 
+**Memoria.** Cada escaneo en paralelo es un proceso `pwsh` completo (~160 MB)
+más su nmap (poco por sí solo, ~180 MB con scripts NSE como `--script`, `-sC` o
+`-A`). Antes de empezar, Scanyx compara lo que pide `-MaxConcurrent` con la
+memoria disponible y, si no cabe en el 80% de ella, lo avisa en la configuración
+previa con el `-MaxConcurrent` que sí cabe. No lo cambia por ti. En un servidor
+justo de RAM, pasarse de ahí lo lleva a swap y el escaneo parece colgado.
+
 ### Carga local (Windows)
 ```powershell
 git clone "https://github.com/xtormin/scanyx.git"
