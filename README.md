@@ -237,15 +237,18 @@ La hora actual, la de parada y lo que falta para ella se ven en la configuració
 ## Reanudar sesión
 
 ```powershell
-# Reanuda la sesión continuando el escaneo con todos los hosts que no se han completado
+# Reanuda la sesión: escanea los hosts pendientes y los que quedaron a medias
 scanyx `
     -ResumeSession "workflow-01" `
     -OutputDir "scans" `
     -Resume
-    -VerboseMode
 ```
 
 Es el comando que Scanyx imprime al final de cada ejecución, listo para copiar y pegar.
+
+`-Resume` no repite los hosts que fallaron. Para incluirlos, cambia `-Resume` por
+`-ResumeRetryFailed` (pendientes, a medias y fallidos) o por `-RetryFailed` (solo
+los fallidos).
 
 ---
 
@@ -366,13 +369,13 @@ scanyx -ResumeSession "pentest-cliente-2025" -Resume -OutputDir "C:\Pentest\PROY
 
 ## Reanudar Escaneos
 ```powershell
-# Continuar escaneo interrumpido (solo pendientes)
+# Continuar escaneo interrumpido (pendientes y los que quedaron a medias)
 scanyx -HostFile hosts.txt -ScanType tcp-1000 -Resume
 
 # Continuar y reintentar fallidos
 scanyx -HostFile hosts.txt -ScanType tcp-1000 -ResumeRetryFailed
 
-# Reintentar los que no dieron ninguna senal de vida
+# Reintentar los que no dieron ninguna señal de vida
 scanyx -HostFile hosts.txt -ScanType tcp-1000 -RetryDead
 
 # Empezar desde cero (ignora estado previo)
@@ -434,8 +437,11 @@ scanyx -CommandFile comandos.txt -ListCommands
 # Ejecutarla con nombre de sesión, para poder reanudarla después
 scanyx -CommandFile comandos.txt -SessionName cliente-2025
 
-# Reanudar: solo corre lo que quedó pendiente o falló
+# Reanudar: corre lo pendiente y lo que quedó a medias (no lo que falló)
 scanyx -CommandFile comandos.txt -SessionName cliente-2025 -Resume
+
+# Reanudar y repetir también las líneas que fallaron
+scanyx -CommandFile comandos.txt -SessionName cliente-2025 -ResumeRetryFailed
 
 # O con la línea que imprime Scanyx al parar (también en .sessions/<sesión>/resume.txt):
 # usa la lista tal como era cuando se lanzó la sesión
