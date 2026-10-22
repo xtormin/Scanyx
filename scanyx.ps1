@@ -316,6 +316,261 @@ function Test-NmapSupportsNoninteractive {
     }
 }
 
+# ---------------------------------------------------------------------------
+# Run control: Ctrl+C, the s/p keys, and stop requests from outside
+# ---------------------------------------------------------------------------
+# The Ctrl+C PowerShell gives us for free does not survive this scan loop. With
+# background jobs running and a progress pane on screen, the SIGINT the terminal
+# sends cannot stop the pipeline: the scan carries on, no handler fires, and the
+# terminal is left in raw mode - no echo, no Ctrl+C - so the only way out is
+# closing the window. Start-Job plus Write-Progress in a loop is enough to
+# reproduce it with no Scanyx involved, so it is not ours to fix in place.
+#
+# What is ours is not to depend on it. Ctrl+C is taken as a keystroke instead of
+# a signal: the terminal stops raising it, the waiting loops read it out of the
+# input buffer, and the stop then takes the same route a scheduled stop takes -
+# scans in flight left unfinished and resumable, summary printed, resume line
+# printed. A second Ctrl+C quits on the spot.
+#
+# Reading keys anyway buys two more, which the progress bar advertises:
+#   s  stop once the scans in flight finish (nothing new is launched)
+#   p  pause and resume dispatch, leaving what is running to run
+#
+# And because a signal cannot be handled here at all - a PowerShell scriptblock
+# has no runspace on the thread .NET calls a POSIX handler on, and compiling one
+# with Add-Type costs over a second on every run - SIGTERM and SIGHUP are turned
+# into a file. The launcher traps them and writes a stop file; the loops below
+# stat it on the same turn they read the keyboard. That also makes a graceful
+# stop scriptable from a second terminal, which a signal never did.
+$script:interruptRequested = $false
+$script:interruptCount = 0
+$script:interruptCapture = $null
+$script:interruptReason = ""
+$script:drainRequested = $false
+$script:pauseRequested = $false
+$script:stopFiles = @()
+$script:exitCode = 0
+
+function Enable-RunControl {
+    # Only where there is a console to read keys from. Piped into a file or a
+    # pager there is no keystroke to read, so the keys are left unadvertised and
+    # the exiting handler stays the net below, as it was. The stop files are
+    # watched either way: they are the one channel that needs no terminal.
+    param([string[]]$StopFile = @())
+
+    $script:interruptRequested = $false
+    $script:interruptCount = 0
+    $script:interruptCapture = $null
+    $script:interruptReason = ""
+    $script:drainRequested = $false
+    $script:pauseRequested = $false
+    $script:exitCode = 0
+    # Dot-sourced and called twice in one session, the second run must not
+    # inherit the first one's verdict.
+    $global:ScanyxExitCode = 0
+
+    # A stop file left behind by the run that was stopped would stop this one
+    # before it scanned anything, which is the last thing a resume needs.
+    $script:stopFiles = @($StopFile | Where-Object { $_ })
+    foreach ($path in $script:stopFiles) {
+        try { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue } catch { }
+    }
+
+    try {
+        if ([Console]::IsInputRedirected) { return $false }
+        $script:interruptCapture = [Console]::TreatControlCAsInput
+        [Console]::TreatControlCAsInput = $true
+        return $true
+    } catch {
+        $script:interruptCapture = $null
+        return $false
+    }
+}
+
+function Restore-RunControl {
+    # Must run on every way out. Leaving the capture on would hand the next
+    # command a terminal that ignores Ctrl+C, which is the very thing being
+    # fixed here, and leaving the stop file behind would stop the next run.
+    try {
+        if ($null -ne $script:interruptCapture) {
+            [Console]::TreatControlCAsInput = $script:interruptCapture
+            $script:interruptCapture = $null
+        }
+    } catch { }
+    foreach ($path in $script:stopFiles) {
+        try { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue } catch { }
+    }
+}
+
+function Clear-ProgressPanes {
+    # Every bar Show-ProgressBar can have up: the single-scan one (default id)
+    # and the workflow pair. Clearing an id that was never used costs nothing.
+    foreach ($id in 0, 1, 2) {
+        try { Write-Progress -Id $id -Activity " " -Completed } catch { }
+    }
+}
+
+function Show-RunControlKeys {
+    # Said once, when the scan starts, rather than carried in the progress bar:
+    # PowerShell's Minimal progress view renders Activity and Status and drops
+    # CurrentOperation, and the status line has no room left for three keys.
+    # Only promise what the terminal can deliver - with no console to read from,
+    # s and p are not listening and saying so would be a lie.
+    if ($null -eq $script:interruptCapture) { return }
+    Write-Host "⌨️  Keys       : " -NoNewline -ForegroundColor Cyan
+    Write-Host "Ctrl+C " -NoNewline -ForegroundColor White
+    Write-Host "stop (twice to quit at once) " -NoNewline -ForegroundColor Gray
+    Write-Host "| s " -NoNewline -ForegroundColor White
+    Write-Host "drain, let what is running finish " -NoNewline -ForegroundColor Gray
+    Write-Host "| p " -NoNewline -ForegroundColor White
+    Write-Host "pause" -ForegroundColor Gray
+}
+
+function Get-RunControlBadge {
+    # What goes in the progress bar: nothing while a run is just running, and a
+    # loud word when it is not, because a paused scan and a stuck one look
+    # exactly alike otherwise. Short on purpose - it shares the status line.
+    if ($null -eq $script:interruptCapture) { return "" }
+    if ($script:pauseRequested) { return "⏸ PAUSED (p resumes) | " }
+    if ($script:drainRequested) { return "⏹ DRAINING | " }
+    return ""
+}
+
+function Get-StopCause {
+    # What ended the run early, as a noun phrase to drop into a sentence. One
+    # place for it so the state file, the log and the summary cannot drift.
+    # Empty when nothing was asked for and the clock did it, or nobody did.
+    if ($script:interruptRequested) {
+        return $(if ($script:interruptReason) { $script:interruptReason } else { "a stop request" })
+    }
+    if ($script:drainRequested) { return "a drain asked for with 's'" }
+    return ""
+}
+
+function Request-ScanStop {
+    # The one door every kind of stop goes through, so the wording, the exit
+    # code and the pane all end up consistent whoever asked.
+    param(
+        [string]$Reason = "a stop request",
+        [int]$ExitCode = 130
+    )
+
+    if ($script:interruptRequested) { return }
+    $script:interruptRequested = $true
+    $script:interruptReason = $Reason
+    $script:exitCode = $ExitCode
+    $script:pauseRequested = $false
+
+    # The pane first: left up, it is redrawn under every line below and the
+    # notice arrives shredded across four copies of the bar.
+    Clear-ProgressPanes
+    Write-Host ""
+    Write-Host "[INFO] Stopping ($Reason)." -ForegroundColor Yellow
+    Write-Host "       The scans still running are left unfinished and will be scanned again on resume." -ForegroundColor DarkGray
+    if ($null -ne $script:interruptCapture) {
+        Write-Host "       Ctrl+C again to quit at once, without the summary." -ForegroundColor DarkGray
+    }
+}
+
+function Request-ScanDrain {
+    # 's': no new scan leaves the machine, but the ones already out there are
+    # given their time. Hosts never dispatched stay pending for the resume.
+    if ($script:drainRequested -or $script:interruptRequested) { return }
+    $script:drainRequested = $true
+    $script:pauseRequested = $false
+    Clear-ProgressPanes
+    Write-Host ""
+    Write-Host "[INFO] Draining: nothing new will be launched." -ForegroundColor Yellow
+    Write-Host "       The scans already running will finish and be recorded; the rest stays pending." -ForegroundColor DarkGray
+    Write-Host "       Ctrl+C to stop without waiting for them." -ForegroundColor DarkGray
+}
+
+function Switch-ScanPause {
+    # 'p': a toggle, not a stop. Nothing new is dispatched while it is on, and
+    # the scans in flight keep running and keep being collected - nmap cannot be
+    # paused mid-scan without lying to its own timing, so it is not asked to.
+    if ($script:interruptRequested -or $script:drainRequested) { return }
+    $script:pauseRequested = -not $script:pauseRequested
+    Clear-ProgressPanes
+    Write-Host ""
+    if ($script:pauseRequested) {
+        Write-Host "[INFO] Paused: nothing new will be launched." -ForegroundColor Yellow
+        Write-Host "       The scans already running carry on. Press p again to go on dispatching." -ForegroundColor DarkGray
+    } else {
+        Write-Host "[INFO] Resumed." -ForegroundColor Green
+    }
+}
+
+function Test-InterruptRequested {
+    # Cheap enough to call on every turn of a 500 ms loop: it reads the input
+    # buffer without ever blocking for a key, and stats the stop files.
+    if ($script:interruptRequested) { return $true }
+
+    # A stop file is how SIGTERM and SIGHUP reach us, so it is checked even
+    # when there is no console and the keys below are not being read.
+    foreach ($path in $script:stopFiles) {
+        if (-not (Test-Path -LiteralPath $path)) { continue }
+        $reason = "a stop request"
+        try {
+            $written = (Get-Content -LiteralPath $path -TotalCount 1 -ErrorAction SilentlyContinue)
+            if ($written) { $reason = $written.Trim() }
+        } catch { }
+        # 128 + the signal number, the way a shell reports a killed process.
+        $code = if ($reason -match '^SIG(TERM)?$|^TERM$') { 143 }
+                elseif ($reason -match '^SIGHUP$|^HUP$') { 129 }
+                else { 130 }
+        Request-ScanStop -Reason $reason -ExitCode $code
+        return $true
+    }
+
+    if ($null -eq $script:interruptCapture) { return $false }
+    try {
+        # Bounded, because KeyAvailable is only as honest as the console it was
+        # given: on a reopened tty it has been seen to report a key that is not
+        # there, and the ReadKey that follows never returns. The launcher hands
+        # over its own descriptor to avoid that, and the cap is the backstop -
+        # a burst of escape-sequence bytes cannot spin here either.
+        $keysLeft = 16
+        while ($keysLeft -gt 0 -and [Console]::KeyAvailable) {
+            $keysLeft--
+            $key = [Console]::ReadKey($true)
+
+            if ($key.Key -eq [ConsoleKey]::C -and ($key.Modifiers -band [ConsoleModifiers]::Control)) {
+                $script:interruptCount++
+                if ($script:interruptCount -eq 1) {
+                    Request-ScanStop -Reason "Ctrl+C" -ExitCode 130
+                } else {
+                    Stop-ScanyxNow
+                }
+                continue
+            }
+
+            # Bare letters only: Ctrl+S is the terminal's own flow control and
+            # Alt+P belongs to whoever bound it, not to us.
+            if ($key.Modifiers -ne 0) { continue }
+            switch ($key.Key) {
+                ([ConsoleKey]::S) { Request-ScanDrain }
+                ([ConsoleKey]::P) { Switch-ScanPause }
+            }
+        }
+    } catch { }
+    return $script:interruptRequested
+}
+
+function Stop-ScanyxNow {
+    # Second Ctrl+C: go now. Every finished scan is already on disk - the state
+    # file is written as each one ends - so the session stays resumable and only
+    # this run's summary is lost.
+    Write-Host "`n[WARNING] Second Ctrl+C: quitting now." -ForegroundColor Yellow
+    try {
+        Get-Job | Where-Object { $_.PSJobTypeName -eq "BackgroundJob" } |
+            Stop-Job -ErrorAction SilentlyContinue
+    } catch { }
+    $global:ScanyxExitCode = 130
+    Restore-RunControl
+    exit 130
+}
+
 function ConvertFrom-Meminfo {
     # Linux: MemAvailable is the kernel's own estimate of what can be handed out
     # without swapping, page cache it can drop included. In MB; 0 if absent.
@@ -993,6 +1248,9 @@ function Wait-ForScheduledStart {
     try { $liveCountdown = -not [Console]::IsOutputRedirected } catch { $liveCountdown = $false }
 
     while ((Get-Date) -lt $StartTime) {
+        # Ctrl+C is a keystroke from here on (Enable-RunControl), so the wait
+        # has to read it too or it would hold until the window opened.
+        if (Test-InterruptRequested) { break }
         $left = $StartTime - (Get-Date)
         if ($liveCountdown) {
             $line = "   Starting in $(Format-Duration -TimeSpan $left)   (now $((Get-Date).ToString('HH:mm:ss')))"
@@ -1003,6 +1261,8 @@ function Wait-ForScheduledStart {
     }
 
     if ($liveCountdown) { Write-Host "`r$(' ' * 70)`r" -NoNewline }
+    # Cut short by Ctrl+C: the window never opened, so do not announce a start.
+    if ($script:interruptRequested) { return (Get-Date) }
     $started = Get-Date
     Write-Host "   Started at $($started.ToString('yyyy-MM-dd HH:mm:ss'))" -ForegroundColor Green
     Write-Host ""
@@ -1333,11 +1593,14 @@ function Test-NmapOutputMatchesCommand {
     $recorded = $Matches[1].Trim()
 
     # Drop the executable from both sides: the recorded one is a resolved path.
+    # And drop --noninteractive, which Scanyx adds itself to keep nmap off the
+    # terminal: it is ours, not the author's, so a line that did not ask for it
+    # must still match the output of a scan that ran with it.
     $stripExe = {
         param($c)
         $t = @(Split-NmapCommandLine -Command $c)
         if ($t.Count -le 1) { return "" }
-        return (($t | Select-Object -Skip 1) -join ' ')
+        return (($t | Select-Object -Skip 1 | Where-Object { $_ -ne "--noninteractive" }) -join ' ')
     }
 
     return ((& $stripExe $recorded) -eq (& $stripExe $Command))
@@ -2626,6 +2889,11 @@ function Show-ProgressBar {
     # last hosts are all waiting to retry looks exactly like a stuck one.
     $retryStr = if ($PendingRetries -gt 0) { " | Retry: $PendingRetries" } else { "" }
 
+    # PAUSED or DRAINING, in front of the counters where it cannot be missed.
+    # Empty while a run is just running, and whenever there is no console
+    # reading keys, so it never names a state no key can get the run out of.
+    $controlStr = Get-RunControlBadge
+
     # Get active hosts list
     $activeHostsList = @()
     if ($ActiveJobs.Count -gt 0) {
@@ -2670,7 +2938,7 @@ function Show-ProgressBar {
                        -PercentComplete $workflowPercent
 
         # Build secondary status - Ultra compact format
-        $secondaryStatus = "$Completed/$Total ($percent%) | OK: $successful | Fail: $Failed$retryStr"
+        $secondaryStatus = "$controlStr$Completed/$Total ($percent%) | OK: $successful | Fail: $Failed$retryStr"
         $secondaryStatus += $livenessSummary
 
         if ($elapsedStr -ne "") {
@@ -2692,7 +2960,7 @@ function Show-ProgressBar {
                        -PercentComplete $percent
     } else {
         # Single scan mode: Show single progress bar - Ultra compact format
-        $statusMessage = "$Completed/$Total ($percent%) | OK: $successful | Fail: $Failed$retryStr"
+        $statusMessage = "$controlStr$Completed/$Total ($percent%) | OK: $successful | Fail: $Failed$retryStr"
         $statusMessage += $livenessSummary
 
         if ($elapsedStr -ne "") {
@@ -3112,10 +3380,15 @@ $Global:NmapScanScriptBlock = {
         $nmapArgs += "--unprivileged"
     }
 
-    # Keep nmap off the terminal (Test-NmapSupportsNoninteractive). Not in
-    # command-list mode: nmap records its argv in the .nmap, and an extra
-    # option there would stop the result matching the author's line on resume.
-    if ($Noninteractive -and -not $Verbatim -and $nmapArgs -notcontains "--noninteractive") {
+    # Keep nmap off the terminal (Test-NmapSupportsNoninteractive). In
+    # command-list mode too: nmap opens /dev/tty for its runtime keys whatever
+    # we asked for, and it then eats the Ctrl+C, s and p that Scanyx is reading
+    # from that same terminal - a -CommandFile run would be back to a Ctrl+C
+    # that does nothing. It changes no scan behaviour and no output, only
+    # whether nmap listens for keystrokes, so verbatim survives it; the one
+    # thing it does change is the argv nmap records in its .nmap, which
+    # Test-NmapOutputMatchesCommand drops from both sides before comparing.
+    if ($Noninteractive -and $nmapArgs -notcontains "--noninteractive") {
         $nmapArgs += "--noninteractive"
     }
 
@@ -6275,15 +6548,36 @@ if (-not (Test-Path $resultsFile)) {
     } | ConvertTo-Json -Depth 10 | Set-Content -Path $resultsFile
 }
 
-# Ctrl+C handler
+# Run control: Ctrl+C, s and p are read as keystrokes from here on, so the loops
+# below can act on them. Everything that asks the user something has already
+# asked it by now, which is why this goes here and not at the top: a prompt
+# wants the normal Ctrl+C, and an s typed into one is an answer, not a command.
+#
+# Two stop files are watched. The launcher names the first through the
+# environment, and traps SIGTERM and SIGHUP into it; the second lives in the
+# session directory, which is printed with the resume line, so a graceful stop
+# can be asked for from a second terminal with a single touch.
+$script:stopRequestFile = [IO.Path]::Combine($sessionDir, "stop.request")
+$null = Enable-RunControl -StopFile @($env:SCANYX_STOP_FILE, $script:stopRequestFile)
+
+# Last resort for the ways out that no loop sees: a kill -9, a terminating
+# error, or a run with no console to read keys from.
 $global:cleanupJobs = @()
 $script:scanCompleted = $false
 $exitSubscriber = Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action {
+    # Before anything else, and on every exit: hand the terminal back the way we
+    # found it. A shell left ignoring Ctrl+C is worse than any missing summary.
+    Restore-RunControl
+
     # This fires on ANY exit, not just Ctrl+C, so only claim an interruption
     # when the scan loop did not reach its end.
     if ($script:scanCompleted) { return }
 
-    Write-Host "`n`n[INFO] Scan interrupted by user (Ctrl+C)" -ForegroundColor Yellow
+    # The keystroke route already printed its own notice and goes on to the real
+    # summary; this handler only speaks for the exits nothing else caught.
+    if (-not $script:interruptRequested) {
+        Write-Host "`n`n[INFO] Scan interrupted by user (Ctrl+C)" -ForegroundColor Yellow
+    }
 
     # Show network summary if available
     if ($script:networkProgress -and $script:networkProgress.Count -gt 0) {
@@ -6487,6 +6781,11 @@ if ($startTime -and -not $startWaitDone) {
 # Warning thresholds already announced, so each one is said once per window
 $stopWarningsFired = @{}
 
+# Said here, with the bar about to take over the screen: after the scheduled
+# wait, so it is the last thing on screen before the first scan, and not so
+# early that it scrolls away under the pre-flight.
+Show-RunControlKeys
+
 Write-Host ""
 
 # ---------------------------------------------------------------------------
@@ -6565,18 +6864,33 @@ if ($scheduleWindows) {
 }
 
 while ($hostIndex -lt $workList.Count) {
+    # Ctrl+C stops here the same way the clock does, and for the same reason:
+    # nothing new leaves the machine, and what is in flight is cut below.
+    if (Test-InterruptRequested) { $stopReached = $true; break }
+
+    # 's': leave the loop with the queue still full. The drain below then runs
+    # as it always does, so the scans in flight finish and get recorded, and
+    # everything never dispatched stays pending for the resume.
+    if ($script:drainRequested) { $stopReached = $true; break }
+
     # Scheduled stop: nothing new leaves the machine after the deadline.
     Show-StopWarning -StopTime $stopTime -Fired $stopWarningsFired -StopMode $StopMode -LogFile $logFile
     if ($stopTime -and (Get-Date) -ge $stopTime) { $stopReached = $true; break }
 
     # A retry whose delay is over takes a free slot before the next new host
-    $null = Start-DueRetries -RetryQueue $retryQueue -JobQueue $jobQueue -JobStartTimes $jobStartTimes -MaxConcurrent $MaxConcurrent -StopTime $stopTime -Unprivileged $Unprivileged -NmapPath $nmapExePath -Verbatim $isCommandMode -Noninteractive $nmapNoninteractive
+    if (-not $script:pauseRequested) {
+        $null = Start-DueRetries -RetryQueue $retryQueue -JobQueue $jobQueue -JobStartTimes $jobStartTimes -MaxConcurrent $MaxConcurrent -StopTime $stopTime -Unprivileged $Unprivileged -NmapPath $nmapExePath -Verbatim $isCommandMode -Noninteractive $nmapNoninteractive
+    }
 
     $currentHost = $workList[$hostIndex]
 
-    # Wait if max concurrent jobs reached
+    # Wait if max concurrent jobs reached - and the same wait serves the pause,
+    # which is the same situation seen from the other side: no slot to be had.
+    # Sharing it keeps one copy of the sleep, the bar refresh and the collect.
     $progressUpdateCounter = 0
-    while ($jobQueue.Count -ge $MaxConcurrent) {
+    while ($jobQueue.Count -ge $MaxConcurrent -or $script:pauseRequested) {
+        if (Test-InterruptRequested) { $stopReached = $true; break }
+        if ($script:drainRequested) { $stopReached = $true; break }
         Show-StopWarning -StopTime $stopTime -Fired $stopWarningsFired -StopMode $StopMode -LogFile $logFile
         if ($stopTime -and (Get-Date) -ge $stopTime) { $stopReached = $true; break }
         Start-Sleep -Milliseconds 500
@@ -6594,8 +6908,11 @@ while ($hostIndex -lt $workList.Count) {
 
         . $collectFinishedJobs
 
-        # Slots freed above go to due retries first
-        $null = Start-DueRetries -RetryQueue $retryQueue -JobQueue $jobQueue -JobStartTimes $jobStartTimes -MaxConcurrent $MaxConcurrent -StopTime $stopTime -Unprivileged $Unprivileged -NmapPath $nmapExePath -Verbatim $isCommandMode -Noninteractive $nmapNoninteractive
+        # Slots freed above go to due retries first - unless the pause is on,
+        # in which case a retry is a new scan like any other and has to wait.
+        if (-not $script:pauseRequested) {
+            $null = Start-DueRetries -RetryQueue $retryQueue -JobQueue $jobQueue -JobStartTimes $jobStartTimes -MaxConcurrent $MaxConcurrent -StopTime $stopTime -Unprivileged $Unprivileged -NmapPath $nmapExePath -Verbatim $isCommandMode -Noninteractive $nmapNoninteractive
+        }
     }
 
     # The wait above exits on the deadline as well as on a free slot
@@ -6728,8 +7045,14 @@ while ($hostIndex -lt $workList.Count) {
 # Wait for remaining jobs to complete
 $progressUpdateCounter = 0
 # Retries still waiting keep this loop alive, but only until the deadline: past
-# it nothing new is launched, and they are carried over below instead.
-while ($jobQueue.Count -gt 0 -or ($retryQueue.Count -gt 0 -and -not ($stopTime -and (Get-Date) -ge $stopTime))) {
+# it nothing new is launched, and they are carried over below instead. A drain
+# asked for with 's' ends them the same way - a retry has not left the machine
+# yet, so "let what is running finish" does not include it, and waiting out its
+# RetryDelay here would hold a drain open for a minute with nothing in flight.
+while ($jobQueue.Count -gt 0 -or ($retryQueue.Count -gt 0 -and -not $script:drainRequested -and -not ($stopTime -and (Get-Date) -ge $stopTime))) {
+    # Ahead of the Drain check on purpose: -StopMode Drain is about the clock,
+    # and someone pressing Ctrl+C is not asking to wait out a 60m host timeout.
+    if (Test-InterruptRequested) { $stopReached = $true; break }
     Show-StopWarning -StopTime $stopTime -Fired $stopWarningsFired -StopMode $StopMode -LogFile $logFile
     if ($stopTime -and $StopMode -ne "Drain" -and (Get-Date) -ge $stopTime) { $stopReached = $true; break }
     Start-Sleep -Milliseconds 500
@@ -6747,7 +7070,9 @@ while ($jobQueue.Count -gt 0 -or ($retryQueue.Count -gt 0 -and -not ($stopTime -
 
     . $collectFinishedJobs
 
-    $null = Start-DueRetries -RetryQueue $retryQueue -JobQueue $jobQueue -JobStartTimes $jobStartTimes -MaxConcurrent $MaxConcurrent -StopTime $stopTime -Unprivileged $Unprivileged -NmapPath $nmapExePath -Verbatim $isCommandMode -Noninteractive $nmapNoninteractive
+    if (-not $script:drainRequested) {
+        $null = Start-DueRetries -RetryQueue $retryQueue -JobQueue $jobQueue -JobStartTimes $jobStartTimes -MaxConcurrent $MaxConcurrent -StopTime $stopTime -Unprivileged $Unprivileged -NmapPath $nmapExePath -Verbatim $isCommandMode -Noninteractive $nmapNoninteractive
+    }
 }
 
 # Scheduled stop: cut this window here. Scans still in flight are stopped and
@@ -6762,13 +7087,27 @@ if ($retryQueue.Count -gt 0) { $stopReached = $true }
 
 $killedHere = 0
 if ($stopReached) {
+    # One cause for the whole block, so the state file, the log and the summary
+    # all name the same thing. Empty means the clock did it.
+    $stopCause = Get-StopCause
+    $stoppedWhy = if ($stopCause) {
+        "Stopped by $stopCause (incomplete, will be scanned again)"
+    } else {
+        "Stopped at the scheduled stop time (incomplete, will be scanned again)"
+    }
+    $pendingWhy = if ($stopCause) {
+        "Retry pending when the run was stopped by $stopCause (will be scanned again)"
+    } else {
+        "Retry pending at the scheduled stop time (will be scanned again)"
+    }
+
     foreach ($entry in @($jobQueue.GetEnumerator())) {
         $stoppedHost = $entry.Key
         try {
             Stop-Job -Job $entry.Value.Job -ErrorAction SilentlyContinue
             Remove-Job -Job $entry.Value.Job -Force -ErrorAction SilentlyContinue
         } catch { }
-        Update-HostState -State $state -TargetHost $stoppedHost -Status "in_progress" -Attempts $entry.Value.Attempts -Error "Stopped at the scheduled stop time (incomplete, will be scanned again)"
+        Update-HostState -State $state -TargetHost $stoppedHost -Status "in_progress" -Attempts $entry.Value.Attempts -Error $stoppedWhy
         $killedHere++
         $stoppedInFlight++
         $carryOver += $stoppedHost
@@ -6776,21 +7115,35 @@ if ($stopReached) {
     }
     $retriesLeft = $retryQueue.Count
     foreach ($entry in @($retryQueue.GetEnumerator())) {
-        Update-HostState -State $state -TargetHost $entry.Key -Status "in_progress" -Attempts $entry.Value.Attempts -Error "Retry pending at the scheduled stop time (will be scanned again)"
+        Update-HostState -State $state -TargetHost $entry.Key -Status "in_progress" -Attempts $entry.Value.Attempts -Error $pendingWhy
         $carryOver += $entry.Key
     }
     $retryQueue.Clear()
     Save-StateFile -StateFile $stateFile -State $state
-    $stopDetail = if ($StopMode -eq "Drain") {
-        "the scans already running were allowed to finish"
-    } else {
+    # Read off what actually happened, not off the mode: a drain leaves nothing
+    # in flight to kill, and Ctrl+C cuts the running scans whatever -StopMode
+    # says, so $killedHere is the only honest witness here.
+    $stopDetail = if ($killedHere -gt 0) {
         "$killedHere scan(s) stopped in flight and left unfinished"
+    } else {
+        "the scans already running were allowed to finish"
     }
     if ($retriesLeft -gt 0) { $stopDetail += "; $retriesLeft retry(ies) not launched" }
-    Write-Log -Message "Scheduled stop reached ($($stopTime.ToString('yyyy-MM-dd HH:mm:ss')), mode $StopMode): $stopDetail" -Level "WARNING" -LogFile $logFile
+    # A run stopped by hand may have no -StopAt at all, and $stopTime is $null.
+    $stopWhen = if ($stopCause) {
+        $stopCause
+    } elseif ($stopTime) {
+        "$($stopTime.ToString('yyyy-MM-dd HH:mm:ss')), mode $StopMode"
+    } else {
+        "mode $StopMode"
+    }
+    Write-Log -Message "Scan stopped ($stopWhen): $stopDetail" -Level "WARNING" -LogFile $logFile
 }
 
 # --- end of this window -----------------------------------------------------
+# A stop asked for by hand ends the run, not just this window: a schedule must
+# not reopen one. A drain is the same answer - it said stop, not stop for now.
+if ($script:interruptRequested -or $script:drainRequested) { $runStopped = $true; break }
 if (-not $scheduleWindows) { break }
 
 $itemsLeft = ($workList.Count - $hostIndex) + $carryOver.Count
@@ -7139,7 +7492,14 @@ Write-Host "$conflictCount" -ForegroundColor Gray
 
 Write-Host ""
 
-$sessionOutcome = if ($stopReached) { "Scan session stopped at the scheduled time" } else { "Scan session completed" }
+$finalStopCause = Get-StopCause
+$sessionOutcome = if ($stopReached -and $finalStopCause) {
+    "Scan session stopped by $finalStopCause"
+} elseif ($stopReached) {
+    "Scan session stopped at the scheduled time"
+} else {
+    "Scan session completed"
+}
 Write-Log -Message "$sessionOutcome | Total: $($validHosts.Count) | Normal: $($normalSuccess + $normalFailed) (success: $normalSuccess, failed: $normalFailed) | Sensitive: $($sensitiveSuccess + $sensitiveFailed) (success: $sensitiveSuccess, failed: $sensitiveFailed) | Pending: $totalPending | Excluded: $($excludedHosts.Count) | Duration: $durationFormatted" -Level $(if ($stopReached) { "WARNING" } else { "SUCCESS" }) -LogFile $logFile
 
 if ($failedCount -gt 0) {
@@ -7165,8 +7525,17 @@ if (($verdictCounts.filtered + $verdictCounts.unreachable) -gt 0) {
 # session that most needs its resume line is the one that did not finish.
 Write-Host ""
 if ($stopReached) {
-    Write-Host "⏹️  Stopped by the schedule" -ForegroundColor Yellow
-    if ($scheduleWindows) {
+    # A stop asked for by hand gets neither the schedule line nor the stop-time
+    # line: the run ended when someone said so, and what the clock was going to
+    # do is beside it.
+    if ($finalStopCause) {
+        Write-Host "⏹️  Stopped by $finalStopCause" -ForegroundColor Yellow
+    } else {
+        Write-Host "⏹️  Stopped by the schedule" -ForegroundColor Yellow
+    }
+    if ($finalStopCause) {
+        # No clock line.
+    } elseif ($scheduleWindows) {
         Write-Host "   Schedule  : " -NoNewline -ForegroundColor Cyan
         Write-Host "$Schedule " -NoNewline -ForegroundColor White
         Write-Host "| $windowNumber window(s) used" -ForegroundColor Gray
@@ -7182,10 +7551,12 @@ if ($stopReached) {
     }
     Write-Host "   Left over : " -NoNewline -ForegroundColor Cyan
     Write-Host "$unfinishedAtEnd still to scan " -NoNewline -ForegroundColor White
-    if ($StopMode -eq "Drain") {
-        Write-Host "(drain: the scans already running were allowed to finish)" -ForegroundColor Gray
-    } else {
+    # Again from what happened, not from the mode: 's' drains without -StopMode
+    # Drain, and Ctrl+C cuts in flight with it.
+    if ($stoppedInFlight -gt 0) {
         Write-Host "($stoppedInFlight stopped in flight, they will be scanned again)" -ForegroundColor Gray
+    } else {
+        Write-Host "(drain: the scans already running were allowed to finish)" -ForegroundColor Gray
     }
     Write-Host ""
 }
@@ -7227,8 +7598,9 @@ Write-Host "──────────────────────�
     if ($stopReached) {
         $stepsLeft = $workflowSteps.Count - ($workflowStepNumber - 1)
         if ($isWorkflowMode -and $stepsLeft -gt 0) {
-            Write-Host "[INFO] $stepsLeft workflow step(s) were not started because of the scheduled stop." -ForegroundColor Yellow
-            Write-Log -Message "Workflow halted by the scheduled stop: $stepsLeft step(s) not started" -Level "WARNING" -LogFile $logFile
+            $haltedBy = if ($finalStopCause) { $finalStopCause } else { "the scheduled stop" }
+            Write-Host "[INFO] $stepsLeft workflow step(s) were not started because of $haltedBy." -ForegroundColor Yellow
+            Write-Log -Message "Workflow halted by $haltedBy`: $stepsLeft step(s) not started" -Level "WARNING" -LogFile $logFile
         }
         break
     }
@@ -7251,10 +7623,27 @@ if ($isWorkflowMode -and -not $stopReached) {
 # Normal completion: stop the exiting handler from firing and reporting an
 # interruption that never happened.
 $script:scanCompleted = $true
+
+# Ctrl+C belongs to the terminal again, not to us. The exiting handler does this
+# too, for the exits that never reach here, but waiting for process teardown to
+# give the shell its Ctrl+C back is too late when Scanyx was dot-sourced.
+Restore-RunControl
 if ($exitSubscriber) {
     Unregister-Event -SubscriptionId $exitSubscriber.Id -ErrorAction SilentlyContinue
     Remove-Job -Job $exitSubscriber -Force -ErrorAction SilentlyContinue
 }
+
+# A run that was cut short did not succeed, and a wrapper has no other way to
+# tell. The code is published rather than thrown: this is a function, and an
+# `exit` here would take the whole session with it when Scanyx is dot-sourced
+# and called by hand. scanyx.sh reads it back and exits with it; anyone wrapping
+# Invoke-Scanyx themselves can do the same.
+#   130  stopped by Ctrl+C
+#   143  stopped by SIGTERM (the launcher's trap)
+#   129  stopped by SIGHUP
+#     0  finished, or stopped by the schedule or by 's', which are plans, not
+#        failures: a cron re-running the window must not read them as one
+$global:ScanyxExitCode = $(if ($script:interruptRequested) { $script:exitCode } else { 0 })
 
 #endregion
 

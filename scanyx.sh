@@ -78,6 +78,18 @@ Spread a long scan over a recurring window, pausing and resuming on its own:
 nohup) and the machine awake; the resume line is saved in
 <output>/.sessions/<name>/resume.txt.
 
+While a scan is running the progress bar lists the keys it reads:
+
+  Ctrl+C  stop: the scans in flight are killed and left resumable; the summary
+          and the resume line still print. Again to quit at once (exit 130)
+  s       drain: launch nothing new, let what is running finish (exit 0)
+  p       pause and resume dispatch, leaving what is running to run
+
+SIGTERM (143) and SIGHUP (129) stop it the same way Ctrl+C does. So does a file,
+for a script or a second terminal:
+
+  touch <output>/.sessions/<name>/stop.request
+
 Command-list mode runs a file of complete nmap commands, one per line, with
 Scanyx's tracking, retries, state and resume on top:
 
@@ -473,9 +485,63 @@ while ($i -lt $raw.Count) {
     $i++
 }
 Invoke-Scanyx @sx @positional
+# A run that was cut short did not succeed. Invoke-Scanyx publishes the code
+# instead of calling exit, because it is a function and an exit would take the
+# whole session with it when Scanyx is dot-sourced; here it is the end of the
+# process, so hand it to the shell. See the note next to $global:ScanyxExitCode.
+if ($global:ScanyxExitCode) { exit $global:ScanyxExitCode }
 '
-pwsh -NoLogo -NoProfile -Command "${loader}; \$raw = @(${ps_args}); ${PS_BINDER}"
-rc=$?
+
+# ── Graceful stop on a signal ─────────────────────────────────────────────────
+# A POSIX signal cannot be handled inside Scanyx: a PowerShell scriptblock has
+# no runspace on the thread .NET calls a handler on, and compiling one with
+# Add-Type costs over a second on every run. So the signal is turned into a
+# file. Scanyx stats it on the same turn it reads the keyboard, and stops the
+# way Ctrl+C stops it: nmap killed, state saved, summary and resume line.
+#
+# It only works with pwsh in the background, because bash defers a trap until
+# the foreground child is done. Backgrounding costs us stdin - bash points an
+# async command at /dev/null - and Scanyx needs it to read Ctrl+C, s and p, so
+# the shell's own stdin is kept on fd 3 and handed back.
+#
+# It has to be this fd and not "< /dev/tty". A reopened tty is a second file
+# description on the same terminal, and on it .NET's Console.KeyAvailable
+# reports a key that is not there: the ReadKey that follows blocks for good,
+# with the scan stopped halfway through stopping. Passing the very descriptor
+# the shell was given keeps Console reading the console it was built for.
+STOP_FILE="$(mktemp -t scanyx-stop.XXXXXX)" || STOP_FILE=""
+rm -f "$STOP_FILE"            # Scanyx stops on its existence, not its content
+export SCANYX_STOP_FILE="$STOP_FILE"
+
+on_stop() {
+    # $1 = signal name, written into the file so Scanyx can name it and pick
+    # the matching 128+n exit code.
+    [ -n "$STOP_FILE" ] && printf '%s\n' "$1" > "$STOP_FILE" 2>/dev/null
+    warn "$1 received: asking Scanyx to stop and save. This may take a moment."
+}
+
+# Not INT: before the scan starts Ctrl+C still travels as a signal to the whole
+# process group, and trapping it here would swallow the user's way out of the
+# pre-flight. Once scanning, Scanyx turns Ctrl+C into a keystroke itself.
+trap 'on_stop SIGTERM' TERM
+trap 'on_stop SIGHUP'  HUP
+
+exec 3<&0
+pwsh -NoLogo -NoProfile -Command "${loader}; \$raw = @(${ps_args}); ${PS_BINDER}" <&3 &
+PWSH_PID=$!
+
+# A trapped signal makes wait return at once with a status above 128, with the
+# child still shutting down. Keep waiting until it is really gone, or the exit
+# code would be the signal's and not Scanyx's own verdict.
+while :; do
+    wait "$PWSH_PID"
+    rc=$?
+    kill -0 "$PWSH_PID" 2>/dev/null || break
+done
+
+trap - TERM HUP
+[ -n "$STOP_FILE" ] && rm -f "$STOP_FILE"
+unset SCANYX_STOP_FILE
 
 # Hand the results back to the invoking user when we ran under sudo, so the
 # output tree is not left owned by root inside their home directory.

@@ -292,9 +292,64 @@ sudo ./scanyx.sh -Hosts 192.168.1.0/24 -ScanType tcp-1000
 Cuando lanzas con `sudo`, el lanzador devuelve la propiedad del directorio de
 resultados a tu usuario al terminar, para no dejarte ficheros de root en el home.
 
-> **Ctrl+C en macOS/Linux**: la limpieza de procesos no siempre alcanza a nmap.
-> Si interrumpes un escaneo, comprueba con `pgrep -fl nmap` y limpia con
-> `pkill -f nmap` si quedan huérfanos.
+## Parar un escaneo
+
+Mientras el escaneo corre, la barra de progreso recuerda las teclas que escucha:
+
+| Tecla | Qué hace |
+|---|---|
+| `Ctrl+C` | Corta: mata los nmap en vuelo, imprime el resumen y la línea de reanudación, y devuelve el terminal. Lo que estaba a medias queda **incompleto**, no fallido, así que `-Resume` lo repite desde el principio en vez de darlo por hecho. |
+| `Ctrl+C` otra vez | Sale en el acto, sin resumen. Lo ya terminado sigue en disco y la sesión sigue siendo reanudable. |
+| `s` | Drena: no lanza nada nuevo, pero deja acabar lo que ya está corriendo y lo apunta como completado. El resto se queda pendiente. Es `-StopMode Drain` a mano, sin tener que haberlo decidido al arrancar. |
+| `p` | Pausa y reanuda el reparto. Lo que ya está corriendo sigue —a nmap no se le puede pausar a mitad sin mentirle a su propio *timing*, y no se le pide—; simplemente no sale nada nuevo hasta que vuelvas a pulsar `p`. |
+
+Las teclas solo se anuncian cuando hay un terminal del que leerlas: con la salida
+redirigida a un fichero o a un pager no hay tecla que leer y no se promete nada.
+
+### Pedir la parada desde fuera
+
+`SIGTERM` y `SIGHUP` (un `kill`, cerrar el tmux, un `systemctl stop`) también
+paran bien: el lanzador los convierte en un fichero que Scanyx mira en la misma
+vuelta en la que lee el teclado. Eso además deja la parada ordenada al alcance de
+un script o de un segundo terminal, cosa que una señal nunca dio:
+
+```bash
+touch <salida>/.sessions/<sesión>/stop.request
+```
+
+El directorio de la sesión se imprime con la línea de reanudación. El fichero se
+borra al salir, así que no frena la reanudación siguiente.
+
+### Código de salida
+
+| Código | Significado |
+|---|---|
+| `0` | Terminó. También cuando paró el horario o `s`: son planes, no fallos, y un cron que repite la ventana no debe leerlos como tal. |
+| `130` | Ctrl+C, o un `stop.request` puesto a mano. |
+| `143` | SIGTERM. |
+| `129` | SIGHUP. |
+
+`Invoke-Scanyx` publica el código en `$global:ScanyxExitCode` en vez de llamar a
+`exit`: es una función, y un `exit` se llevaría por delante la sesión entera
+cuando se usa con `. ./scanyx.ps1`. `scanyx.sh` lo lee y sale con él.
+
+### Por qué una tecla y no una señal
+
+Con jobs en marcha y la barra de progreso en pantalla, la señal que manda el
+terminal no consigue parar PowerShell: el escaneo seguía, no saltaba ningún
+manejador y el terminal se quedaba en modo crudo —sin eco y sin Ctrl+C—, de forma
+que no quedaba más salida que cerrar la ventana. Se reproduce con `Start-Job` y
+`Write-Progress` y nada más, sin Scanyx de por medio, así que no es algo que se
+pueda arreglar aquí; lo que sí se puede es no depender de ello. Por el mismo
+motivo las señales se traducen a un fichero: un manejador POSIX no tiene *runspace*
+donde ejecutar un `scriptblock`, y compilar uno con `Add-Type` cuesta más de un
+segundo en cada arranque.
+
+Para que las teclas lleguen, nmap tiene que mantenerse fuera del terminal: abre
+`/dev/tty` para sus propias teclas de ejecución y se come las nuestras. Scanyx le
+pasa `--noninteractive` en todos los modos, también en el de lista de comandos
+—donde la reanudación compara la línea del autor con la que nmap apuntó, y esa
+opción se descuenta de las dos antes de comparar—.
 
 ---
 
