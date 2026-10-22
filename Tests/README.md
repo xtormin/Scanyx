@@ -368,5 +368,5 @@ When adding new functionality to SCANYX:
 ---
 
 **Last Updated**: 2025-10-15
-**SCANYX Version**: 2.8.0
+**SCANYX Version**: 2.8.1
 **Pester Version**: 5.x

@@ -230,12 +230,21 @@ Combine file-based and command line hosts, exclusions, and sensitive hosts.
 
 .NOTES
 Author: Jennifer Torres (@xtormin)
-Version: 2.8.0
+Version: 2.8.1
 Requires: Nmap installed and available in PATH
+
+The version above is the one place a release has to be typed by hand that a
+comment block makes unavoidable; everything that prints it reads
+$script:ScanyxVersion below. Keep the two in step - the banner said 2.8.1 while
+this block still said 2.8.0 for a while, and nothing noticed.
 
 Scan profiles are loaded from nmap-profiles-workflows.json in the script directory.
 If the file doesn't exist, it will be created with default profiles.
 #>
+
+# The version, once. Show-Banner reads it, and so should anything else that
+# needs to name it: no second copy to forget.
+$script:ScanyxVersion = "2.8.1"
 
 # ============================================
 # HELPER FUNCTIONS (Global Scope)
@@ -3520,7 +3529,7 @@ function Show-ScanyxBanner {
     Write-Host "       ░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░  ░▒▓█▓▒░   ░▒▓█▓▒░░▒▓█▓▒░" -ForegroundColor Red
     Write-Host "░▒▓███████▓▒░ ░▒▓██████▓▒░░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░  ░▒▓█▓▒░   ░▒▓█▓▒░░▒▓█▓▒░" -ForegroundColor Red
     Write-Host ""
-    Write-Host "                   https://github.com/xtormin/Scanyx (v2.8.1)" -ForegroundColor Red
+    Write-Host "                   https://github.com/xtormin/Scanyx (v$script:ScanyxVersion)" -ForegroundColor Red
     Write-Host "                           @xtormin (Jennifer Torres)" -ForegroundColor Red
     Write-Host ""
 }
