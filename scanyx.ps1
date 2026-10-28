@@ -27,11 +27,15 @@ Can be combined with -HostFile to scan hosts from both sources.
 .PARAMETER ExcludeFile
 Optional path to a text file containing hosts to exclude from scanning.
 Supports the same formats as HostFile (IPs, CIDR, hostnames).
+Kept in the session state and in the resume line, so -ResumeSession leaves the
+same hosts out again without being told.
 
 .PARAMETER ExcludeHosts
 Optional array of hosts to exclude provided directly as command line arguments.
 Supports the same formats as ExcludeFile (IPs, CIDR, hostnames).
 Can be combined with -ExcludeFile to exclude hosts from both sources.
+Remembered like -ExcludeFile. On -ResumeSession, passing either parameter
+replaces what the session remembers, and -ExcludeHosts @() clears it.
 
 .PARAMETER ResolveHostnames
 Attempt to resolve hostnames to IPs so that exclusions match a host written as a
@@ -792,7 +796,10 @@ function Get-ResumeCommand {
         [string]$SessionId,
         [string]$OutputDir = "",
         [bool]$Elevated = $false,
-        [string]$Schedule = ""
+        [string]$Schedule = "",
+        [string]$ExcludeFile = "",
+        [string[]]$ExcludeHosts = @(),
+        [bool]$ResolveHostnames = $false
     )
 
     $prefix = if ($Elevated -and ($IsLinux -or $IsMacOS)) { "sudo " } else { "" }
@@ -804,6 +811,21 @@ function Get-ResumeCommand {
     # ended this run does not, so -Until is deliberately left out.
     if ($Schedule -and $Schedule -ne "") {
         $command += " -Schedule `"$Schedule`""
+    }
+    # The session inherits these on its own, but the line says them out loud:
+    # what it excludes is then visible before running it, and it keeps working
+    # if the line is edited, replayed against another session, or pasted
+    # somewhere the state cannot be read.
+    if ($ExcludeFile -and $ExcludeFile -ne "") {
+        $command += " -ExcludeFile `"$ExcludeFile`""
+    }
+    if ($ExcludeHosts.Count -gt 0) {
+        $command += " -ExcludeHosts " + (($ExcludeHosts | ForEach-Object { "`"$_`"" }) -join ",")
+    }
+    # Exclusions match by exact key, and this is what decides whether a name
+    # matches an address, so it belongs with them.
+    if ($ResolveHostnames) {
+        $command += " -ResolveHostnames"
     }
     return "$command -Resume"
 }
@@ -4919,6 +4941,9 @@ if ($SessionName -and $SessionName -ne "") {
 
 # Handle -ResumeSession
 $resumingSession = $false
+# Set when a resumed session's own exclusions are used because the caller passed
+# none. Only for what the pre-flight screen says; nothing branches on it.
+$exclusionsFromSession = $false
 $resumedSessionData = $null
 $resumedCommandLines = @()
 $resumedCommandBaseDir = $null
@@ -4982,6 +5007,33 @@ if ($ResumeSession -and $ResumeSession -ne "") {
         Write-Host "[INFO] Loaded scan type from session: $ScanType" -ForegroundColor Green
     } else {
         Write-Host "[WARNING] Could not load scan type or workflow from session state" -ForegroundColor Yellow
+    }
+
+    # The exclusions the session was run with. A resume that says nothing about
+    # exclusions inherits them, so the line Scanyx prints does not have to be
+    # re-armed by hand and a host left out once is not scanned by the next
+    # resume. -ExcludeFile or -ExcludeHosts replaces them, and an explicitly
+    # empty -ExcludeHosts @() clears them: what the caller passes always wins,
+    # which is how an exclusion is lifted.
+    if (-not ($PSBoundParameters.ContainsKey('ExcludeFile') -or $PSBoundParameters.ContainsKey('ExcludeHosts'))) {
+        $savedExcludeFile = [string]$resumedSessionData.State.exclude_file
+        $savedExcludeHosts = @($resumedSessionData.State.exclude_hosts | Where-Object { $_ })
+
+        if (($savedExcludeFile -and $savedExcludeFile -ne "") -or $savedExcludeHosts.Count -gt 0) {
+            $ExcludeFile = $savedExcludeFile
+            $ExcludeHosts = $savedExcludeHosts
+            $exclusionsFromSession = $true
+            # The matching mode goes with the list it was built for, unless the
+            # caller asked for something else.
+            if (-not $PSBoundParameters.ContainsKey('ResolveHostnames') -and $resumedSessionData.State.resolve_hostnames) {
+                $ResolveHostnames = $true
+            }
+
+            $inheritedWhat = @()
+            if ($ExcludeFile -and $ExcludeFile -ne "") { $inheritedWhat += $ExcludeFile }
+            if ($ExcludeHosts.Count -gt 0) { $inheritedWhat += "$($ExcludeHosts.Count) host(s)" }
+            Write-Host "[INFO] Loaded exclusions from session: $($inheritedWhat -join ' + ')" -ForegroundColor Green
+        }
     }
 
     # The profile the session ran with has to exist in the configuration loaded
@@ -5464,6 +5516,14 @@ if (-not $isCommandMode) {
 # Process exclusion hosts from file and/or command line
 $excludedHosts = @()
 
+# The path the session records and the resume line prints, resolved while the
+# working directory is still the one it was given in: a relative path in a line
+# pasted somewhere else would otherwise point at nothing.
+$excludeFileForResume = $ExcludeFile
+if ($ExcludeFile -and $ExcludeFile -ne "" -and (Test-Path $ExcludeFile)) {
+    $excludeFileForResume = (Resolve-Path -LiteralPath $ExcludeFile).Path
+}
+
 # Process exclusion file if provided
 if ($ExcludeFile -and $ExcludeFile -ne "") {
     if (Test-Path $ExcludeFile) {
@@ -5900,6 +5960,10 @@ if ($excludedHosts.Count -gt 0) {
             Write-Host ""
         }
     }
+
+    if ($exclusionsFromSession) {
+        Write-Host "                inherited from the session; -ExcludeHosts replaces them, -ExcludeHosts @() clears them" -ForegroundColor DarkGray
+    }
 }
 
 }
@@ -5991,7 +6055,8 @@ if ($stopTime) {
     Write-Host "                Whatever is left stays pending; resume it with the line below." -ForegroundColor DarkGray
 }
 
-$resumeCommand = Get-ResumeCommand -SessionId $sessionId -OutputDir $OutputDir -Elevated (Test-IsElevated) -Schedule $Schedule
+$resumeCommand = Get-ResumeCommand -SessionId $sessionId -OutputDir $OutputDir -Elevated (Test-IsElevated) -Schedule $Schedule `
+                                   -ExcludeFile $excludeFileForResume -ExcludeHosts $ExcludeHosts -ResolveHostnames ([bool]$ResolveHostnames)
 Write-Host "↩️  Resume     : " -NoNewline -ForegroundColor Cyan
 Write-Host "$resumeCommand" -ForegroundColor Yellow
 
@@ -6169,6 +6234,13 @@ $state = @{
     # What -ResumeSession needs to run the list again without being handed it
     command_lines = if ($isCommandMode) { @($listLines) } else { $null }
     command_base_dir = if ($isCommandMode) { $invocationDir } else { $null }
+    # What this run was told to leave out, so the next -ResumeSession leaves out
+    # the same thing without being told again, and so the session says what it
+    # skipped. The hosts marked 'excluded' below are the ones this list hit;
+    # this is the rule that produced them.
+    exclude_file = if ($excludeFileForResume -and $excludeFileForResume -ne "") { $excludeFileForResume } else { $null }
+    exclude_hosts = if ($ExcludeHosts.Count -gt 0) { @($ExcludeHosts) } else { $null }
+    resolve_hostnames = [bool]$ResolveHostnames
     hosts = @{}
 }
 
@@ -6627,7 +6699,8 @@ Save-StateFile -StateFile $stateFile -State $state
 
 # The resume line on disk, written before the first scan so it is already there
 # if the run dies in a way that prints nothing at all.
-$resumeCommand = Get-ResumeCommand -SessionId $sessionId -OutputDir $OutputDir -Elevated (Test-IsElevated) -Schedule $Schedule
+$resumeCommand = Get-ResumeCommand -SessionId $sessionId -OutputDir $OutputDir -Elevated (Test-IsElevated) -Schedule $Schedule `
+                                   -ExcludeFile $excludeFileForResume -ExcludeHosts $ExcludeHosts -ResolveHostnames ([bool]$ResolveHostnames)
 $resumeFile = Write-ResumeFile -SessionDir $sessionDir -ResumeCommand $resumeCommand -SessionId $sessionId -Status "in_progress"
 
 # Remembered for the interrupt handler, which runs in its own scope and may
@@ -6637,6 +6710,9 @@ $script:currentSessionId = $sessionId
 $script:currentOutputDir = $OutputDir
 $script:currentElevated = Test-IsElevated
 $script:currentResumeFile = $resumeFile
+$script:currentExcludeFile = $excludeFileForResume
+$script:currentExcludeHosts = $ExcludeHosts
+$script:currentResolveHostnames = [bool]$ResolveHostnames
 
 # Initialize results file
 if (-not (Test-Path $resultsFile)) {
@@ -6702,7 +6778,10 @@ $exitSubscriber = Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Act
     # normally prints it is never reached.
     if ($script:currentSessionId) {
         Write-Host "[INFO] Resume this session with:" -ForegroundColor Cyan
-        Write-Host "  $(Get-ResumeCommand -SessionId $script:currentSessionId -OutputDir $script:currentOutputDir -Elevated $script:currentElevated)" -ForegroundColor Yellow
+        $interruptResume = Get-ResumeCommand -SessionId $script:currentSessionId -OutputDir $script:currentOutputDir `
+                                             -Elevated $script:currentElevated -ExcludeFile $script:currentExcludeFile `
+                                             -ExcludeHosts $script:currentExcludeHosts -ResolveHostnames $script:currentResolveHostnames
+        Write-Host "  $interruptResume" -ForegroundColor Yellow
         if ($script:currentResumeFile) {
             Write-Host "       Also saved in: $script:currentResumeFile" -ForegroundColor DarkGray
         }

@@ -399,11 +399,26 @@ scanyx -Hosts "192.168.1.0/24" -ExcludeHosts "192.168.1.1","192.168.1.254" -Scan
 
 Al reanudar, la lista de objetivos **es** el estado de la sesión, así que
 `-ExcludeFile` y `-ExcludeHosts` se aplican sobre los hosts guardados en
-`scan-state.json` y se respetan en esa ejecución. La lista de exclusión no se
-guarda en la sesión ni viaja en el comando de reanudación que Scanyx imprime:
-hay que volver a pasarla en cada reanudación.
+`scan-state.json` y se respetan en esa ejecución.
 
-Lo que sí se conserva es lo que la sesión ya sabía de esos hosts. El host
+La sesión se queda con la lista: se guarda en `scan-state.json` (`exclude_file`,
+`exclude_hosts`, `resolve_hostnames`) y viaja en la línea de reanudación que
+Scanyx imprime y escribe en `resume.txt`, con la ruta del fichero de exclusiones
+ya resuelta para que la línea funcione desde cualquier directorio.
+
+Con `-ResumeSession`, lo que pasas manda y lo que no pasas se hereda:
+
+| Al reanudar | Exclusiones que se aplican |
+|---|---|
+| sin `-ExcludeFile` ni `-ExcludeHosts` | las que la sesión recuerda |
+| `-ExcludeHosts "a","b"` o `-ExcludeFile f` | solo esas: reemplazan a las guardadas |
+| `-ExcludeHosts @()` | ninguna: borra las guardadas |
+
+Así se levanta una exclusión, y así se cambia por otra. La herencia es de
+`-ResumeSession`: con `-Resume` sobre un `-HostFile` el estado se carga más
+tarde, y ahí las exclusiones hay que volver a pasarlas.
+
+Lo que se conserva es lo que la sesión ya sabía de esos hosts. El host
 excluido se queda en `scan-state.json` con `status: "excluded"`, su estado
 anterior en `previous_status` y el resto intacto: veredicto de liveness,
 carpeta de resultados y fichero `.nmap`. Si en la siguiente reanudación ya no

@@ -196,3 +196,105 @@ Describe "-ExcludeHosts on a resumed session" -Tag "Integration", "Exclusions" -
         $kept.previous_status | Should -Be "completed"
     }
 }
+
+Describe "Exclusions the session remembers" -Tag "Integration", "Exclusions" -Skip:$IsWindows {
+    BeforeEach {
+        $root = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
+        $out = Join-Path $root "out"
+        $cfg = Join-Path $root "profiles.json"
+        New-Item -ItemType Directory -Path $root -Force | Out-Null
+        @{
+            profiles = @{ "tcp-test" = @{
+                name = "TCP Test"; description = "Fast test profile"
+                command = "nmap -sT -Pn -p 22 -T4"
+            } }
+            workflows = @{}
+        } | ConvertTo-Json -Depth 10 | Set-Content $cfg
+
+        Remove-Item $script:argvLog -ErrorAction SilentlyContinue
+
+        Invoke-Scanyx -Hosts "127.0.0.1", "127.0.0.2", "127.0.0.3" -ScanType "tcp-test" `
+                      -SessionName "rem" -OutputDir $out -ConfigFile $cfg -Unprivileged `
+                      -OverwriteMode Overwrite -RetryDelay 1 -Yes *> $null
+
+        $stateFile = Get-SessionStateFile -OutputDir $out -Session "rem"
+        $resumeTxt = [IO.Path]::Combine($out, ".sessions", "rem", "resume.txt")
+
+        # The run that arms the exclusion: its list is the one the session keeps.
+        Set-HostStatus -StateFile $stateFile -TargetHost "127.0.0.3" -Status "pending"
+        $armedOutput = Invoke-Scanyx -ResumeSession "rem" -OutputDir $out -Resume -ConfigFile $cfg `
+                                     -Unprivileged -OverwriteMode Overwrite -RetryDelay 1 -Yes `
+                                     -ExcludeHosts "127.0.0.2" *>&1 | Out-String
+        Remove-Item $script:argvLog -ErrorAction SilentlyContinue
+
+        function Invoke-ResumeSayingNothing {
+            # Neither -ExcludeFile nor -ExcludeHosts bound, which is what makes
+            # the session's own list apply.
+            Invoke-Scanyx -ResumeSession "rem" -OutputDir $out -Resume -ConfigFile $cfg `
+                          -Unprivileged -OverwriteMode Overwrite -RetryDelay 1 -Yes *> $null
+        }
+    }
+
+    It "Saves the exclusions it was given in the session state" {
+        $s = Read-SessionState -StateFile $stateFile
+        @($s.exclude_hosts) | Should -Contain "127.0.0.2"
+        $s.resolve_hostnames | Should -BeFalse
+    }
+
+    It "Puts them in the resume line it prints and in resume.txt" {
+        $armedOutput | Should -Match '-ExcludeHosts "127\.0\.0\.2"'
+        Get-Content $resumeTxt -Raw | Should -Match '-ExcludeHosts "127\.0\.0\.2"'
+    }
+
+    It "Keeps the host excluded on a resume that says nothing about exclusions" {
+        Set-HostStatus -StateFile $stateFile -TargetHost "127.0.0.3" -Status "pending"
+
+        Invoke-ResumeSayingNothing
+
+        $s = Read-SessionState -StateFile $stateFile
+        $s.hosts.'127.0.0.2'.status | Should -Be "excluded"
+        @($s.exclude_hosts) | Should -Contain "127.0.0.2"
+        @(Get-ScannedLines | Where-Object { $_ -match '127\.0\.0\.2' }).Count | Should -Be 0
+    }
+
+    It "Clears them when an empty -ExcludeHosts is passed" {
+        Set-HostStatus -StateFile $stateFile -TargetHost "127.0.0.3" -Status "pending"
+
+        Invoke-Scanyx -ResumeSession "rem" -OutputDir $out -Resume -ConfigFile $cfg -Unprivileged `
+                      -OverwriteMode Overwrite -RetryDelay 1 -Yes -ExcludeHosts @() *> $null
+
+        $s = Read-SessionState -StateFile $stateFile
+        $s.hosts.'127.0.0.2'.status | Should -Be "completed"
+        $s.exclude_hosts | Should -BeNullOrEmpty
+    }
+
+    It "Replaces them when a new list is passed" {
+        Set-HostStatus -StateFile $stateFile -TargetHost "127.0.0.3" -Status "pending"
+
+        Invoke-Scanyx -ResumeSession "rem" -OutputDir $out -Resume -ConfigFile $cfg -Unprivileged `
+                      -OverwriteMode Overwrite -RetryDelay 1 -Yes -ExcludeHosts "127.0.0.1" *> $null
+
+        $s = Read-SessionState -StateFile $stateFile
+        $s.hosts.'127.0.0.1'.status | Should -Be "excluded"
+        $s.hosts.'127.0.0.2'.status | Should -Be "completed"
+        @($s.exclude_hosts) | Should -Contain "127.0.0.1"
+        @($s.exclude_hosts) | Should -Not -Contain "127.0.0.2"
+    }
+
+    It "Remembers an exclusion file by its resolved path, and that file alone" {
+        $exFile = Join-Path $root "gateways.txt"
+        Set-Content -Path $exFile -Value "127.0.0.1"
+        Set-HostStatus -StateFile $stateFile -TargetHost "127.0.0.3" -Status "pending"
+
+        $said = Invoke-Scanyx -ResumeSession "rem" -OutputDir $out -Resume -ConfigFile $cfg `
+                              -Unprivileged -OverwriteMode Overwrite -RetryDelay 1 -Yes `
+                              -ExcludeFile $exFile *>&1 | Out-String
+
+        $s = Read-SessionState -StateFile $stateFile
+        $s.exclude_file | Should -Be (Resolve-Path -LiteralPath $exFile).Path
+        $s.exclude_hosts | Should -BeNullOrEmpty
+        $s.hosts.'127.0.0.1'.status | Should -Be "excluded"
+        $s.hosts.'127.0.0.2'.status | Should -Be "completed"
+        $said | Should -Match '-ExcludeFile "'
+    }
+}
