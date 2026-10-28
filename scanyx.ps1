@@ -2225,6 +2225,23 @@ function Update-HostState {
     $State.pending = ($State.hosts.GetEnumerator() | Where-Object { $_.Value.status -eq "pending" }).Count
 }
 
+function ConvertTo-HostStateTable {
+    # A host's state entry as a hashtable, so fields can be added and dropped.
+    # Entries read back from scan-state.json are PSCustomObjects, which only
+    # allow writing properties that already exist.
+    param($HostState)
+
+    $table = @{}
+    if ($null -eq $HostState) { return $table }
+
+    if ($HostState -is [System.Collections.IDictionary]) {
+        foreach ($key in @($HostState.Keys)) { $table[$key] = $HostState[$key] }
+    } else {
+        foreach ($prop in $HostState.PSObject.Properties) { $table[$prop.Name] = $prop.Value }
+    }
+    return $table
+}
+
 function Get-ScanResultsLogPath {
     # The append-only companion of scan-results.json, in the same directory.
     param([string]$ResultsFile)
@@ -5593,6 +5610,10 @@ if ($sensitiveTargets.Count -gt 0) {
 # Apply exclusions and detect conflicts
 $validHosts = @()
 $excludedCount = 0
+# Which target hosts the exclusion list takes out. On a resume the target list
+# is the session state, so these are hosts the session already knows about and
+# whose state entry has to survive the exclusion.
+$excludedTargets = @()
 $conflicts = @()
 
 # Create hashtable for faster lookups
@@ -5636,6 +5657,7 @@ if ($excludedHosts.Count -gt 0) {
     foreach ($currentHost in $targetHosts) {
         if ($excludedSet.ContainsKey($currentHost)) {
             $excludedCount++
+            $excludedTargets += $currentHost
             # Check if also in sensitive (conflict)
             if ($sensitiveSet.ContainsKey($currentHost)) {
                 $conflicts += $currentHost
@@ -5856,6 +5878,28 @@ if ($excludedHosts.Count -gt 0) {
     Write-Host "🚫 Excluded   : " -NoNewline -ForegroundColor Cyan
     Write-Host "$($excludedHosts.Count) host(s) " -NoNewline -ForegroundColor White
     Write-Host "($exShown)" -ForegroundColor Gray
+
+    # The count above is the size of the exclusion list, which says nothing
+    # about how much of the run it removes: excluding one /24 reads as 256
+    # whether it drops 256 hosts or none. This is the number that decides
+    # whether the exclusion is the one that was meant.
+    if ($excludedCount -gt 0) {
+        $excludedCompleted = 0
+        if ($resumingSession -and $resumedSessionData -and $resumedSessionData.State.hosts) {
+            foreach ($exHost in $excludedTargets) {
+                $exPrior = $resumedSessionData.State.hosts.$exHost
+                if ($exPrior -and $exPrior.status -eq "completed") { $excludedCompleted++ }
+            }
+        }
+        Write-Host "                " -NoNewline
+        Write-Host "$excludedCount " -NoNewline -ForegroundColor Yellow
+        Write-Host "of them in this run's targets" -NoNewline -ForegroundColor Gray
+        if ($excludedCompleted -gt 0) {
+            Write-Host " - $excludedCompleted already scanned; the session keeps their results" -ForegroundColor Gray
+        } else {
+            Write-Host ""
+        }
+    }
 }
 
 }
@@ -6203,6 +6247,28 @@ $hasValidState = $existingState -and
 if ($hasValidState -and -not $Force) {
     Write-Log -Message "Found previous scan state from session: $($existingState.session_id)" -Level "INFO" -LogFile $logFile
 
+    # A host excluded on an earlier run kept the status it had then in
+    # previous_status. It is in $validHosts now, so the exclusion is gone and
+    # the status has to go back before the selection below reads it: no branch
+    # there recognises 'excluded', and a host no branch claims is left pending
+    # and never scanned.
+    $restoredFromExcluded = 0
+    foreach ($currentHost in $validHosts) {
+        $hostState = $existingState.hosts.$currentHost
+        if (-not $hostState -or $hostState.status -ne "excluded") { continue }
+
+        $restored = ConvertTo-HostStateTable -HostState $hostState
+        $restored.status = if ($restored.previous_status) { [string]$restored.previous_status } else { "pending" }
+        $restored.Remove("previous_status")
+        $restored.Remove("excluded_at")
+        $existingState.hosts.$currentHost = $restored
+        $restoredFromExcluded++
+    }
+    if ($restoredFromExcluded -gt 0) {
+        Write-Host "[INFO] $restoredFromExcluded host(s) excluded on a previous run are no longer excluded; each is back with the status it had." -ForegroundColor Cyan
+        Write-Log -Message "Restored $restoredFromExcluded host(s) from status 'excluded': no longer in the exclusion list" -Level "INFO" -LogFile $logFile
+    }
+
     # Show session information to user
     Write-Host ""
     Write-Host "╔════════════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
@@ -6461,6 +6527,38 @@ if ($hasValidState -and -not $Force) {
         Write-Log -Message "Force mode: Setting OverwriteMode to 'Overwrite'" -Level "INFO" -LogFile $logFile
     }
     $hostsToScan = $validHosts
+}
+
+# $state was rebuilt from $validHosts alone, and the selection above only ever
+# walks that list, so a host taken out by the exclusion list is absent from the
+# new state: the first save would drop its entry from scan-state.json, and with
+# it the record of a scan that already ran - status, liveness, the folder its
+# results are in. Worse, the host list of the next resume comes from that same
+# file, so the host would be gone for good and no later run could bring it
+# back. Keep the entry, marked 'excluded': not scanned now, still on record,
+# and restored above as it was if the exclusion is lifted.
+if ($hasValidState -and -not $Force -and $excludedTargets.Count -gt 0) {
+    $keptExcluded = 0
+    foreach ($currentHost in $excludedTargets) {
+        $hostState = $existingState.hosts.$currentHost
+        if (-not $hostState) { continue }
+
+        $kept = ConvertTo-HostStateTable -HostState $hostState
+        # Excluded on an earlier run as well: previous_status already holds the
+        # status from before that one, and overwriting it with 'excluded' would
+        # lose the only copy of it.
+        if ($kept.status -ne "excluded") { $kept.previous_status = $kept.status }
+        $kept.status = "excluded"
+        $kept.excluded_at = (Get-Date -Format "yyyy-MM-ddTHH:mm:ss")
+        $state.hosts[$currentHost] = $kept
+        $keptExcluded++
+    }
+    if ($keptExcluded -gt 0) {
+        # Not part of total_hosts: the counters measure the work in hand, and
+        # an excluded host is not work. This is here to be read, not summed.
+        $state.excluded = $keptExcluded
+        Write-Log -Message "Kept $keptExcluded excluded host(s) in the session state with status 'excluded'" -Level "INFO" -LogFile $logFile
+    }
 }
 
 if ($hostsToScan.Count -eq 0) {

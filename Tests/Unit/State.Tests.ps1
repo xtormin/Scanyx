@@ -353,3 +353,47 @@ Describe "Update-HostState liveness fields" -Tag "Unit", "State", "Liveness" {
         Test-HostNeedsRescan -HostState $loaded.hosts."10.0.0.6" -Mode 'NoResponse' | Should -BeTrue
     }
 }
+
+Describe "ConvertTo-HostStateTable" -Tag "Unit", "State" {
+    It "Copies a PSCustomObject entry so new fields can be added" {
+        $stateFile = Join-Path $TestDrive "convert-state.json"
+        @{ hosts = @{ "10.0.0.7" = @{ status = "completed"; attempts = 2; liveness = "open" } } } |
+            ConvertTo-Json -Depth 10 | Set-Content $stateFile
+        $entry = (Load-StateFile -StateFile $stateFile).hosts."10.0.0.7"
+
+        $table = ConvertTo-HostStateTable -HostState $entry
+
+        $table | Should -BeOfType [hashtable]
+        $table.status | Should -Be "completed"
+        $table.attempts | Should -Be 2
+        $table.liveness | Should -Be "open"
+        # The point of the copy: an entry read back from JSON refuses this.
+        { $table.previous_status = "completed" } | Should -Not -Throw
+        $table.previous_status | Should -Be "completed"
+    }
+
+    It "Copies a hashtable entry and leaves the original alone" {
+        $entry = @{ status = "pending"; attempts = 0 }
+
+        $table = ConvertTo-HostStateTable -HostState $entry
+        $table.status = "excluded"
+
+        $table.attempts | Should -Be 0
+        $entry.status | Should -Be "pending"
+    }
+
+    It "Returns an empty table for a host with no entry" {
+        $table = ConvertTo-HostStateTable -HostState $null
+
+        $table | Should -BeOfType [hashtable]
+        $table.Keys.Count | Should -Be 0
+    }
+
+    It "Drops a field the caller removes" {
+        $table = ConvertTo-HostStateTable -HostState @{ status = "excluded"; previous_status = "completed" }
+        $table.Remove("previous_status")
+
+        $table.ContainsKey("previous_status") | Should -BeFalse
+        $table.status | Should -Be "excluded"
+    }
+}

@@ -395,6 +395,27 @@ scanyx -HostFile hosts.txt -ExcludeFile gateways.txt -ScanType "tcp-1000"
 scanyx -Hosts "192.168.1.0/24" -ExcludeHosts "192.168.1.1","192.168.1.254" -ScanType "tcp-1000"
 ```
 
+### Excluir hosts al reanudar una sesión
+
+Al reanudar, la lista de objetivos **es** el estado de la sesión, así que
+`-ExcludeFile` y `-ExcludeHosts` se aplican sobre los hosts guardados en
+`scan-state.json` y se respetan en esa ejecución. La lista de exclusión no se
+guarda en la sesión ni viaja en el comando de reanudación que Scanyx imprime:
+hay que volver a pasarla en cada reanudación.
+
+Lo que sí se conserva es lo que la sesión ya sabía de esos hosts. El host
+excluido se queda en `scan-state.json` con `status: "excluded"`, su estado
+anterior en `previous_status` y el resto intacto: veredicto de liveness,
+carpeta de resultados y fichero `.nmap`. Si en la siguiente reanudación ya no
+está excluido, vuelve con el estado que tenía, así que lo que estaba completado
+no se repite y lo que estaba pendiente se escanea.
+
+Los excluidos no cuentan como trabajo por hacer: `total_hosts` y los contadores
+de la sesión miden solo lo que queda por escanear, y cuántos hay excluidos se
+guarda aparte en `excluded`. Antes de empezar, la pantalla de confirmación dice
+cuántos hosts del objetivo quita la exclusión y cuántos de ellos ya estaban
+escaneados.
+
 ## Hosts Sensibles
 ```powershell
 # Escaneo diferenciado: normal (T4) vs sensible (T2)
